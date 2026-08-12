@@ -1,0 +1,5 @@
+run models as efficiently as your hardware allows.
+
+goal: get mradermacher/GigaChat3.1-Lightning-Uncensored-i1-GGUF:Q4_K_M (10B / 1B active experts) working on personal laptop
+Hardware Specs: Dell XPS 15, i7-6th gen, 32GB RAM, 1TB NVMe, integrated gpu
+Current speed: 8tok/s
