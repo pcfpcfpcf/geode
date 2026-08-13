@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 #define READ_CHUNK (1u << 20)
-#define PROBE_FILE_BYTES (1024ull << 20)
+#define PROBE_FILE_BYTES (128ull << 20)
 
 typedef struct {
     unsigned major, minor;
@@ -101,14 +101,18 @@ static int writable_dir_on_drive(const DevNum *devs, int ndevs, char *out,
 }
 
 static double bench_seq_read(int fd, unsigned long long byte_limit,
-                             double seconds) {
+                             double seconds, int loop) {
     void *buf = NULL;
     if (posix_memalign(&buf, 4096, READ_CHUNK)) return 0.0;
     double t0 = now_s(), t1 = t0;
     unsigned long long total = 0;
     while (t1 - t0 < seconds) {
         ssize_t got = read(fd, buf, READ_CHUNK);
-        if (got <= 0) break;
+        if (got < 0) break;
+        if (got == 0) {
+            if (!loop || lseek(fd, 0, SEEK_SET)) break;
+            continue;
+        }
         total += (unsigned long long)got;
         if (byte_limit && total >= byte_limit) break;
         t1 = now_s();
@@ -124,7 +128,7 @@ static double measure_raw_device(const char *name, unsigned long long capacity,
     int fd = open(path, O_RDONLY | O_DIRECT);
     if (fd < 0) return 0.0;
     unsigned long long limit = capacity < 4ull << 30 ? capacity : 4ull << 30;
-    double bw = bench_seq_read(fd, limit, seconds);
+    double bw = bench_seq_read(fd, limit, seconds, 0);
     close(fd);
     return bw;
 }
@@ -166,7 +170,7 @@ static double measure_file_on_fs(const char *dirpath, double seconds) {
         unlink(path);
         return 0.0;
     }
-    double bw = bench_seq_read(fd, PROBE_FILE_BYTES, seconds);
+    double bw = bench_seq_read(fd, 0, seconds, 1);
     free(buf);
     close(fd);
     unlink(path);
@@ -201,11 +205,11 @@ int nvme_probe(NvmeDrive **out) {
         drive_devnums(e->d_name, devs, 64, &ndevs);
 
         d->read_bw_bytes_s = measure_raw_device(e->d_name, d->capacity_bytes,
-                                                1.5);
+                                                0.5);
         if (d->read_bw_bytes_s == 0.0) {
             char dirpath[1024] = "";
             if (writable_dir_on_drive(devs, ndevs, dirpath, sizeof dirpath))
-                d->read_bw_bytes_s = measure_file_on_fs(dirpath, 1.5);
+                d->read_bw_bytes_s = measure_file_on_fs(dirpath, 0.5);
         }
         d->measured = d->read_bw_bytes_s > 0.0;
         count++;

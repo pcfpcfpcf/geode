@@ -93,28 +93,40 @@ static int node_capacity(int node, unsigned long long *bytes) {
 }
 
 static double bench_read(uint64_t *p, size_t nw, double seconds) {
-    double t0 = now_s(), t1 = t0;
-    long long passes = 0;
-    uint64_t sum = 0;
-    do {
-        for (size_t i = 0; i < nw; i++) sum += p[i];
-        sink = sum;
-        passes++;
-        t1 = now_s();
-    } while (t1 - t0 < seconds);
-    return (double)passes * nw * 8 / (t1 - t0);
+    double best = 0;
+    double t_end = now_s() + seconds;
+    while (now_s() < t_end) {
+        double t0 = now_s(), t1 = t0;
+        long long passes = 0;
+        uint64_t sum = 0;
+        do {
+            for (size_t i = 0; i < nw; i++) sum += p[i];
+            sink = sum;
+            passes++;
+            t1 = now_s();
+        } while (t1 - t0 < 0.15 && t1 < t_end);
+        double rate = (double)passes * nw * 8 / (t1 - t0);
+        if (rate > best) best = rate;
+    }
+    return best;
 }
 
 static double bench_copy(uint64_t *dst, const uint64_t *src, size_t nw,
                          double seconds) {
-    double t0 = now_s(), t1 = t0;
-    long long passes = 0;
-    do {
-        memcpy(dst, src, nw * 8);
-        passes++;
-        t1 = now_s();
-    } while (t1 - t0 < seconds);
-    return (double)passes * nw * 8 / (t1 - t0);
+    double best = 0;
+    double t_end = now_s() + seconds;
+    while (now_s() < t_end) {
+        double t0 = now_s(), t1 = t0;
+        long long passes = 0;
+        do {
+            memcpy(dst, src, nw * 8);
+            passes++;
+            t1 = now_s();
+        } while (t1 - t0 < 0.15 && t1 < t_end);
+        double rate = (double)passes * nw * 8 / (t1 - t0);
+        if (rate > best) best = rate;
+    }
+    return best;
 }
 
 typedef struct {
@@ -148,8 +160,6 @@ static void *dram_worker(void *arg) {
     pin_memory_to_node(w->dst, WORKER_BUFFER_BYTES, w->node, w->n_nodes);
     for (int i = 0; i < words; i++) w->src[i] = i;
     for (int i = 0; i < words; i++) w->dst[i] = 0;
-    bench_read(w->src, words, 0.1);
-    bench_copy(w->dst, w->src, words, 0.1);
     w->read_bw = bench_read(w->src, words, w->seconds);
     w->copy_bw = bench_copy(w->dst, w->src, words, w->seconds);
     w->ok = 1;
@@ -167,18 +177,24 @@ static void build_chain(char *buf, size_t nslots) {
 }
 
 static double bench_chain(char *buf, size_t nslots, double seconds) {
-    size_t next = 0;
-    double t0 = now_s(), t1 = t0;
-    long long hops = 0;
-    do {
-        for (size_t i = 0; i < nslots; i++) {
-            next = *(uint64_t *)(buf + next * LATENCY_STRIDE);
-            hops++;
-        }
-        t1 = now_s();
-    } while (t1 - t0 < seconds);
-    sink = next;
-    return (t1 - t0) / hops * 1e9;
+    double best_ns = 1e18;
+    double t_end = now_s() + seconds;
+    while (now_s() < t_end) {
+        size_t next = 0;
+        double t0 = now_s(), t1 = t0;
+        long long hops = 0;
+        do {
+            for (size_t i = 0; i < nslots; i++) {
+                next = *(uint64_t *)(buf + next * LATENCY_STRIDE);
+                hops++;
+            }
+            t1 = now_s();
+        } while (t1 - t0 < 0.1 && t1 < t_end);
+        sink = next;
+        double ns = (t1 - t0) / hops * 1e9;
+        if (ns < best_ns) best_ns = ns;
+    }
+    return best_ns;
 }
 
 int dram_probe(DramNode **out) {
@@ -214,7 +230,7 @@ int dram_probe(DramNode **out) {
             workers[w].cpu = cpus[w];
             workers[w].node = node;
             workers[w].n_nodes = n_nodes;
-            workers[w].seconds = 1.0;
+            workers[w].seconds = 0.5;
             pthread_create(&threads[w], NULL, dram_worker, &workers[w]);
         }
         int ok = 1;
@@ -235,7 +251,7 @@ int dram_probe(DramNode **out) {
         pin_memory_to_node(chain, LATENCY_SLOTS * LATENCY_STRIDE, node,
                            n_nodes);
         build_chain(chain, LATENCY_SLOTS);
-        d->load_latency_ns = bench_chain(chain, LATENCY_SLOTS, 0.4);
+        d->load_latency_ns = bench_chain(chain, LATENCY_SLOTS, 0.2);
         free(chain);
     }
     *out = result;
