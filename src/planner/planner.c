@@ -90,6 +90,7 @@ static void jstr(const JVal *obj, const char *key, char *out, size_t outsz) {
 
 static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
                       GpuTier *gpu, double *cpu_flops,
+                      const char **cpu_flops_kind,
                       unsigned long long weights_kv_bytes,
                       char *err, size_t errsz) {
     char *text = json_read_file(path, err, errsz);
@@ -99,11 +100,20 @@ static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
     if (!root) return 0;
 
     *cpu_flops = 0;
+    *cpu_flops_kind = "unmeasured";
     const JVal *jcpu = json_get(root, "cpu");
     if (jcpu) {
         int ok = 1;
-        *cpu_flops = jnum(jcpu, "fp32_flops", &ok);
-        if (!ok) *cpu_flops = 0; /* probe v1: field absent */
+        /* dequant-shaped measurement is the honest bound for quantized
+           inference; plain fp32 fma is the fallback */
+        *cpu_flops = jnum(jcpu, "q4k_dequant_flops", &ok);
+        if (ok && *cpu_flops > 0) {
+            *cpu_flops_kind = "q4k dequant";
+        } else {
+            *cpu_flops = jnum(jcpu, "fp32_flops", &ok);
+            if (ok && *cpu_flops > 0) *cpu_flops_kind = "fp32 fma";
+            else *cpu_flops = 0; /* old probe: fields absent */
+        }
     }
 
     const JVal *jdram = json_get(root, "dram");
@@ -418,8 +428,9 @@ int main(int argc, char **argv) {
     NvmeTier nvme;
     GpuTier gpu;
     double cpu_flops;
-    if (!load_probe(probe_path, &dram, &nvme, &gpu, &cpu_flops, weights_kv,
-                    err, sizeof err)) {
+    const char *cpu_flops_kind;
+    if (!load_probe(probe_path, &dram, &nvme, &gpu, &cpu_flops,
+                    &cpu_flops_kind, weights_kv, err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         return 1;
     }
@@ -450,7 +461,8 @@ int main(int argc, char **argv) {
 
     char size[32];
     if (cpu_flops > 0)
-        printf("probed:  cpu %.0f GFLOPS fp32, ", cpu_flops / 1e9);
+        printf("probed:  cpu %.0f GFLOPS %s, ", cpu_flops / 1e9,
+               cpu_flops_kind);
     else
         printf("probed:  cpu flops unmeasured, ");
     printf("dram %.0f GB/s eff (%s), usable ", dram.eff_bw / 1e9,
