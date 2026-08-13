@@ -184,15 +184,21 @@ predict: 60–90 tok/s decode (calibrating), TTFT ~4s @ 4k
 
 ## 4. Contracts (write these first)
 
-**manifest.json** — offline ↔ runtime:
+**manifest.json** — offline ↔ runtime. Components carry `bytes_per_token`
+(decode reads every layer once per token). Full-weight packages report
+`experts`; decomposed packages report `deltas` instead:
 ```json
 {
   "model": "deepseek-v4-flash",
   "components": {
-    "attention": {"bytes": "...", "pattern": "deterministic"},
-    "base":      {"bytes": "...", "pattern": "deterministic"},
+    "attention": {"bytes_per_token": "...", "pattern": "deterministic"},
+    "base":      {"bytes_per_token": "...", "pattern": "deterministic"},
+    "experts":   {"count": 256, "used_per_token": 8,
+                  "bytes_each": "...", "bytes_per_token": "...",
+                  "pattern": "stochastic"},
     "deltas":    {"count": 256, "bytes_each": "...", "rank": 192}
   },
+  "kv_cache":  {"bytes_per_context_token": "..."},
   "hash_routed_layers": [0, 1, 2],
   "mtp_head": true,
   "variants": ["full-q4", "decomposed-r192-q4"],
