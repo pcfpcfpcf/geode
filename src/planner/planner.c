@@ -64,6 +64,7 @@ typedef struct {
     int scorable;
     char reason[160];
     double point;               /* decode tok/s point estimate */
+    double prefill;             /* prefill tok/s, 0 = unmeasured */
 } Candidate;
 
 static void fmt_size(double bytes, char *out, size_t outsz) {
@@ -469,21 +470,13 @@ int main(int argc, char **argv) {
                                  (2.0 * m.active_params * batch)
                            : INFINITY;
 
-    /* Prefill is GEMM-shaped: pick the device with the higher calibrated
-       rate. The gpu number rests on an assumed dequant efficiency. */
+    /* Prefill is GEMM-shaped, computed wherever each component lives.
+       The gpu number rests on an assumed dequant efficiency. */
     double cpu_prefill = cpu_flops > 0 ? cpu_flops / (2.0 * m.active_params) : 0;
     double gpu_prefill =
         gpu.flops_measured ? gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY /
                                  (2.0 * m.active_params)
                            : 0;
-    double prefill_rate = cpu_prefill;
-    const char *prefill_device = "cpu";
-    int prefill_estimated = 0;
-    if (gpu_prefill > prefill_rate) {
-        prefill_rate = gpu_prefill;
-        prefill_device = gpu.name;
-        prefill_estimated = 1;
-    }
 
     /* Per decode step: attention+base are read once and amortize over the
        batch, but each token routes independently, so expert reads grow with
@@ -513,6 +506,20 @@ int main(int argc, char **argv) {
                  &dram, &gpu, flops_bound);
     score_flash_stream(&cands[3], &m, kv_total, weights_kv, kv_per_token,
                        batch, &dram, &nvme, flops_bound);
+
+    /* Params split approximated by byte split; the Q4_K/Q6_K mix varies
+       little across components. HYBRID prefill serializes: attention on the
+       gpu, everything else on the cpu. */
+    double active_bytes =
+        m.attention_bytes + m.base_bytes + m.routed_bytes;
+    double att_frac = m.attention_bytes / active_bytes;
+    cands[0].prefill = gpu_prefill;
+    cands[1].prefill = cpu_prefill;
+    cands[2].prefill =
+        (gpu_prefill > 0 && cpu_prefill > 0)
+            ? 1.0 / (att_frac / gpu_prefill + (1.0 - att_frac) / cpu_prefill)
+            : 0;
+    cands[3].prefill = cpu_prefill;
 
     Candidate *best = NULL;
     for (int i = 0; i < 4; i++)
@@ -578,13 +585,19 @@ int main(int argc, char **argv) {
     printf("%s\n", m.mtp_head ? ", mtp on" : "");
     printf("predict: %.0f-%.0f tok/s decode (calibrating)",
            best->point * PESSIMISM_LO, best->point);
-    if (prefill_rate > 0)
+    if (best->prefill > 0) {
+        const char *device = "cpu";
+        if (best == &cands[0]) device = gpu.name;
+        else if (best == &cands[2]) device = "gpu+cpu";
         printf(", prefill ~%.0f tok/s on %s%s, TTFT ~%.0fs @ %ld ctx",
-               prefill_rate, prefill_device,
-               prefill_estimated ? " (estimated from fp32 peak)" : "",
-               context / prefill_rate, context);
-    else
+               best->prefill, device,
+               best != &cands[1] && best != &cands[3]
+                   ? " (estimated from fp32 peak)"
+                   : "",
+               context / best->prefill, context);
+    } else {
         printf(", prefill unmeasured (probe has no flops measurement)");
+    }
     printf("\n");
 
     FILE *out = fopen(out_path, "w");
@@ -662,10 +675,8 @@ int main(int argc, char **argv) {
     json_double(&j, NULL, best->point * PESSIMISM_LO);
     json_double(&j, NULL, best->point);
     json_close(&j);
-    if (prefill_rate > 0) {
-        json_double(&j, "predicted_prefill_tok_s", prefill_rate);
-        json_string(&j, "prefill_device", prefill_device);
-    }
+    if (best->prefill > 0)
+        json_double(&j, "predicted_prefill_tok_s", best->prefill);
     json_open(&j, "candidates", 1);
     for (int i = 0; i < 4; i++) {
         json_open(&j, NULL, 0);
