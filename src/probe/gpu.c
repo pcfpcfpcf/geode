@@ -61,39 +61,27 @@ static int pcie_link_of(const char *bus_id, int *gen, int *width) {
     return 0;
 }
 
-static int cuda_bandwidth(void *cuda, int ordinal, double *hbm,
-                          double *pcie_bw, char *err, size_t errsz) {
-    *hbm = 0.0;
-    *pcie_bw = 0.0;
+/* cuDevicePrimaryCtxRetain + cuCtxSetCurrent leaves allocations failing
+   with "invalid device context" on some driver/gpu combos (seen: driver
+   580, Maxwell); cuCtxCreate works everywhere. */
+static int cuda_context(void *cuda, int ordinal, void **ctx_out, char *err,
+                        size_t errsz) {
     typedef int (*cuinit_t)(unsigned);
     typedef int (*cuget_t)(int *, int);
-    typedef int (*cuprim_t)(void **, int);
-    typedef int (*cucur_t)(void *);
-    typedef int (*cumem_t)(unsigned long long *, size_t);
-    typedef int (*cumemhost_t)(void **, size_t);
-    typedef int (*cucopy_t)(unsigned long long, unsigned long long, size_t);
-    typedef int (*cucopyhh_t)(unsigned long long, void *, size_t);
-    typedef int (*cucopyh_t)(void *, unsigned long long, size_t);
+    typedef int (*cuctx_t)(void **, unsigned, int);
     typedef int (*curc_t)(int, const char **);
 
     cuinit_t cuInit = sym(cuda, "cuInit");
     cuget_t cuDeviceGet = sym(cuda, "cuDeviceGet");
-    cuprim_t cuPrimRet = sym(cuda, "cuDevicePrimaryCtxRetain");
-    cucur_t cuSetCur = sym(cuda, "cuCtxSetCurrent");
-    cumem_t cuMemAlloc = sym(cuda, "cuMemAlloc");
-    cumemhost_t cuMemAllocHost = sym(cuda, "cuMemAllocHost");
-    cucopy_t cuDtoD = sym(cuda, "cuMemcpyDtoD");
-    cucopyhh_t cuHtoD = sym(cuda, "cuMemcpyHtoD");
-    cucopyh_t cuDtoH = sym(cuda, "cuMemcpyDtoH");
+    cuctx_t cuCtxCreate = sym(cuda, "cuCtxCreate");
     curc_t cuGetError = sym(cuda, "cuGetErrorString");
-
-    if (!cuInit || !cuDeviceGet || !cuPrimRet || !cuSetCur || !cuMemAlloc ||
-        !cuMemAllocHost || !cuDtoD || !cuHtoD || !cuDtoH) {
+    if (!cuInit || !cuDeviceGet || !cuCtxCreate) {
         snprintf(err, errsz, "CUDA driver API incomplete");
         return -1;
     }
-    if (cuInit(0)) {
-        snprintf(err, errsz, "cuInit failed");
+    int r = cuInit(0);
+    if (r) {
+        snprintf(err, errsz, "cuInit: %d", r);
         return -1;
     }
     int dev;
@@ -101,19 +89,46 @@ static int cuda_bandwidth(void *cuda, int ordinal, double *hbm,
         snprintf(err, errsz, "cuDeviceGet failed");
         return -1;
     }
-    void *ctx = NULL;
-    int r = cuPrimRet(&ctx, dev);
-    if (r || !ctx) {
-        snprintf(err, errsz, "context: %d", r);
+    r = cuCtxCreate(ctx_out, 0, dev);
+    if (r || !*ctx_out) {
+        const char *es = NULL;
+        if (cuGetError && !cuGetError(r, &es) && es)
+            snprintf(err, errsz, "cuCtxCreate: %d (%s)", r, es);
+        else
+            snprintf(err, errsz, "cuCtxCreate: %d", r);
         return -1;
     }
-    if ((r = cuSetCur(ctx))) {
-        snprintf(err, errsz, "cuCtxSetCurrent: %d", r);
+    return 0;
+}
+
+static int cuda_bandwidth(void *cuda, double *hbm, double *pcie_bw,
+                          char *err, size_t errsz) {
+    *hbm = 0.0;
+    *pcie_bw = 0.0;
+    typedef int (*cumem_t)(unsigned long long *, size_t);
+    typedef int (*cumemhost_t)(void **, size_t);
+    typedef int (*cucopy_t)(unsigned long long, unsigned long long, size_t);
+    typedef int (*cucopyhh_t)(unsigned long long, void *, size_t);
+    typedef int (*cucopyh_t)(void *, unsigned long long, size_t);
+    typedef int (*curc_t)(int, const char **);
+
+    cumem_t cuMemAlloc = sym(cuda, "cuMemAlloc");
+    cumemhost_t cuMemAllocHost = sym(cuda, "cuMemAllocHost");
+    cucopy_t cuDtoD = sym(cuda, "cuMemcpyDtoD");
+    cucopyhh_t cuHtoD = sym(cuda, "cuMemcpyHtoD");
+    cucopyh_t cuDtoH = sym(cuda, "cuMemcpyDtoH");
+    typedef int (*cusync_t)(void);
+    cusync_t cuCtxSynchronize = sym(cuda, "cuCtxSynchronize");
+    curc_t cuGetError = sym(cuda, "cuGetErrorString");
+
+    if (!cuMemAlloc || !cuMemAllocHost || !cuDtoD || !cuHtoD || !cuDtoH ||
+        !cuCtxSynchronize) {
+        snprintf(err, errsz, "CUDA driver API incomplete");
         return -1;
     }
 
     unsigned long long d1 = 0, d2 = 0;
-    r = cuMemAlloc(&d1, COPY_BYTES);
+    int r = cuMemAlloc(&d1, COPY_BYTES);
     if (r) {
         sprintf(err, "cuMemAlloc: %d", r);
         const char *es = NULL;
@@ -132,8 +147,10 @@ static int cuda_bandwidth(void *cuda, int ordinal, double *hbm,
     }
 
     cuDtoD(d2, d1, COPY_BYTES);
+    cuCtxSynchronize();
     double t0 = now_s();
     for (int i = 0; i < 4; i++) cuDtoD(d2, d1, COPY_BYTES);
+    cuCtxSynchronize();
     double dt = now_s() - t0;
     if (dt > 0) *hbm = 4.0 * COPY_BYTES / dt;
 
@@ -142,8 +159,172 @@ static int cuda_bandwidth(void *cuda, int ordinal, double *hbm,
         cuHtoD(d1, host, COPY_BYTES);
         cuDtoH(host, d2, COPY_BYTES);
     }
+    cuCtxSynchronize();
     dt = now_s() - t0;
     if (dt > 0) *pcie_bw = 8.0 * COPY_BYTES / dt;
+    return 0;
+}
+
+/* FP32 FMA throughput measured by a kernel the driver JITs from embedded
+   PTX, so any compute capability works without a build-time toolchain.
+   Loop trip count is fixed; on datacenter GPUs the launch may be too short
+   to amortize overhead, which only makes the number pessimistic. */
+#define FLOPS_KERNEL_ITERS 200000
+#define FLOPS_ACCUMULATORS 12
+#define FLOPS_THREADS 256
+#define FLOPS_BLOCKS_PER_SM 8
+#define FLOPS_BENCH_SECONDS 0.5
+
+static const char flops_ptx[] =
+    ".version 6.0\n"
+    ".target sm_50\n"
+    ".address_size 64\n"
+    ".visible .entry geode_flops_kernel(.param .u64 geode_out)\n"
+    "{\n"
+    "    .reg .pred %p<2>;\n"
+    "    .reg .f32 %f<16>;\n"
+    "    .reg .u32 %r<5>;\n"
+    "    .reg .u64 %rd<3>;\n"
+    "    ld.param.u64 %rd1, [geode_out];\n"
+    "    mov.u32 %r1, %ctaid.x;\n"
+    "    mov.u32 %r2, %ntid.x;\n"
+    "    mov.u32 %r3, %tid.x;\n"
+    "    mad.lo.s32 %r1, %r1, %r2, %r3;\n"
+    "    mov.f32 %f1, 0f3F800347;\n"  /* 1.0001f */
+    "    mov.f32 %f2, 0f3A83126F;\n"  /* 0.001f */
+    "    cvt.rn.f32.u32 %f3, %r1;\n"
+    "    mul.f32 %f3, %f3, %f2;\n"
+    "    mov.f32 %f4, %f3;\n"
+    "    mov.f32 %f5, %f3;\n"
+    "    mov.f32 %f6, %f3;\n"
+    "    mov.f32 %f7, %f3;\n"
+    "    mov.f32 %f8, %f3;\n"
+    "    mov.f32 %f9, %f3;\n"
+    "    mov.f32 %f10, %f3;\n"
+    "    mov.f32 %f11, %f3;\n"
+    "    mov.f32 %f12, %f3;\n"
+    "    mov.f32 %f13, %f3;\n"
+    "    mov.f32 %f14, %f3;\n"
+    "    mov.u32 %r4, 200000;\n"
+    "$L_geode_loop:\n"
+    "    fma.rn.f32 %f3, %f3, %f1, %f2;\n"
+    "    fma.rn.f32 %f4, %f4, %f1, %f2;\n"
+    "    fma.rn.f32 %f5, %f5, %f1, %f2;\n"
+    "    fma.rn.f32 %f6, %f6, %f1, %f2;\n"
+    "    fma.rn.f32 %f7, %f7, %f1, %f2;\n"
+    "    fma.rn.f32 %f8, %f8, %f1, %f2;\n"
+    "    fma.rn.f32 %f9, %f9, %f1, %f2;\n"
+    "    fma.rn.f32 %f10, %f10, %f1, %f2;\n"
+    "    fma.rn.f32 %f11, %f11, %f1, %f2;\n"
+    "    fma.rn.f32 %f12, %f12, %f1, %f2;\n"
+    "    fma.rn.f32 %f13, %f13, %f1, %f2;\n"
+    "    fma.rn.f32 %f14, %f14, %f1, %f2;\n"
+    "    add.s32 %r4, %r4, -1;\n"
+    "    setp.ne.s32 %p1, %r4, 0;\n"
+    "    @%p1 bra $L_geode_loop;\n"
+    "    add.f32 %f3, %f3, %f4;\n"
+    "    add.f32 %f5, %f5, %f6;\n"
+    "    add.f32 %f7, %f7, %f8;\n"
+    "    add.f32 %f9, %f9, %f10;\n"
+    "    add.f32 %f11, %f11, %f12;\n"
+    "    add.f32 %f13, %f13, %f14;\n"
+    "    add.f32 %f3, %f3, %f5;\n"
+    "    add.f32 %f7, %f7, %f9;\n"
+    "    add.f32 %f11, %f11, %f13;\n"
+    "    add.f32 %f3, %f3, %f7;\n"
+    "    add.f32 %f3, %f3, %f11;\n"
+    "    cvt.u64.u32 %rd2, %r1;\n"
+    "    shl.b64 %rd2, %rd2, 2;\n"
+    "    add.s64 %rd2, %rd1, %rd2;\n"
+    "    st.global.f32 [%rd2], %f3;\n"
+    "    ret;\n"
+    "}\n";
+
+static int cuda_flops(void *cuda, int ordinal, double *flops, char *err,
+                      size_t errsz) {
+    *flops = 0.0;
+    typedef int (*cumem_t)(unsigned long long *, size_t);
+    typedef int (*cufree_t)(unsigned long long);
+    typedef int (*cumod_t)(void *, const void *);
+    typedef int (*cufunc_t)(void *, void *, const char *);
+    typedef int (*cuattr_t)(int *, int, int);
+    typedef int (*culaunch_t)(void *, unsigned, unsigned, unsigned, unsigned,
+                              unsigned, unsigned, unsigned, void *, void **,
+                              void **);
+    typedef int (*cusync_t)(void);
+    typedef int (*curc_t)(int, const char **);
+
+    cumem_t cuMemAlloc = sym(cuda, "cuMemAlloc");
+    cufree_t cuMemFree = sym(cuda, "cuMemFree");
+    cumod_t cuModuleLoadData = sym(cuda, "cuModuleLoadData");
+    cufunc_t cuModuleGetFunction = sym(cuda, "cuModuleGetFunction");
+    cuattr_t cuDeviceGetAttribute = sym(cuda, "cuDeviceGetAttribute");
+    culaunch_t cuLaunchKernel = sym(cuda, "cuLaunchKernel");
+    cusync_t cuCtxSynchronize = sym(cuda, "cuCtxSynchronize");
+    curc_t cuGetError = sym(cuda, "cuGetErrorString");
+
+    if (!cuMemAlloc || !cuMemFree || !cuModuleLoadData ||
+        !cuModuleGetFunction || !cuDeviceGetAttribute || !cuLaunchKernel ||
+        !cuCtxSynchronize) {
+        snprintf(err, errsz, "CUDA driver API incomplete");
+        return -1;
+    }
+
+    void *module = NULL;
+    int r = cuModuleLoadData(&module, flops_ptx);
+    if (r) {
+        const char *es = NULL;
+        if (cuGetError && !cuGetError(r, &es) && es)
+            snprintf(err, errsz, "ptx jit: %d (%s)", r, es);
+        else
+            snprintf(err, errsz, "ptx jit: %d", r);
+        return -1;
+    }
+    void *kernel = NULL;
+    r = cuModuleGetFunction(&kernel, module, "geode_flops_kernel");
+    if (r) {
+        snprintf(err, errsz, "cuModuleGetFunction: %d", r);
+        return -1;
+    }
+    int sm_count = 0;
+    if (cuDeviceGetAttribute(&sm_count, 16 /* multiprocessor count */,
+                             ordinal) ||
+        sm_count <= 0) {
+        snprintf(err, errsz, "cuDeviceGetAttribute failed");
+        return -1;
+    }
+    int blocks = sm_count * FLOPS_BLOCKS_PER_SM;
+    long long total_threads = (long long)blocks * FLOPS_THREADS;
+
+    unsigned long long out = 0;
+    if (cuMemAlloc(&out, total_threads * 4)) {
+        snprintf(err, errsz, "cuMemAlloc failed");
+        return -1;
+    }
+    void *params[] = {&out};
+
+    cuLaunchKernel(kernel, blocks, 1, 1, FLOPS_THREADS, 1, 1, 0, NULL,
+                   params, NULL);
+    cuCtxSynchronize(); /* warmup: absorb jit + first-launch cost */
+
+    double best = 0;
+    double t_end = now_s() + FLOPS_BENCH_SECONDS;
+    while (now_s() < t_end) {
+        double t0 = now_s();
+        r = cuLaunchKernel(kernel, blocks, 1, 1, FLOPS_THREADS, 1, 1, 0,
+                           NULL, params, NULL);
+        if (r || cuCtxSynchronize()) break;
+        double dt = now_s() - t0;
+        double rate = (double)total_threads * FLOPS_KERNEL_ITERS *
+                      FLOPS_ACCUMULATORS * 2 / dt;
+        if (rate > best) best = rate;
+    }
+    cuMemFree(out);
+    if (best <= 0) {
+        snprintf(err, errsz, "kernel launch failed");
+        return -1;
+    }
+    *flops = best;
     return 0;
 }
 
@@ -243,11 +424,24 @@ int gpu_probe(Gpu **out) {
         }
 
         char err[128] = "";
-        g->bw_measured =
-            cuda_bandwidth(cuda, i, &g->hbm_bw_bytes_s,
-                           &g->pcie_bw_bytes_s, err, sizeof err) == 0;
-        if (!g->bw_measured) snprintf(g->bw_error, sizeof g->bw_error, "%s",
-                                      err);
+        void *ctx = NULL;
+        if (cuda_context(cuda, i, &ctx, err, sizeof err) == 0) {
+            g->bw_measured =
+                cuda_bandwidth(cuda, &g->hbm_bw_bytes_s,
+                               &g->pcie_bw_bytes_s, err, sizeof err) == 0;
+            if (!g->bw_measured)
+                snprintf(g->bw_error, sizeof g->bw_error, "%s", err);
+            g->flops_measured =
+                cuda_flops(cuda, i, &g->fp32_flops, err, sizeof err) == 0;
+            if (!g->flops_measured)
+                snprintf(g->flops_error, sizeof g->flops_error, "%s", err);
+            typedef int (*cud_t)(void *);
+            cud_t cuCtxDestroy = sym(cuda, "cuCtxDestroy");
+            if (cuCtxDestroy) cuCtxDestroy(ctx);
+        } else {
+            snprintf(g->bw_error, sizeof g->bw_error, "%s", err);
+            snprintf(g->flops_error, sizeof g->flops_error, "%s", err);
+        }
     }
     if (nvml_handle && nvmlShutdown) nvmlShutdown();
     *out = gpus;

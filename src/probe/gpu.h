@@ -10,6 +10,9 @@ typedef struct {
     double pcie_bw_bytes_s;
     int bw_measured;
     char bw_error[128];
+    double fp32_flops;
+    int flops_measured;
+    char flops_error[128];
 } Gpu;
 
 int gpu_probe(Gpu **out);

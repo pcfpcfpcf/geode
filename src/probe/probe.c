@@ -91,6 +91,12 @@ static void print_summary(const DramNode *dram, int ndram,
             printf("  gpu   %-24s  %12s  bandwidth unmeasured (%s)\n",
                    gpu[i].name, size,
                    gpu[i].bw_error[0] ? gpu[i].bw_error : "no CUDA driver");
+        if (gpu[i].flops_measured)
+            printf("  gpu   %-24s  %12s  %6.1f GFLOPS fp32\n", "", size,
+                   gpu[i].fp32_flops / 1e9);
+        else if (gpu[i].bw_measured)
+            printf("  gpu   %-24s  %12s  flops unmeasured (%s)\n", "", size,
+                   gpu[i].flops_error[0] ? gpu[i].flops_error : "?");
     }
 }
 
@@ -148,6 +154,8 @@ static void write_json(FILE *f, const DramNode *dram, int ndram,
         json_close(&j);
         json_double(&j, "hbm_bw_bytes_s", gpu[i].hbm_bw_bytes_s);
         json_u64(&j, "bw_measured", gpu[i].bw_measured);
+        json_double(&j, "fp32_flops", gpu[i].fp32_flops);
+        json_u64(&j, "flops_measured", gpu[i].flops_measured);
         json_close(&j);
     }
     json_close(&j);

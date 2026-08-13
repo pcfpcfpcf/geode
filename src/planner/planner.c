@@ -19,6 +19,9 @@
                                     band low end = 0.70 x point estimate */
 #define HYBRID_SYNC_FACTOR 0.90  /* PCIe transfers + pipeline bubbles */
 #define MTP_ACCEPTANCE 2.0       /* only used when manifest has a draft head */
+#define GPU_DEQUANT_EFFICIENCY 0.50 /* assumed until a gpu dequant-shaped
+                                       bench exists; dequant GEMM never hits
+                                       the fp32 fma peak */
 
 static const double h_sweep[] = {0.0, 0.50, 0.85};
 static const int n_h_sweep = sizeof h_sweep / sizeof h_sweep[0];
@@ -39,9 +42,11 @@ typedef struct {
 typedef struct {
     int present;
     int bw_measured;
+    int flops_measured;
     char name[128];
     unsigned long long vram;
     double hbm_bw;
+    double fp32_flops;
 } GpuTier;
 
 typedef struct {
@@ -178,6 +183,8 @@ static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
         gpu->vram = (unsigned long long)jnum(g, "vram_bytes", &ok);
         gpu->hbm_bw = jnum(g, "hbm_bw_bytes_s", &ok);
         gpu->bw_measured = (int)jnum(g, "bw_measured", &ok);
+        gpu->fp32_flops = jnum(g, "fp32_flops", &ok);
+        gpu->flops_measured = (int)jnum(g, "flops_measured", &ok);
         jstr(g, "name", gpu->name, sizeof gpu->name);
     }
 
@@ -234,7 +241,7 @@ static double mtp_multiplier(const Manifest *m) {
 static void score_resident(Candidate *c, const Manifest *m,
                            unsigned long long total_bytes,
                            unsigned long long bytes_per_token,
-                           const GpuTier *gpu) {
+                           const GpuTier *gpu, double gpu_flops_bound) {
     c->name = "RESIDENT";
     c->scorable = 0;
     if (!gpu->present) {
@@ -254,7 +261,9 @@ static void score_resident(Candidate *c, const Manifest *m,
         return;
     }
     c->scorable = 1;
-    c->point = gpu->hbm_bw / bytes_per_token * mtp_multiplier(m);
+    c->point = gpu->hbm_bw / bytes_per_token;
+    if (gpu_flops_bound < c->point) c->point = gpu_flops_bound;
+    c->point *= mtp_multiplier(m);
 }
 
 static void score_cpu_stream(Candidate *c, const Manifest *m,
@@ -278,8 +287,11 @@ static void score_cpu_stream(Candidate *c, const Manifest *m,
 }
 
 static void score_hybrid(Candidate *c, const Manifest *m,
-                         unsigned long long kv_total, const DramPlan *dram,
-                         const GpuTier *gpu, double flops_bound) {
+                         unsigned long long kv_total,
+                         unsigned long long bytes_per_step,
+                         unsigned long long gpu_bytes_per_step,
+                         const DramPlan *dram, const GpuTier *gpu,
+                         double flops_bound) {
     c->name = "HYBRID";
     c->scorable = 0;
     if (!gpu->present) {
@@ -298,9 +310,10 @@ static void score_hybrid(Candidate *c, const Manifest *m,
     }
     /* Decode is expert-byte-bound: experts stream from DRAM exactly as in
        CPU-STREAM; the gpu only takes attention+kv reads off DRAM. */
-    double dram_bytes = m->base_bytes + m->routed_bytes;
     c->scorable = 1;
-    c->point = dram->eff_bw / dram_bytes;
+    c->point = dram->eff_bw / bytes_per_step;
+    double gpu_rate = gpu->hbm_bw / gpu_bytes_per_step;
+    if (gpu_rate < c->point) c->point = gpu_rate;
     if (flops_bound < c->point) c->point = flops_bound;
     c->point *= HYBRID_SYNC_FACTOR * mtp_multiplier(m);
 }
@@ -310,13 +323,15 @@ static void score_hybrid(Candidate *c, const Manifest *m,
    another tier binds. */
 static double flash_rate_at_h(const Manifest *m, const DramPlan *dram,
                               const NvmeTier *nvme,
-                              unsigned long long dram_resident, double h,
-                              double flops_bound) {
-    double dram_rate = dram->eff_bw / (dram_resident + m->routed_bytes * h);
-    double disk_rate = h >= 1.0
-                           ? INFINITY
-                           : nvme->read_bw / (m->routed_bytes * (1.0 - h));
-    double misses = m->n_layer * m->expert_used * (1.0 - h);
+                              unsigned long long att_base,
+                              unsigned long long kv_per_token, long batch,
+                              double h, double flops_bound) {
+    double dram_bytes = att_base + batch * (kv_per_token + m->routed_bytes * h);
+    double dram_rate = dram->eff_bw / dram_bytes;
+    double disk_rate =
+        h >= 1.0 ? INFINITY
+                 : nvme->read_bw / (batch * m->routed_bytes * (1.0 - h));
+    double misses = batch * m->n_layer * m->expert_used * (1.0 - h);
     double serialized = misses * (1.0 - PREFETCH_HIDDEN_FRACTION);
     double latency_rate =
         serialized <= 0.0 ? INFINITY : 1.0 / (NVME_MISS_LATENCY_S * serialized);
@@ -329,12 +344,20 @@ static double flash_rate_at_h(const Manifest *m, const DramPlan *dram,
 
 static void score_flash_stream(Candidate *c, const Manifest *m,
                                unsigned long long kv_total,
+                               unsigned long long weights_kv,
+                               unsigned long long kv_per_token, long batch,
                                const DramPlan *dram, const NvmeTier *nvme,
                                double flops_bound) {
     c->name = "FLASH-STREAM";
     c->scorable = 0;
-    unsigned long long resident = m->attention_bytes + m->base_bytes + kv_total;
-    if (resident > dram->usable) {
+    /* Design doc: FLASH-STREAM is the "else" branch — streaming from disk
+       what could be held in dram is never better. */
+    if (weights_kv <= dram->usable) {
+        snprintf(c->reason, sizeof c->reason, "model fits in dram");
+        return;
+    }
+    unsigned long long att_base = m->attention_bytes + m->base_bytes;
+    if (att_base + kv_total > dram->usable) {
         snprintf(c->reason, sizeof c->reason,
                  "attention+base+kv do not fit in dram");
         return;
@@ -344,7 +367,8 @@ static void score_flash_stream(Candidate *c, const Manifest *m,
         return;
     }
     c->scorable = 1;
-    c->point = flash_rate_at_h(m, dram, nvme, resident, H_ASSUMED, flops_bound);
+    c->point = flash_rate_at_h(m, dram, nvme, att_base, kv_per_token, batch,
+                               H_ASSUMED, flops_bound);
 }
 
 static const char *default_probe_path(void) {
@@ -440,19 +464,55 @@ int main(int argc, char **argv) {
     double flops_bound = cpu_flops > 0
                              ? cpu_flops / (2.0 * m.active_params * batch)
                              : INFINITY;
-    double prefill_rate =
-        cpu_flops > 0 ? cpu_flops / (2.0 * m.active_params) : 0;
+    double gpu_flops_bound =
+        gpu.flops_measured ? gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY /
+                                 (2.0 * m.active_params * batch)
+                           : INFINITY;
 
-    unsigned long long bytes_per_token =
-        m.attention_bytes + m.base_bytes + m.routed_bytes +
+    /* Prefill is GEMM-shaped: pick the device with the higher calibrated
+       rate. The gpu number rests on an assumed dequant efficiency. */
+    double cpu_prefill = cpu_flops > 0 ? cpu_flops / (2.0 * m.active_params) : 0;
+    double gpu_prefill =
+        gpu.flops_measured ? gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY /
+                                 (2.0 * m.active_params)
+                           : 0;
+    double prefill_rate = cpu_prefill;
+    const char *prefill_device = "cpu";
+    int prefill_estimated = 0;
+    if (gpu_prefill > prefill_rate) {
+        prefill_rate = gpu_prefill;
+        prefill_device = gpu.name;
+        prefill_estimated = 1;
+    }
+
+    /* Per decode step: attention+base are read once and amortize over the
+       batch, but each token routes independently, so expert reads grow with
+       the expected union of hit experts; kv reads scale with batch. Rates
+       below are per sequence (latency-oriented). */
+    double experts_hit =
+        m.expert_count *
+        (1.0 - pow(1.0 - (double)m.expert_used / m.expert_count, batch));
+    unsigned long long kv_per_token =
         m.kv_bytes_per_ctx_token * (unsigned long long)context;
+    unsigned long long routed_per_step =
+        (unsigned long long)(experts_hit * m.expert_bytes);
+    unsigned long long bytes_per_step = m.attention_bytes + m.base_bytes +
+                                        routed_per_step +
+                                        kv_per_token * (unsigned long long)batch;
+    unsigned long long hybrid_dram_step =
+        m.base_bytes + routed_per_step;
+    unsigned long long hybrid_gpu_step =
+        m.attention_bytes + kv_per_token * (unsigned long long)batch;
 
     Candidate cands[4];
-    score_resident(&cands[0], &m, weights_kv, bytes_per_token, &gpu);
-    score_cpu_stream(&cands[1], &m, weights_kv, bytes_per_token, &dram,
+    score_resident(&cands[0], &m, weights_kv, bytes_per_step, &gpu,
+                   gpu_flops_bound);
+    score_cpu_stream(&cands[1], &m, weights_kv, bytes_per_step, &dram,
                      flops_bound);
-    score_hybrid(&cands[2], &m, kv_total, &dram, &gpu, flops_bound);
-    score_flash_stream(&cands[3], &m, kv_total, &dram, &nvme, flops_bound);
+    score_hybrid(&cands[2], &m, kv_total, hybrid_dram_step, hybrid_gpu_step,
+                 &dram, &gpu, flops_bound);
+    score_flash_stream(&cands[3], &m, kv_total, weights_kv, kv_per_token,
+                       batch, &dram, &nvme, flops_bound);
 
     Candidate *best = NULL;
     for (int i = 0; i < 4; i++)
@@ -500,14 +560,13 @@ int main(int argc, char **argv) {
     }
 
     if (best == &cands[3]) {
-        unsigned long long resident =
-            m.attention_bytes + m.base_bytes + kv_total;
+        unsigned long long att_base = m.attention_bytes + m.base_bytes;
         printf("hit-rate dial (routed %.2f GB/token, nvme %.1f GB/s):\n",
                m.routed_bytes / 1e9, nvme.read_bw / 1e9);
         for (int i = 0; i < n_h_sweep; i++)
             printf("  h=%-4.0f%% -> %.1f tok/s\n", h_sweep[i] * 100,
-                   flash_rate_at_h(&m, &dram, &nvme, resident, h_sweep[i],
-                                   flops_bound));
+                   flash_rate_at_h(&m, &dram, &nvme, att_base, kv_per_token,
+                                   batch, h_sweep[i], flops_bound));
         if (strstr(m.variant, "decomposed") == NULL)
             printf("note: streaming full experts; decomposition cuts routed "
                    "bytes ~7x\n");
@@ -520,7 +579,9 @@ int main(int argc, char **argv) {
     printf("predict: %.0f-%.0f tok/s decode (calibrating)",
            best->point * PESSIMISM_LO, best->point);
     if (prefill_rate > 0)
-        printf(", prefill ~%.0f tok/s, TTFT ~%.0fs @ %ld ctx", prefill_rate,
+        printf(", prefill ~%.0f tok/s on %s%s, TTFT ~%.0fs @ %ld ctx",
+               prefill_rate, prefill_device,
+               prefill_estimated ? " (estimated from fp32 peak)" : "",
                context / prefill_rate, context);
     else
         printf(", prefill unmeasured (probe has no flops measurement)");
@@ -601,7 +662,10 @@ int main(int argc, char **argv) {
     json_double(&j, NULL, best->point * PESSIMISM_LO);
     json_double(&j, NULL, best->point);
     json_close(&j);
-    if (prefill_rate > 0) json_double(&j, "predicted_prefill_tok_s", prefill_rate);
+    if (prefill_rate > 0) {
+        json_double(&j, "predicted_prefill_tok_s", prefill_rate);
+        json_string(&j, "prefill_device", prefill_device);
+    }
     json_open(&j, "candidates", 1);
     for (int i = 0; i < 4; i++) {
         json_open(&j, NULL, 0);
