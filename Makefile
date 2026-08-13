@@ -2,7 +2,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -Isrc/common
 LDLIBS   = -ldl -pthread
 
-PROBE_SRC = src/probe/probe.c src/probe/dram.c \
+PROBE_SRC = src/probe/probe.c src/probe/dram.c src/probe/flops.c \
             src/probe/nvme.c src/probe/gpu.c src/common/json.c
 
 all: probe manifest planner

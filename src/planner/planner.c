@@ -89,13 +89,22 @@ static void jstr(const JVal *obj, const char *key, char *out, size_t outsz) {
 }
 
 static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
-                      GpuTier *gpu, unsigned long long weights_kv_bytes,
+                      GpuTier *gpu, double *cpu_flops,
+                      unsigned long long weights_kv_bytes,
                       char *err, size_t errsz) {
     char *text = json_read_file(path, err, errsz);
     if (!text) return 0;
     JVal *root = json_parse(text, err, errsz);
     free(text);
     if (!root) return 0;
+
+    *cpu_flops = 0;
+    const JVal *jcpu = json_get(root, "cpu");
+    if (jcpu) {
+        int ok = 1;
+        *cpu_flops = jnum(jcpu, "fp32_flops", &ok);
+        if (!ok) *cpu_flops = 0; /* probe v1: field absent */
+    }
 
     const JVal *jdram = json_get(root, "dram");
     if (!jdram || jdram->kind != JV_ARR || jdram->n_items == 0) {
@@ -241,7 +250,7 @@ static void score_resident(Candidate *c, const Manifest *m,
 static void score_cpu_stream(Candidate *c, const Manifest *m,
                              unsigned long long total_bytes,
                              unsigned long long bytes_per_token,
-                             const DramPlan *dram) {
+                             const DramPlan *dram, double flops_bound) {
     c->name = "CPU-STREAM";
     c->scorable = 0;
     if (total_bytes > dram->usable) {
@@ -253,12 +262,14 @@ static void score_cpu_stream(Candidate *c, const Manifest *m,
         return;
     }
     c->scorable = 1;
-    c->point = dram->eff_bw / bytes_per_token * mtp_multiplier(m);
+    c->point = dram->eff_bw / bytes_per_token;
+    if (flops_bound < c->point) c->point = flops_bound;
+    c->point *= mtp_multiplier(m);
 }
 
 static void score_hybrid(Candidate *c, const Manifest *m,
                          unsigned long long kv_total, const DramPlan *dram,
-                         const GpuTier *gpu) {
+                         const GpuTier *gpu, double flops_bound) {
     c->name = "HYBRID";
     c->scorable = 0;
     if (!gpu->present) {
@@ -279,7 +290,9 @@ static void score_hybrid(Candidate *c, const Manifest *m,
        CPU-STREAM; the gpu only takes attention+kv reads off DRAM. */
     double dram_bytes = m->base_bytes + m->routed_bytes;
     c->scorable = 1;
-    c->point = dram->eff_bw / dram_bytes * HYBRID_SYNC_FACTOR * mtp_multiplier(m);
+    c->point = dram->eff_bw / dram_bytes;
+    if (flops_bound < c->point) c->point = flops_bound;
+    c->point *= HYBRID_SYNC_FACTOR * mtp_multiplier(m);
 }
 
 /* The design-doc formula with h folded into bytes: equivalent to
@@ -287,7 +300,8 @@ static void score_hybrid(Candidate *c, const Manifest *m,
    another tier binds. */
 static double flash_rate_at_h(const Manifest *m, const DramPlan *dram,
                               const NvmeTier *nvme,
-                              unsigned long long dram_resident, double h) {
+                              unsigned long long dram_resident, double h,
+                              double flops_bound) {
     double dram_rate = dram->eff_bw / (dram_resident + m->routed_bytes * h);
     double disk_rate = h >= 1.0
                            ? INFINITY
@@ -299,12 +313,14 @@ static double flash_rate_at_h(const Manifest *m, const DramPlan *dram,
     double rate = dram_rate;
     if (disk_rate < rate) rate = disk_rate;
     if (latency_rate < rate) rate = latency_rate;
+    if (flops_bound < rate) rate = flops_bound;
     return rate * mtp_multiplier(m);
 }
 
 static void score_flash_stream(Candidate *c, const Manifest *m,
                                unsigned long long kv_total,
-                               const DramPlan *dram, const NvmeTier *nvme) {
+                               const DramPlan *dram, const NvmeTier *nvme,
+                               double flops_bound) {
     c->name = "FLASH-STREAM";
     c->scorable = 0;
     unsigned long long resident = m->attention_bytes + m->base_bytes + kv_total;
@@ -318,7 +334,7 @@ static void score_flash_stream(Candidate *c, const Manifest *m,
         return;
     }
     c->scorable = 1;
-    c->point = flash_rate_at_h(m, dram, nvme, resident, H_ASSUMED);
+    c->point = flash_rate_at_h(m, dram, nvme, resident, H_ASSUMED, flops_bound);
 }
 
 static const char *default_probe_path(void) {
@@ -401,11 +417,20 @@ int main(int argc, char **argv) {
     DramPlan dram;
     NvmeTier nvme;
     GpuTier gpu;
-    if (!load_probe(probe_path, &dram, &nvme, &gpu, weights_kv, err,
-                    sizeof err)) {
+    double cpu_flops;
+    if (!load_probe(probe_path, &dram, &nvme, &gpu, &cpu_flops, weights_kv,
+                    err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         return 1;
     }
+
+    /* Experts are dequantized and multiplied on the cpu in every strategy
+       except RESIDENT, so the cpu flops bound applies to all of them. */
+    double flops_bound = cpu_flops > 0
+                             ? cpu_flops / (2.0 * m.active_params * batch)
+                             : INFINITY;
+    double prefill_rate =
+        cpu_flops > 0 ? cpu_flops / (2.0 * m.active_params) : 0;
 
     unsigned long long bytes_per_token =
         m.attention_bytes + m.base_bytes + m.routed_bytes +
@@ -413,9 +438,10 @@ int main(int argc, char **argv) {
 
     Candidate cands[4];
     score_resident(&cands[0], &m, weights_kv, bytes_per_token, &gpu);
-    score_cpu_stream(&cands[1], &m, weights_kv, bytes_per_token, &dram);
-    score_hybrid(&cands[2], &m, kv_total, &dram, &gpu);
-    score_flash_stream(&cands[3], &m, kv_total, &dram, &nvme);
+    score_cpu_stream(&cands[1], &m, weights_kv, bytes_per_token, &dram,
+                     flops_bound);
+    score_hybrid(&cands[2], &m, kv_total, &dram, &gpu, flops_bound);
+    score_flash_stream(&cands[3], &m, kv_total, &dram, &nvme, flops_bound);
 
     Candidate *best = NULL;
     for (int i = 0; i < 4; i++)
@@ -423,7 +449,11 @@ int main(int argc, char **argv) {
             best = &cands[i];
 
     char size[32];
-    printf("probed:  dram %.0f GB/s eff (%s), usable ", dram.eff_bw / 1e9,
+    if (cpu_flops > 0)
+        printf("probed:  cpu %.0f GFLOPS fp32, ", cpu_flops / 1e9);
+    else
+        printf("probed:  cpu flops unmeasured, ");
+    printf("dram %.0f GB/s eff (%s), usable ", dram.eff_bw / 1e9,
            dram.policy);
     fmt_size((double)dram.usable, size, sizeof size);
     printf("%s, nvme %.1f GB/s", size, nvme.read_bw / 1e9);
@@ -464,7 +494,8 @@ int main(int argc, char **argv) {
                m.routed_bytes / 1e9, nvme.read_bw / 1e9);
         for (int i = 0; i < n_h_sweep; i++)
             printf("  h=%-4.0f%% -> %.1f tok/s\n", h_sweep[i] * 100,
-                   flash_rate_at_h(&m, &dram, &nvme, resident, h_sweep[i]));
+                   flash_rate_at_h(&m, &dram, &nvme, resident, h_sweep[i],
+                                   flops_bound));
         if (strstr(m.variant, "decomposed") == NULL)
             printf("note: streaming full experts; decomposition cuts routed "
                    "bytes ~7x\n");
@@ -474,9 +505,14 @@ int main(int argc, char **argv) {
     printf("plan:    %s, numa %s", best->name, dram.policy);
     if (dram.replicas > 1) printf(" (%d replicas)", dram.replicas);
     printf("%s\n", m.mtp_head ? ", mtp on" : "");
-    printf("predict: %.0f-%.0f tok/s decode (calibrating), prefill unmeasured "
-           "(probe v1 has no flops benchmark)\n",
+    printf("predict: %.0f-%.0f tok/s decode (calibrating)",
            best->point * PESSIMISM_LO, best->point);
+    if (prefill_rate > 0)
+        printf(", prefill ~%.0f tok/s, TTFT ~%.0fs @ %ld ctx", prefill_rate,
+               context / prefill_rate, context);
+    else
+        printf(", prefill unmeasured (probe has no flops measurement)");
+    printf("\n");
 
     FILE *out = fopen(out_path, "w");
     if (!out) {
@@ -553,6 +589,7 @@ int main(int argc, char **argv) {
     json_double(&j, NULL, best->point * PESSIMISM_LO);
     json_double(&j, NULL, best->point);
     json_close(&j);
+    if (prefill_rate > 0) json_double(&j, "predicted_prefill_tok_s", prefill_rate);
     json_open(&j, "candidates", 1);
     for (int i = 0; i < 4; i++) {
         json_open(&j, NULL, 0);

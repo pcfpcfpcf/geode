@@ -1,4 +1,5 @@
 #include "dram.h"
+#include "flops.h"
 #include "gpu.h"
 #include "json.h"
 #include "nvme.h"
@@ -44,8 +45,15 @@ static void cpu_model(char *out, size_t outsz) {
 
 static void print_summary(const DramNode *dram, int ndram,
                           const NvmeDrive *nvme, int nnvme, const Gpu *gpu,
-                          int ngpu) {
+                          int ngpu, double flops, int flops_threads) {
     printf("probed hardware:\n");
+    char model[256];
+    cpu_model(model, sizeof model);
+    if (flops > 0)
+        printf("  cpu   %-40s  %6.1f GFLOPS fp32 (%d threads)\n", model,
+               flops / 1e9, flops_threads);
+    else
+        printf("  cpu   %-40s  flops unmeasured\n", model);
     for (int i = 0; i < ndram; i++) {
         char size[32];
         fmt_size((double)dram[i].capacity_bytes, size, sizeof size);
@@ -82,7 +90,7 @@ static void print_summary(const DramNode *dram, int ndram,
 
 static void write_json(FILE *f, const DramNode *dram, int ndram,
                        const NvmeDrive *nvme, int nnvme, const Gpu *gpu,
-                       int ngpu) {
+                       int ngpu, double flops, int flops_threads) {
     char model[256] = "";
     cpu_model(model, sizeof model);
 
@@ -91,6 +99,8 @@ static void write_json(FILE *f, const DramNode *dram, int ndram,
     json_u64(&j, "schema", 1);
     json_open(&j, "cpu", 0);
     json_string(&j, "model", model);
+    json_double(&j, "fp32_flops", flops);
+    json_u64(&j, "flops_threads", (unsigned long long)flops_threads);
     json_close(&j);
 
     json_open(&j, "dram", 1);
@@ -159,11 +169,13 @@ int main(int argc, char **argv) {
     DramNode *dram = NULL;
     NvmeDrive *nvme = NULL;
     Gpu *gpu = NULL;
+    int flops_threads = 0;
     int ndram = dram_probe(&dram);
     int nnvme = nvme_probe(&nvme);
     int ngpu = gpu_probe(&gpu);
+    double flops = flops_probe(&flops_threads);
 
-    print_summary(dram, ndram, nvme, nnvme, gpu, ngpu);
+    print_summary(dram, ndram, nvme, nnvme, gpu, ngpu, flops, flops_threads);
 
     char dir[1024];
     snprintf(dir, sizeof dir, "%s", out_path);
@@ -178,7 +190,7 @@ int main(int argc, char **argv) {
         perror(out_path);
         return 1;
     }
-    write_json(f, dram, ndram, nvme, nnvme, gpu, ngpu);
+    write_json(f, dram, ndram, nvme, nnvme, gpu, ngpu, flops, flops_threads);
     if (fclose(f)) {
         perror(out_path);
         return 1;
