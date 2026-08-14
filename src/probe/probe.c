@@ -2,6 +2,7 @@
 #include "flops.h"
 #include "gpu.h"
 #include "json.h"
+#include "modules.h"
 #include "nvme.h"
 
 #include <stdio.h>
@@ -185,7 +186,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "usage: %s [OUT.json]\n", argv0);
 }
 
-int main(int argc, char **argv) {
+int probe_main(int argc, char **argv) {
     const char *out_path = default_path();
     if (argc > 2) {
         usage(argv[0]);

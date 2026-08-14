@@ -1,4 +1,5 @@
 #include "json.h"
+#include "modules.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -411,7 +412,7 @@ static void usage(const char *argv0) {
             argv0);
 }
 
-int main(int argc, char **argv) {
+int planner_main(int argc, char **argv) {
     const char *probe_path = default_probe_path();
     const char *manifest_path = default_manifest_path();
     const char *out_path = default_out_path();

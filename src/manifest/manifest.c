@@ -1,4 +1,5 @@
 #include "json.h"
+#include "modules.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,7 +166,7 @@ static const char *default_out_path(void) {
     return buf;
 }
 
-int main(int argc, char **argv) {
+int manifest_main(int argc, char **argv) {
     if (argc < 2 || argc > 3) {
         fprintf(stderr, "usage: %s MODEL.gguf [OUT.json]\n", argv[0]);
         return 2;
