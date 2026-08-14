@@ -99,8 +99,8 @@ Re-plan if achieved diverges >30% from predicted.
 | Strategy | Weights in | Condition | Backend |
 |---|---|---|---|
 | RESIDENT | VRAM | fits in VRAM | llama.cpp / vLLM |
-| CPU-STREAM | DRAM | fits in DRAM | kt-kernel |
-| HYBRID | CPU-STREAM + attention/KV in VRAM | GPU present, prefill-heavy workload | kt-kernel |
+| CPU-STREAM | DRAM | fits in DRAM | **built in-house** |
+| HYBRID | CPU-STREAM + attention/KV in VRAM | GPU present, prefill-heavy workload | **built in-house** |
 | FLASH-STREAM | DRAM pool + NVMe | else | **built in-house** |
 
 **HYBRID accelerates both prefill and decode.** Prefill: attention/KV GEMM on
@@ -291,17 +291,19 @@ predict: 60–90 tok/s decode (calibrating), TTFT ~4s @ 4k
 | Stage | Deliverable | Kill criterion |
 |---|---|---|
 | 0 | probe + bench harness; baseline on target box | box BW too low → re-scope promise |
-| 1 | planner + kt-kernel integration (CPU-STREAM). **First experiment: NUMA replication** — cheapest 1.5–2×, no new science | <2× over stock llama.cpp |
+| 1 | **in-house executor**: CPU-STREAM first (all on DRAM), then attention+KV on GPU → HYBRID. Minimal scope — one arch, Q4_K_M, batch 1–8; port ggml kernels as reference | HYBRID achieved < CPU-STREAM achieved |
 | 2 | decomposition pipeline | quality loss on task evals → full-weight fallback |
 | 3 | expert cache: pool, predictor, balance admission, parallel-tier read. First application: HYBRID (VRAM above DRAM) | achieved h outside tolerance of `h_balanced` |
 | 4 | FLASH-STREAM executor (NVMe prefetch, layout, latency term) — expert cache applied to the disk tier | hit rate <70% with trace pinning |
 | 5 | MTP speculation | acceptance <2.0 |
 | 6 | RESIDENT parity, polish, registry | — |
 
-**Stage 1 is a wrapper.** kt-kernel + planner + NUMA config is a consulting
-deliverable, not defensible product — price it like integration work. The IP
-starts at Stage 2 (decomposition) and 3 (expert cache). Don't confuse shipping
-Stage 1 with having a moat.
+**Stage 1 is in-house by necessity, not ambition.** llama.cpp offloads whole
+layers — component-level placement is impossible inside its scheduler — and
+kt-kernel won't run on Maxwell. Placement is the product; it can't be delegated
+to a backend. Scope stays minimal: one architecture, one quant, batch 1–8,
+kernels ported from ggml as reference. The moat still starts at Stage 2
+(decomposition) and 3 (expert cache) — the executor is the vehicle, not the IP.
 
 ## 7. Competition / gap
 

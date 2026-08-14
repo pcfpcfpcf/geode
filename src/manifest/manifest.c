@@ -1,5 +1,6 @@
 #include "json.h"
 #include "modules.h"
+#include "quant.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,27 +11,6 @@
 
 #define GGUF_MAGIC 0x46554747u /* "GGUF" */
 #define KV_DTYPE_BYTES 2       /* KV cache stored as f16 */
-
-typedef struct {
-    const char *name;
-    int block_size;
-    int type_size;
-} QuantType;
-
-static const QuantType quant_types[] = {
-    {"F32", 1, 4},      {"F16", 1, 2},      {"Q4_0", 32, 18},
-    {"Q4_1", 32, 20},   {NULL, 0, 0},       {NULL, 0, 0},
-    {"Q5_0", 32, 22},   {"Q5_1", 32, 24},   {"Q8_0", 32, 34},
-    {"Q8_1", 32, 36},   {"Q2_K", 256, 84},  {"Q3_K", 256, 110},
-    {"Q4_K", 256, 144}, {"Q5_K", 256, 176}, {"Q6_K", 256, 210},
-    {"Q8_K", 256, 292}, {"IQ2_XXS", 256, 66},  {"IQ2_XS", 256, 74},
-    {"IQ3_XXS", 256, 98},  {"IQ1_S", 256, 50},  {"IQ4_NL", 32, 18},
-    {"IQ3_S", 256, 110},   {"IQ2_S", 256, 82},  {"IQ4_XS", 256, 136},
-    {"I8", 1, 1},       {"I16", 1, 2},      {"I32", 1, 4},
-    {"I64", 1, 8},      {"F64", 1, 8},      {"IQ1_M", 256, 56},
-    {"BF16", 1, 2},
-};
-static const int n_quant_types = sizeof quant_types / sizeof quant_types[0];
 
 typedef enum {
     T_EMBED,
