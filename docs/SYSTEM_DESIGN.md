@@ -103,23 +103,72 @@ Re-plan if achieved diverges >30% from predicted.
 | HYBRID | CPU-STREAM + attention/KV in VRAM | GPU present, prefill-heavy workload | kt-kernel |
 | FLASH-STREAM | DRAM pool + NVMe | else | **built in-house** |
 
-**HYBRID is not a decode strategy — it is a prefill accelerator bolted onto
-CPU-STREAM.** Decode is expert-byte-bound; both configs read experts from the
-same DRAM at the same bandwidth, so decode is ≈ equal. The GPU accelerates
-only attention/prefill GEMM. Attention placement is a *variable* the planner
-scores, not a strategy constant.
+**HYBRID accelerates both prefill and decode.** Prefill: attention/KV GEMM on
+the GPU. Decode: the parallel-tier expert cache (see below) splits expert
+reads across HBM and DRAM, so the two bandwidth sources stack. Without the
+expert cache, decode is expert-byte-bound on DRAM and HYBRID ≈ CPU-STREAM.
+Attention placement is a *variable* the planner scores, not a strategy
+constant.
 
 Same box ± GPU:
 
 | | Decode | Cold prefill | KV capacity | Sync cost |
 |---|---|---|---|---|
 | CPU-STREAM | 1.0× (baseline) | 1.0× | all of DRAM | — |
-| HYBRID | 0.8–1.0×; **>1× at long ctx** (KV reads moved off DRAM, BW returned to experts) | 3–6× | capped by VRAM; offload back to RAM negates | per-layer PCIe transfers + pipeline bubbles |
+| HYBRID | ~1.4× with expert cache (see below); 0.8–1.0× without, **>1× at long ctx** | 3–6× | capped by VRAM; offload back to RAM negates | per-layer PCIe transfers + pipeline bubbles |
 
 Planner rule: add GPU to the plan iff `prefill_savings > pcie_overhead` at the
 workload's context length and prefill:decode ratio. Warm-cache agentic loops
 (prefill amortized) → GPU earns little. Cold-heavy workloads (fresh 32k docs)
 → GPU pays for itself.
+
+**Expert cache policy — balance, don't maximize.** The pool concept
+generalizes beyond FLASH-STREAM: cache hot experts at *every* tier boundary,
+not just DRAM above NVMe. For HYBRID this means a VRAM expert cache above
+DRAM — attention+KV resident in VRAM as before, plus as many hot experts as
+the balance point calls for. Both tiers read in parallel; the bottleneck is
+`max(gpu_time, dram_time)`, not the sum.
+
+The optimal admission is the hit rate that load-balances the two tiers —
+not the highest hit rate the cache can hold:
+```
+h_balanced = (bw_fast × (fixed_slow + movable) − bw_slow × fixed_fast)
+             / (movable × (bw_fast + bw_slow))
+```
+where `fixed_fast`/`fixed_slow` is the non-expert work already bound to each
+tier and `movable` is the routed expert bytes/token. Past this point, every
+expert promoted to the fast tier makes it *slower* — you're moving work from
+an underutilized tier to an overutilized one.
+
+On the target box (HBM 34.8 GB/s, DRAM 24.3 GB/s; fixed GPU 495 MB =
+attention+KV@4k, fixed DRAM 287 MB = base, movable 356 MB = routed):
+
+| h | GPU ms | DRAM ms | bottleneck | tok/s | vs ollama 8.75 |
+|---|---|---|---|---|---|
+| 0 (no cache) | 14.2 | 26.5 | DRAM | 37.8 | 4.3× |
+| **0.49** | **19.3** | **19.3** | **either** | **51.9** | **5.9×** |
+| 0.85 | 22.9 | 14.0 | GPU | 43.6 | 5.0× |
+| 1.0 | 24.4 | 11.8 | GPU | 40.9 | 4.7× |
+
+h=0.85 is worse than h=0.49. "Cache as much as fits" over-caches into
+GPU-bound territory and throws away the parallel-bandwidth advantage.
+
+**Bandwidth ratio sets the policy.** The same formula covers FLASH-STREAM
+(DRAM above NVMe), but a 12× bandwidth ratio puts `h_balanced` near 1 and
+makes the curve sharply asymmetric: under-caching is catastrophic (NVMe time
+explodes), over-caching is nearly free (DRAM sits idle). There, "maximize h"
+is the right one-sided approximation. For HYBRID (HBM above DRAM, 1.4× apart)
+the curve is symmetric and you must hit the balance point — over-caching
+hurts as much as under-caching. Same mechanism, different operating point,
+determined entirely by the bandwidth ratio between adjacent tiers.
+
+**Predictor target shifts accordingly.** The predictor does not aim for the
+highest possible h — it aims for `h_balanced` on this hardware. For
+FLASH-STREAM (far tiers) this collapses to "maximize h" and the existing
+Stage-3 kill criterion (`hit rate <70% with trace pinning`) still holds. For
+HYBRID (close tiers) over-prediction is a performance bug, not just wasted
+cache, and the kill criterion is "achieved h within tolerance of
+`h_balanced`" — missing high hurts as much as missing low.
 
 FLASH-STREAM internals:
 - **Pool:** 6–12GB DRAM of hot/predicted deltas. **Design constraint: pool is
@@ -244,13 +293,14 @@ predict: 60–90 tok/s decode (calibrating), TTFT ~4s @ 4k
 | 0 | probe + bench harness; baseline on target box | box BW too low → re-scope promise |
 | 1 | planner + kt-kernel integration (CPU-STREAM). **First experiment: NUMA replication** — cheapest 1.5–2×, no new science | <2× over stock llama.cpp |
 | 2 | decomposition pipeline | quality loss on task evals → full-weight fallback |
-| 3 | FLASH-STREAM executor (pool, prefetch, layout) | hit rate <70% with trace pinning |
-| 4 | MTP speculation | acceptance <2.0 |
-| 5 | RESIDENT/HYBRID parity, polish, registry | — |
+| 3 | expert cache: pool, predictor, balance admission, parallel-tier read. First application: HYBRID (VRAM above DRAM) | achieved h outside tolerance of `h_balanced` |
+| 4 | FLASH-STREAM executor (NVMe prefetch, layout, latency term) — expert cache applied to the disk tier | hit rate <70% with trace pinning |
+| 5 | MTP speculation | acceptance <2.0 |
+| 6 | RESIDENT parity, polish, registry | — |
 
 **Stage 1 is a wrapper.** kt-kernel + planner + NUMA config is a consulting
 deliverable, not defensible product — price it like integration work. The IP
-starts at Stage 2 (decomposition) and 3 (disk tier). Don't confuse shipping
+starts at Stage 2 (decomposition) and 3 (expert cache). Don't confuse shipping
 Stage 1 with having a moat.
 
 ## 7. Competition / gap
