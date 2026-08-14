@@ -56,9 +56,10 @@ static void usage(const char *argv0) {
             "  %s plan [opts]        same, with planner opts\n"
             "                        (--context N --batch N --out plan.json)\n"
             "  %s probe|manifest|planner [args...]   run one step\n"
+            "  %s exec-run MODEL.gguf [PROMPT] [N]   generate on the cpu\n"
             "\n"
             "cache: ~/.geode/probe.json, manifest.json, plan.json\n",
-            argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -75,6 +76,7 @@ int main(int argc, char **argv) {
         return exec_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "exec-tokenize") == 0)
         return exec_main(argc - 1, argv + 1);
+    if (strcmp(argv[1], "exec-run") == 0) return exec_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
         usage(argv[0]);

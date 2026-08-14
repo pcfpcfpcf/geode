@@ -1,6 +1,7 @@
 #include "kernels.h"
 #include "quant.h"
 
+#include <math.h>
 #include <string.h>
 
 /* Block layouts and dequant math follow ggml (llama.cpp) exactly. */
@@ -25,7 +26,7 @@ typedef struct {
     uint16_t d;
 } block_q6_K;
 
-static inline float fp16_to_fp32(uint16_t h) {
+float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
     uint32_t exp = (h >> 10) & 0x1f;
     uint32_t man = h & 0x3ff;
@@ -150,6 +151,123 @@ void dequant_row(const void *data, unsigned type, int n, float *dst) {
     }
     default:
         break;
+    }
+}
+
+uint16_t fp32_to_fp16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((bits >> 23) & 0xff) - 127 + 15;
+    uint32_t man = bits & 0x7fffffu;
+
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        man |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t sub = man >> shift;
+        if ((man >> (shift - 1)) & 1) sub++;
+        return (uint16_t)(sign | sub);
+    }
+    uint16_t half = (uint16_t)(sign | ((uint32_t)exp << 10) | (man >> 13));
+    if (man & 0x1000u) half++;
+    return half;
+}
+
+size_t row_bytes(unsigned type, int n) {
+    QuantType quant = quant_types[type];
+    return (size_t)(n / quant.block_size) * (size_t)quant.type_size;
+}
+
+void matvec(float *out, const void *rows, unsigned type, int n_in,
+            int row_begin, int row_end, const float *x) {
+    const unsigned char *row = (const unsigned char *)rows +
+                               (size_t)row_begin * row_bytes(type, n_in);
+    size_t stride = row_bytes(type, n_in);
+    for (int r = row_begin; r < row_end; r++, row += stride)
+        out[r] = gemv_row(row, type, n_in, x);
+}
+
+void rmsnorm(float *out, const float *x, const float *weight, int n,
+             float eps) {
+    float sum = 0;
+    for (int i = 0; i < n; i++) sum += x[i] * x[i];
+    float scale = 1.0f / sqrtf(sum / (float)n + eps);
+    for (int i = 0; i < n; i++) out[i] = x[i] * scale * weight[i];
+}
+
+void softmax(float *values, int n) {
+    float max = values[0];
+    for (int i = 1; i < n; i++)
+        if (values[i] > max) max = values[i];
+    float sum = 0;
+    for (int i = 0; i < n; i++) {
+        values[i] = expf(values[i] - max);
+        sum += values[i];
+    }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) values[i] *= inv;
+}
+
+void swiglu(float *out, const float *gate, const float *up, int n) {
+    for (int i = 0; i < n; i++)
+        out[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];
+}
+
+void add_scaled(float *dst, const float *src, float scale, int n) {
+    for (int i = 0; i < n; i++) dst[i] += src[i] * scale;
+}
+
+float dot_fp16(const uint16_t *values, const float *x, int n) {
+    float acc = 0;
+    for (int i = 0; i < n; i++) acc += fp16_to_fp32(values[i]) * x[i];
+    return acc;
+}
+
+void accumulate_fp16(float *dst, const uint16_t *values, float weight, int n) {
+    for (int i = 0; i < n; i++) dst[i] += fp16_to_fp32(values[i]) * weight;
+}
+
+static float corr_dim(int n_dims, int orig_ctx, float n_rot, float base) {
+    return (float)n_dims * logf((float)orig_ctx / (n_rot * 2.0f * (float)M_PI)) /
+           (2.0f * logf(base));
+}
+
+void rope_init(RopeConfig *rope, float freq_base, float freq_scale, int n_dims,
+               int orig_ctx, float beta_fast, float beta_slow) {
+    rope->freq_scale = freq_scale;
+    rope->theta_step = powf(freq_base, -2.0f / (float)n_dims);
+    rope->n_dims = n_dims;
+    rope->corr_low = floorf(corr_dim(n_dims, orig_ctx, beta_fast, freq_base));
+    rope->corr_high = ceilf(corr_dim(n_dims, orig_ctx, beta_slow, freq_base));
+}
+
+/* Interleaved pairing: dimension 2i rotates against 2i+1. DeepSeek emits its
+   rotary dimensions in that order, so the split-half pairing that most recent
+   architectures use yields text that reads fluently but has lost track of
+   position -- it recalls facts and cannot continue "1, 2, 3".
+   Magnitude is left alone -- see the mscale note in model.c. */
+void rope_apply(float *vec, const RopeConfig *rope, int position) {
+    int n_pairs = rope->n_dims / 2;
+    float theta_extrap = (float)position;
+    float span = rope->corr_high - rope->corr_low;
+    if (span < 0.001f) span = 0.001f;
+
+    for (int i = 0; i < n_pairs; i++, theta_extrap *= rope->theta_step) {
+        float ramp = 1.0f - ((float)i - rope->corr_low) / span;
+        if (ramp < 0.0f) ramp = 0.0f;
+        if (ramp > 1.0f) ramp = 1.0f;
+
+        float theta_interp = rope->freq_scale * theta_extrap;
+        float theta = theta_interp * (1.0f - ramp) + theta_extrap * ramp;
+        float cos_theta = cosf(theta);
+        float sin_theta = sinf(theta);
+
+        float low = vec[2 * i];
+        float high = vec[2 * i + 1];
+        vec[2 * i] = low * cos_theta - high * sin_theta;
+        vec[2 * i + 1] = low * sin_theta + high * cos_theta;
     }
 }
 

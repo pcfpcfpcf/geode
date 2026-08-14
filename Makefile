@@ -8,8 +8,9 @@ GEODE_SRC = src/geode.c \
             src/probe/nvme.c src/probe/gpu.c \
             src/manifest/manifest.c \
             src/planner/planner.c \
-            src/exec/gguf.c src/exec/kernels.c src/exec/tokenizer.c src/exec/exec.c \
-            src/common/json.c src/common/quant.c
+            src/exec/gguf.c src/exec/kernels.c src/exec/tokenizer.c \
+            src/exec/model.c src/exec/forward.c src/exec/exec.c \
+            src/common/json.c src/common/quant.c src/common/parallel.c
 
 BIN   := bin/geode
 

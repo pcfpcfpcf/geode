@@ -104,9 +104,11 @@ Re-plan if achieved diverges >30% from predicted.
 | FLASH-STREAM | DRAM pool + NVMe | else | **built in-house** |
 
 **HYBRID accelerates both prefill and decode.** Prefill: attention/KV GEMM on
-the GPU. Decode: the parallel-tier expert cache (see below) splits expert
-reads across HBM and DRAM, so the two bandwidth sources stack. Without the
-expert cache, decode is expert-byte-bound on DRAM and HYBRID ≈ CPU-STREAM.
+the GPU. Decode gains twice, and the two gains are independent. First, moving
+attention+KV to VRAM takes their bytes off the DRAM path — 495 of 1139 MB per
+token on the target box at 4k ctx — which stands on its own with no expert
+cache at all. Second, the parallel-tier expert cache (see below) splits routed
+expert reads across HBM and DRAM, so the two bandwidth sources stack.
 Attention placement is a *variable* the planner scores, not a strategy
 constant.
 
@@ -115,7 +117,12 @@ Same box ± GPU:
 | | Decode | Cold prefill | KV capacity | Sync cost |
 |---|---|---|---|---|
 | CPU-STREAM | 1.0× (baseline) | 1.0× | all of DRAM | — |
-| HYBRID | ~1.4× with expert cache (see below); 0.8–1.0× without, **>1× at long ctx** | 3–6× | capped by VRAM; offload back to RAM negates | per-layer PCIe transfers + pipeline bubbles |
+| HYBRID | 1.8× without expert cache, 2.4× with (see below); **grows with ctx** | 3–6× | capped by VRAM; offload back to RAM negates | per-layer PCIe transfers + pipeline bubbles |
+
+Decode multipliers are the bandwidth model of the table below. The planner
+predicts less — 1.5× point estimate on the target box — because it also charges
+the cpu dequant-flops bound and a PCIe sync factor. Stage 1 measures which one
+the box obeys.
 
 Planner rule: add GPU to the plan iff `prefill_savings > pcie_overhead` at the
 workload's context length and prefill:decode ratio. Warm-cache agentic loops
@@ -141,17 +148,22 @@ expert promoted to the fast tier makes it *slower* — you're moving work from
 an underutilized tier to an overutilized one.
 
 On the target box (HBM 34.8 GB/s, DRAM 24.3 GB/s; fixed GPU 495 MB =
-attention+KV@4k, fixed DRAM 287 MB = base, movable 356 MB = routed):
+attention+KV@4k, fixed DRAM 287 MB = base, movable 356 MB = routed).
+CPU-STREAM reads all 1139 MB from DRAM — 46.8 ms, 21.4 tok/s — and is the
+baseline both right-hand columns divide by:
 
-| h | GPU ms | DRAM ms | bottleneck | tok/s | vs ollama 8.75 |
-|---|---|---|---|---|---|
-| 0 (no cache) | 14.2 | 26.5 | DRAM | 37.8 | 4.3× |
-| **0.49** | **19.3** | **19.3** | **either** | **51.9** | **5.9×** |
-| 0.85 | 22.9 | 14.0 | GPU | 43.6 | 5.0× |
-| 1.0 | 24.4 | 11.8 | GPU | 40.9 | 4.7× |
+| h | GPU ms | DRAM ms | bottleneck | tok/s | vs CPU-STREAM 21.4 | vs ollama 8.75 |
+|---|---|---|---|---|---|---|
+| 0 (no cache) | 14.2 | 26.5 | DRAM | 37.8 | 1.8× | 4.3× |
+| **0.49** | **19.3** | **19.3** | **either** | **51.9** | **2.4×** | **5.9×** |
+| 0.85 | 22.9 | 14.0 | GPU | 43.6 | 2.0× | 5.0× |
+| 1.0 | 24.4 | 11.8 | GPU | 40.9 | 1.9× | 4.7× |
 
 h=0.85 is worse than h=0.49. "Cache as much as fits" over-caches into
 GPU-bound territory and throws away the parallel-bandwidth advantage.
+
+The h=0 row is also why the Stage-1 gate is winnable before this cache
+exists: attention+KV in VRAM alone clears CPU-STREAM by 1.8×.
 
 **Bandwidth ratio sets the policy.** The same formula covers FLASH-STREAM
 (DRAM above NVMe), but a 12× bandwidth ratio puts `h_balanced` near 1 and

@@ -1,5 +1,7 @@
+#include "forward.h"
 #include "gguf.h"
 #include "kernels.h"
+#include "model.h"
 #include "modules.h"
 #include "quant.h"
 #include "tokenizer.h"
@@ -8,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void cfg(const GgufFile *g, const char *arch, const char *key) {
     char full[160];
@@ -146,9 +149,100 @@ static int tokenize_test(const GgufFile *g) {
     return ok ? 0 : 1;
 }
 
+#define PROMPT_TOKENS_MAX 2048
+#define DEFAULT_PREDICT_TOKENS 32
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static int argmax(const float *values, int n) {
+    int best = 0;
+    for (int i = 1; i < n; i++)
+        if (values[i] > values[best]) best = i;
+    return best;
+}
+
+static int run_prompt(const GgufFile *g, const char *prompt, int n_predict) {
+    char err[256];
+    Model model;
+    if (!model_load(&model, g, err, sizeof err)) {
+        fprintf(stderr, "%s\n", err);
+        return 1;
+    }
+    Tokenizer tokenizer;
+    if (!tokenizer_init(&tokenizer, g, err, sizeof err)) {
+        fprintf(stderr, "%s\n", err);
+        model_free(&model);
+        return 1;
+    }
+
+    int prompt_ids[PROMPT_TOKENS_MAX];
+    int n_prompt = 0;
+    if (tokenizer.add_bos) prompt_ids[n_prompt++] = tokenizer.bos_id;
+    int n_text = tokenizer_encode(&tokenizer, prompt, prompt_ids + n_prompt,
+                                  PROMPT_TOKENS_MAX - n_prompt);
+    if (n_text > 0) n_prompt += n_text;
+    if (n_prompt < 1) {
+        fprintf(stderr, "prompt encoded to %d tokens; expected at least 1\n",
+                n_prompt);
+        tokenizer_free(&tokenizer);
+        model_free(&model);
+        return 1;
+    }
+
+    Runtime *runtime =
+        runtime_start(&model, n_prompt + n_predict, 0, err, sizeof err);
+    if (!runtime) {
+        fprintf(stderr, "%s\n", err);
+        tokenizer_free(&tokenizer);
+        model_free(&model);
+        return 1;
+    }
+
+    double started = now_seconds();
+    const float *logits = NULL;
+    for (int i = 0; i < n_prompt; i++)
+        logits = forward(runtime, prompt_ids[i], i);
+    double prefilled = now_seconds();
+
+    printf("%s", prompt);
+    fflush(stdout);
+
+    int generated = 0;
+    for (int i = 0; i < n_predict; i++) {
+        int token = argmax(logits, model.n_vocab);
+        if (token == tokenizer.eos_id) break;
+        char text[512];
+        tokenizer_decode(&tokenizer, &token, 1, text, sizeof text);
+        printf("%s", text);
+        fflush(stdout);
+        generated++;
+        logits = forward(runtime, token, n_prompt + i);
+    }
+    double finished = now_seconds();
+
+    double prefill_seconds = prefilled - started;
+    double decode_seconds = finished - prefilled;
+    printf("\n\nprefill: %d tokens in %.2fs (%.1f tok/s)\n", n_prompt,
+           prefill_seconds, n_prompt / prefill_seconds);
+    if (generated > 0)
+        printf("decode:  %d tokens in %.2fs (%.2f tok/s)\n", generated,
+               decode_seconds, generated / decode_seconds);
+
+    runtime_stop(runtime);
+    tokenizer_free(&tokenizer);
+    model_free(&model);
+    return 0;
+}
+
 int exec_main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL.gguf\n", argv[0]);
+    int generating = strcmp(argv[0], "exec-run") == 0;
+    if (argc < 2 || (generating ? argc > 4 : argc != 2)) {
+        fprintf(stderr, "usage: %s MODEL.gguf%s\n", argv[0],
+                generating ? " [PROMPT] [N_PREDICT]" : "");
         return 2;
     }
     char err[256];
@@ -158,6 +252,19 @@ int exec_main(int argc, char **argv) {
         return 1;
     }
 
+    if (generating) {
+        const char *prompt = argc > 2 ? argv[2] : "The capital of France is";
+        int n_predict = argc > 3 ? atoi(argv[3]) : DEFAULT_PREDICT_TOKENS;
+        if (n_predict < 1) {
+            fprintf(stderr, "N_PREDICT is %d; expected at least 1\n",
+                    n_predict);
+            gguf_close(&g);
+            return 2;
+        }
+        int rc = run_prompt(&g, prompt, n_predict);
+        gguf_close(&g);
+        return rc;
+    }
     if (strcmp(argv[0], "exec-kernels") == 0) {
         int rc = kernels_test(&g);
         gguf_close(&g);
