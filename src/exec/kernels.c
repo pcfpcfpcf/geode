@@ -31,6 +31,15 @@ typedef struct {
     uint16_t d;
 } block_q6_K;
 
+/* Activations quantized per 256, mirroring the weight block size. group_sums
+   holds the sum of each 16 quants: Q4_K needs them in pairs to cancel its
+   sub-block minimum without touching the quants again. */
+typedef struct {
+    float scale;
+    int8_t qs[QK_K];
+    int16_t group_sums[QK_K / 16];
+} ActivationBlock;
+
 float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
     uint32_t exp = (h >> 10) & 0x1f;
@@ -178,137 +187,122 @@ hsum256(__m256 v) {
     return _mm_cvtss_f32(lo);
 }
 
-/* Per 64-element group the two nibble halves carry different scales and mins,
-   so each needs both a weighted dot and a plain sum of activations; the four
-   partial vectors fold into one accumulator and hsum once per row. */
+/* Weights stay unsigned nibbles and activations are signed int8, which is
+   exactly the operand pairing VPMADDUBSW wants: 32 multiply-accumulates per
+   instruction against 8 for float FMA. Q4_K's per-sub-block minimum is a
+   constant offset, so it folds into a sum of activations taken from the
+   precomputed group sums instead of costing any multiplies. */
 __attribute__((target("avx2,fma,f16c"))) static float
-gemv_q4k_avx2(const block_q4_K *blocks, int nb, const float *x) {
-    const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+gemv_q4k_q8_avx2(const block_q4_K *blocks, int nb,
+                 const ActivationBlock *activations) {
+    const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
     __m256 acc = _mm256_setzero_ps();
+    float offset_acc = 0;
 
     for (int i = 0; i < nb; i++) {
         const block_q4_K *b = &blocks[i];
+        const ActivationBlock *a = &activations[i];
         const uint8_t *q = b->qs;
-        const float *xb = x + i * 256;
-        float d = fp16_to_fp32(b->d);
-        float min = fp16_to_fp32(b->dmin);
+        __m256i sumi = _mm256_setzero_si256();
+        int offsets = 0;
         int is = 0;
 
         for (int j = 0; j < 256; j += 64) {
-            uint8_t sc, m;
-            get_scale_min_k4(is + 0, b->scales, &sc, &m);
-            float d1 = d * sc, m1 = min * m;
-            get_scale_min_k4(is + 1, b->scales, &sc, &m);
-            float d2 = d * sc, m2 = min * m;
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, b->scales, &sc1, &m1);
+            get_scale_min_k4(is + 1, b->scales, &sc2, &m2);
 
-            __m256 dot_lo = _mm256_setzero_ps(), dot_hi = _mm256_setzero_ps();
-            __m256 sum_lo = _mm256_setzero_ps(), sum_hi = _mm256_setzero_ps();
-            for (int l = 0; l < 32; l += 8) {
-                __m128i bytes = _mm_loadl_epi64((const __m128i *)(q + l));
-                __m256i lo = _mm256_cvtepu8_epi32(
-                    _mm_and_si128(bytes, nibble_mask));
-                __m256i hi = _mm256_cvtepu8_epi32(
-                    _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask));
-                __m256 xlo = _mm256_loadu_ps(xb + j + l);
-                __m256 xhi = _mm256_loadu_ps(xb + j + 32 + l);
-                dot_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(lo), xlo, dot_lo);
-                dot_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(hi), xhi, dot_hi);
-                sum_lo = _mm256_add_ps(sum_lo, xlo);
-                sum_hi = _mm256_add_ps(sum_hi, xhi);
-            }
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(d1), dot_lo, acc);
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(d2), dot_hi, acc);
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(-m1), sum_lo, acc);
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(-m2), sum_hi, acc);
+            __m256i packed = _mm256_loadu_si256((const __m256i *)q);
+            __m256i low = _mm256_and_si256(packed, nibble_mask);
+            __m256i high =
+                _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask);
+            __m256i xlow =
+                _mm256_loadu_si256((const __m256i *)(a->qs + j));
+            __m256i xhigh =
+                _mm256_loadu_si256((const __m256i *)(a->qs + j + 32));
+
+            sumi = _mm256_add_epi32(
+                sumi, _mm256_madd_epi16(_mm256_maddubs_epi16(low, xlow),
+                                        _mm256_set1_epi16(sc1)));
+            sumi = _mm256_add_epi32(
+                sumi, _mm256_madd_epi16(_mm256_maddubs_epi16(high, xhigh),
+                                        _mm256_set1_epi16(sc2)));
+
+            int g = j / 16;
+            offsets += m1 * (a->group_sums[g + 0] + a->group_sums[g + 1]);
+            offsets += m2 * (a->group_sums[g + 2] + a->group_sums[g + 3]);
             q += 32;
             is += 2;
         }
+        acc = _mm256_fmadd_ps(
+            _mm256_set1_ps(fp16_to_fp32(b->d) * a->scale),
+            _mm256_cvtepi32_ps(sumi), acc);
+        offset_acc -= fp16_to_fp32(b->dmin) * a->scale * (float)offsets;
     }
-    return hsum256(acc);
+    return hsum256(acc) + offset_acc;
 }
 
+/* Q6_K is symmetric around 32 with no stored minimum, so the -32 is recovered
+   by multiplying the activations against a constant 32 and subtracting. */
 __attribute__((target("avx2,fma,f16c"))) static float
-gemv_q6k_avx2(const block_q6_K *blocks, int nb, const float *x) {
-    const __m256i nibble_mask = _mm256_set1_epi32(0x0F);
-    const __m256i pair_mask = _mm256_set1_epi32(3);
-    const __m256i offset = _mm256_set1_epi32(32);
+gemv_q6k_q8_avx2(const block_q6_K *blocks, int nb,
+                 const ActivationBlock *activations) {
+    const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
+    const __m256i pair_mask = _mm256_set1_epi8(3);
+    const __m256i thirty_two = _mm256_set1_epi8(32);
     __m256 acc = _mm256_setzero_ps();
 
     for (int i = 0; i < nb; i++) {
         const block_q6_K *b = &blocks[i];
+        const ActivationBlock *a = &activations[i];
         const uint8_t *ql = b->ql;
         const uint8_t *qh = b->qh;
         const int8_t *sc = b->scales;
-        const float *xb = x + i * 256;
-        float d = fp16_to_fp32(b->d);
+        __m256i sumi = _mm256_setzero_si256();
 
         for (int n2 = 0; n2 < 256; n2 += 128) {
-            for (int l = 0; l < 32; l += 8) {
-                int is = l / 16;
-                __m256i low = _mm256_cvtepu8_epi32(
-                    _mm_loadl_epi64((const __m128i *)(ql + l)));
-                __m256i low32 = _mm256_cvtepu8_epi32(
-                    _mm_loadl_epi64((const __m128i *)(ql + l + 32)));
-                __m256i high = _mm256_cvtepu8_epi32(
-                    _mm_loadl_epi64((const __m128i *)(qh + l)));
+            __m256i low = _mm256_loadu_si256((const __m256i *)ql);
+            __m256i low32 = _mm256_loadu_si256((const __m256i *)(ql + 32));
+            __m256i high = _mm256_loadu_si256((const __m256i *)qh);
 
-                __m256i q1 = _mm256_sub_epi32(
-                    _mm256_or_si256(
-                        _mm256_and_si256(low, nibble_mask),
-                        _mm256_slli_epi32(
-                            _mm256_and_si256(high, pair_mask), 4)),
-                    offset);
-                __m256i q2 = _mm256_sub_epi32(
-                    _mm256_or_si256(
-                        _mm256_and_si256(low32, nibble_mask),
-                        _mm256_slli_epi32(
-                            _mm256_and_si256(_mm256_srli_epi32(high, 2),
-                                             pair_mask),
-                            4)),
-                    offset);
-                __m256i q3 = _mm256_sub_epi32(
-                    _mm256_or_si256(
-                        _mm256_srli_epi32(low, 4),
-                        _mm256_slli_epi32(
-                            _mm256_and_si256(_mm256_srli_epi32(high, 4),
-                                             pair_mask),
-                            4)),
-                    offset);
-                __m256i q4 = _mm256_sub_epi32(
-                    _mm256_or_si256(
-                        _mm256_srli_epi32(low32, 4),
-                        _mm256_slli_epi32(
-                            _mm256_and_si256(_mm256_srli_epi32(high, 6),
-                                             pair_mask),
-                            4)),
-                    offset);
+            __m256i quants[4];
+            quants[0] = _mm256_or_si256(
+                _mm256_and_si256(low, nibble_mask),
+                _mm256_slli_epi16(_mm256_and_si256(high, pair_mask), 4));
+            quants[1] = _mm256_or_si256(
+                _mm256_and_si256(low32, nibble_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(high, 2), pair_mask), 4));
+            quants[2] = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(low, 4), nibble_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(high, 4), pair_mask), 4));
+            quants[3] = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(low32, 4), nibble_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(high, 6), pair_mask), 4));
 
-                const float *xs = xb + n2 + l;
-                acc = _mm256_fmadd_ps(
-                    _mm256_cvtepi32_ps(q1),
-                    _mm256_mul_ps(_mm256_set1_ps(d * sc[is + 0]),
-                                  _mm256_loadu_ps(xs)),
-                    acc);
-                acc = _mm256_fmadd_ps(
-                    _mm256_cvtepi32_ps(q2),
-                    _mm256_mul_ps(_mm256_set1_ps(d * sc[is + 2]),
-                                  _mm256_loadu_ps(xs + 32)),
-                    acc);
-                acc = _mm256_fmadd_ps(
-                    _mm256_cvtepi32_ps(q3),
-                    _mm256_mul_ps(_mm256_set1_ps(d * sc[is + 4]),
-                                  _mm256_loadu_ps(xs + 64)),
-                    acc);
-                acc = _mm256_fmadd_ps(
-                    _mm256_cvtepi32_ps(q4),
-                    _mm256_mul_ps(_mm256_set1_ps(d * sc[is + 6]),
-                                  _mm256_loadu_ps(xs + 96)),
-                    acc);
+            for (int part = 0; part < 4; part++) {
+                __m256i x = _mm256_loadu_si256(
+                    (const __m256i *)(a->qs + n2 + 32 * part));
+                __m256i product = _mm256_sub_epi16(
+                    _mm256_maddubs_epi16(quants[part], x),
+                    _mm256_maddubs_epi16(thirty_two, x));
+                /* Lanes 0-7 cover the first 16 weights and lanes 8-15 the
+                   next, and those two halves carry different scales. */
+                __m256i scales = _mm256_inserti128_si256(
+                    _mm256_castsi128_si256(_mm_set1_epi16(sc[2 * part + 0])),
+                    _mm_set1_epi16(sc[2 * part + 1]), 1);
+                sumi = _mm256_add_epi32(sumi,
+                                        _mm256_madd_epi16(scales, product));
             }
             ql += 64;
             qh += 32;
             sc += 8;
         }
+        acc = _mm256_fmadd_ps(
+            _mm256_set1_ps(fp16_to_fp32(b->d) * a->scale),
+            _mm256_cvtepi32_ps(sumi), acc);
     }
     return hsum256(acc);
 }
@@ -361,18 +355,79 @@ uint16_t fp32_to_fp16(float value) {
     return half;
 }
 
+size_t activation_bytes(int n) {
+    return (size_t)(n / QK_K) * sizeof(ActivationBlock);
+}
+
+/* Scale so the largest-magnitude value lands on -127: taking the signed
+   extreme rather than the absolute one keeps the quantization symmetric
+   around whichever end actually saturates. */
+void activation_set(Activation *activation, void *scratch, const float *values,
+                    int n) {
+    activation->values = values;
+    activation->n = n;
+    activation->blocks = NULL;
+    if (n % QK_K != 0 || !scratch) return;
+
+    ActivationBlock *blocks = scratch;
+    for (int i = 0; i < n / QK_K; i++) {
+        ActivationBlock *block = &blocks[i];
+        const float *x = values + i * QK_K;
+
+        float extreme = 0, largest = 0;
+        for (int j = 0; j < QK_K; j++) {
+            float magnitude = fabsf(x[j]);
+            if (magnitude > largest) {
+                largest = magnitude;
+                extreme = x[j];
+            }
+        }
+        if (largest == 0) {
+            memset(block, 0, sizeof *block);
+            continue;
+        }
+
+        float inverse_scale = -127.0f / extreme;
+        for (int j = 0; j < QK_K; j++) {
+            int q = (int)lrintf(inverse_scale * x[j]);
+            block->qs[j] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
+        }
+        for (int g = 0; g < QK_K / 16; g++) {
+            int sum = 0;
+            for (int k = 0; k < 16; k++) sum += block->qs[g * 16 + k];
+            block->group_sums[g] = (int16_t)sum;
+        }
+        block->scale = 1.0f / inverse_scale;
+    }
+    activation->blocks = blocks;
+}
+
 size_t row_bytes(unsigned type, int n) {
     QuantType quant = quant_types[type];
     return (size_t)(n / quant.block_size) * (size_t)quant.type_size;
 }
 
 void matvec(float *out, const void *rows, unsigned type, int n_in,
-            int row_begin, int row_end, const float *x) {
-    const unsigned char *row = (const unsigned char *)rows +
-                               (size_t)row_begin * row_bytes(type, n_in);
+            int row_begin, int row_end, const Activation *x) {
     size_t stride = row_bytes(type, n_in);
+    const unsigned char *row =
+        (const unsigned char *)rows + (size_t)row_begin * stride;
+
+#ifdef HAVE_AVX2
+    if (x->blocks && have_avx2() &&
+        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K)) {
+        int nb = n_in / QK_K;
+        for (int r = row_begin; r < row_end; r++, row += stride)
+            out[r] = type == GGML_TYPE_Q4_K
+                         ? gemv_q4k_q8_avx2((const block_q4_K *)row, nb,
+                                            x->blocks)
+                         : gemv_q6k_q8_avx2((const block_q6_K *)row, nb,
+                                            x->blocks);
+        return;
+    }
+#endif
     for (int r = row_begin; r < row_end; r++, row += stride)
-        out[r] = gemv_row(row, type, n_in, x);
+        out[r] = gemv_row(row, type, n_in, x->values);
 }
 
 void rmsnorm(float *out, const float *x, const float *weight, int n,
@@ -467,14 +522,6 @@ void rope_apply(float *vec, const RopeConfig *rope, int position) {
 }
 
 float gemv_row(const void *data, unsigned type, int n_in, const float *x) {
-#ifdef HAVE_AVX2
-    if (have_avx2()) {
-        if (type == GGML_TYPE_Q4_K)
-            return gemv_q4k_avx2(data, n_in / QK_K, x);
-        if (type == GGML_TYPE_Q6_K)
-            return gemv_q6k_avx2(data, n_in / QK_K, x);
-    }
-#endif
     switch (type) {
     case GGML_TYPE_F32: {
         const float *w = data;

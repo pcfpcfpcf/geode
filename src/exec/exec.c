@@ -69,6 +69,10 @@ static void dump_layer_tensors(const GgufFile *g, int layer) {
     }
 }
 
+/* Rounding an activation to int8 costs a fraction of a percent per dot; well
+   past this the quantization is not the explanation and the kernel is wrong. */
+#define ACTIVATION_TOLERANCE 0.02f
+
 /* Dequant the first 256 elements of a tensor, print them, and check gemv_row
    against a naive dequant-then-dot reference. */
 static int check_tensor(const GgufFile *g, const char *name) {
@@ -89,15 +93,34 @@ static int check_tensor(const GgufFile *g, const char *name) {
 
     int ok = 1;
     for (int i = 0; i < n; i++) x[i] = (float)(i % 7) - 3.0f;
-    float got = gemv_row(t->data, t->type, n, x);
     float want = 0;
     for (int i = 0; i < n; i++) want += deq[i] * x[i];
+
+    float got = gemv_row(t->data, t->type, n, x);
     if (fabsf(got - want) > 1e-3f * (1.0f + fabsf(want))) {
         printf("    gemv MISMATCH: got %.6f want %.6f\n", got, want);
         ok = 0;
     } else {
         printf("    gemv ok: %.6f\n", got);
     }
+
+    /* matvec is the path decode actually takes, and it quantizes activations
+       to int8 first, so it is held to int8 tolerance rather than gemv's. */
+    void *scratch = malloc(activation_bytes(n) + 1);
+    Activation activation;
+    float quantized = 0;
+    activation_set(&activation, scratch, x, n);
+    matvec(&quantized, t->data, t->type, n, 0, 1, &activation);
+    float tolerance = ACTIVATION_TOLERANCE * (1.0f + fabsf(want));
+    if (fabsf(quantized - want) > tolerance) {
+        printf("    matvec MISMATCH: got %.6f want %.6f (tolerance %.6f)\n",
+               quantized, want, tolerance);
+        ok = 0;
+    } else {
+        printf("    matvec ok: %.6f (%.3f%% off reference)\n", quantized,
+               100.0f * fabsf(quantized - want) / (1.0f + fabsf(want)));
+    }
+    free(scratch);
     free(x);
     free(deq);
     return ok;

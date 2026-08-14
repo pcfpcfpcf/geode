@@ -24,11 +24,25 @@ void rope_apply(float *vec, const RopeConfig *rope, int position);
 float fp16_to_fp32(uint16_t half);
 uint16_t fp32_to_fp16(float value);
 
+/* An activation vector quantized to int8 once per matvec, so the cost is paid
+   once and every row of the weight matrix reuses it. Weight types with no
+   integer path, and lengths that are not a whole number of blocks, fall back
+   to `values`. */
+typedef struct {
+    const float *values;
+    const void *blocks;
+    int n;
+} Activation;
+
+size_t activation_bytes(int n);
+void activation_set(Activation *activation, void *scratch, const float *values,
+                    int n);
+
 size_t row_bytes(unsigned type, int n);
 float gemv_row(const void *data, unsigned type, int n_in, const float *x);
 void dequant_row(const void *data, unsigned type, int n, float *dst);
 void matvec(float *out, const void *rows, unsigned type, int n_in,
-            int row_begin, int row_end, const float *x);
+            int row_begin, int row_end, const Activation *x);
 
 void rmsnorm(float *out, const float *x, const float *weight, int n,
              float eps);

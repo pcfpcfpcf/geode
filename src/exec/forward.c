@@ -40,7 +40,18 @@ struct Runtime {
     float *expert_out;
     float *logits;
     ExpertChoice *chosen;
+
+    /* One quantization slot per worker: the sequential path fills slot 0 for
+       every worker to read, while attention quantizes per head inside the
+       parallel region and each worker needs its own. */
+    unsigned char *activation_scratch;
+    size_t activation_slot_bytes;
 };
+
+static void *activation_slot(Runtime *runtime, int worker) {
+    return runtime->activation_scratch +
+           (size_t)worker * runtime->activation_slot_bytes;
+}
 
 static const void *matrix_at(const GgufTensor *tensor, int index) {
     size_t matrix_bytes = (size_t)tensor->dims[1] *
@@ -59,7 +70,7 @@ typedef struct {
     unsigned type;
     int n_in;
     int n_out;
-    const float *x;
+    const Activation *x;
 } MatvecJob;
 
 static void matvec_worker(void *state, int worker, int n_workers) {
@@ -71,12 +82,15 @@ static void matvec_worker(void *state, int worker, int n_workers) {
 
 static void run_matvec(Runtime *runtime, float *out, const GgufTensor *tensor,
                        int matrix_index, const float *x) {
+    Activation activation;
+    activation_set(&activation, activation_slot(runtime, 0), x,
+                   (int)tensor->dims[0]);
     MatvecJob job = {out,
                      matrix_at(tensor, matrix_index),
                      tensor->type,
                      (int)tensor->dims[0],
                      (int)tensor->dims[1],
-                     x};
+                     &activation};
     pool_run(runtime->pool, matvec_worker, &job);
 }
 
@@ -106,9 +120,12 @@ static void attention_worker(void *state, int worker, int n_workers) {
         float *scores = runtime->scores + (size_t)head * runtime->n_ctx;
         float *attn_latent = runtime->attn_latent + (size_t)head * rank;
 
+        Activation activation;
         rope_apply(query_rope, &runtime->rope, job->position);
+        activation_set(&activation, activation_slot(runtime, worker), query,
+                       model->qk_nope_dim);
         matvec(query_latent, matrix_at(job->layer->k_b, head),
-               job->layer->k_b->type, model->qk_nope_dim, 0, rank, query);
+               job->layer->k_b->type, model->qk_nope_dim, 0, rank, &activation);
 
         for (int p = 0; p < job->n_cached; p++) {
             const uint16_t *slot = cache_slot(runtime, job->layer_index, p);
@@ -124,9 +141,11 @@ static void attention_worker(void *state, int worker, int n_workers) {
                             cache_slot(runtime, job->layer_index, p), scores[p],
                             rank);
 
+        activation_set(&activation, activation_slot(runtime, worker),
+                       attn_latent, rank);
         matvec(runtime->attn_out + (size_t)head * model->head_dim_v,
                matrix_at(job->layer->v_b, head), job->layer->v_b->type, rank, 0,
-               model->head_dim_v, attn_latent);
+               model->head_dim_v, &activation);
     }
 }
 
@@ -283,7 +302,22 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     int shared = model->n_ff_expert * model->n_expert_shared;
     if (shared > inner) inner = shared;
 
-    int ok = runtime->pool != NULL;
+    if (!runtime->pool) {
+        snprintf(err, errsz, "could not start %d worker threads", n_threads);
+        runtime_stop(runtime);
+        return NULL;
+    }
+
+    int ok = 1;
+    int widest = inner > model->n_head * model->head_dim_v
+                     ? inner
+                     : model->n_head * model->head_dim_v;
+    runtime->activation_slot_bytes = activation_bytes(widest);
+    runtime->activation_scratch =
+        calloc((size_t)pool_workers(runtime->pool),
+               runtime->activation_slot_bytes);
+    if (!runtime->activation_scratch) ok = 0;
+
     size_t cache_elements = (size_t)model->n_layer * n_ctx *
                             runtime->cache_width;
     runtime->cache = calloc(cache_elements, sizeof *runtime->cache);
@@ -346,5 +380,6 @@ void runtime_stop(Runtime *runtime) {
     free(runtime->expert_out);
     free(runtime->logits);
     free(runtime->chosen);
+    free(runtime->activation_scratch);
     free(runtime);
 }
