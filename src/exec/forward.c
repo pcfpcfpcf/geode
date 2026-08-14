@@ -9,10 +9,19 @@
 #include <string.h>
 #include <unistd.h>
 
+/* One feed-forward whose output is summed into the layer's result: a dense
+   block is a single branch of weight 1, an expert block is the routed experts
+   plus the shared one. They all read the same input and none reads another's
+   output, so every branch's gate and up rows are one parallel region and every
+   branch's down rows are a second -- three regions per expert block instead of
+   sixteen. `offset` is where the branch's rows start in the concatenated
+   gate/up/activated buffers. */
 typedef struct {
-    int index;
+    const FeedForward *ffn;
+    int matrix_index;
+    int offset;
     float weight;
-} ExpertChoice;
+} Branch;
 
 struct Runtime {
     const Model *model;
@@ -37,20 +46,22 @@ struct Runtime {
     float *up;
     float *activated;
     float *router_probs;
-    float *expert_out;
+    float *branch_out;
     float *logits;
-    ExpertChoice *chosen;
+    Branch *branches;
 
-    /* One quantization slot per worker: the sequential path fills slot 0 for
-       every worker to read, while attention quantizes per head inside the
-       parallel region and each worker needs its own. */
+    /* Quantization slots, indexed by worker inside a parallel region and by
+       branch between the two feed-forward regions -- never both at once, so
+       there are as many as the larger of the two needs. Sequential callers use
+       slot 0 and are done with it before the region they feed returns. */
     unsigned char *activation_scratch;
     size_t activation_slot_bytes;
+    Activation *activations;
 };
 
-static void *activation_slot(Runtime *runtime, int worker) {
+static void *activation_slot(Runtime *runtime, int slot) {
     return runtime->activation_scratch +
-           (size_t)worker * runtime->activation_slot_bytes;
+           (size_t)slot * runtime->activation_slot_bytes;
 }
 
 static const void *matrix_at(const GgufTensor *tensor, int index) {
@@ -174,20 +185,111 @@ static void attention(Runtime *runtime, const Layer *layer, int layer_index,
                runtime->attn_out);
 }
 
-static void feed_forward(Runtime *runtime, const FeedForward *ffn,
-                         int matrix_index, const float *x, float *out) {
-    run_matvec(runtime, runtime->gate, ffn->gate, matrix_index, x);
-    run_matvec(runtime, runtime->up, ffn->up, matrix_index, x);
-    swiglu(runtime->activated, runtime->gate, runtime->up,
-           (int)ffn->gate->dims[1]);
-    run_matvec(runtime, out, ffn->down, matrix_index, runtime->activated);
+static int branch_width(const Branch *branch) {
+    return (int)branch->ffn->gate->dims[1];
+}
+
+/* Lays the branches end to end and returns how many rows they occupy in
+   total, which is the row space the expand region divides between workers. */
+static int branch_layout(Branch *branches, int n_branches) {
+    int offset = 0;
+    for (int b = 0; b < n_branches; b++) {
+        branches[b].offset = offset;
+        offset += branch_width(&branches[b]);
+    }
+    return offset;
+}
+
+typedef struct {
+    Runtime *runtime;
+    int n_branches;
+    int total_ff;
+    const Activation *x;
+} ExpandJob;
+
+/* A worker takes a slice of the concatenated row space and runs whichever
+   branches it lands in, so the last branch is never left to one thread while
+   the rest wait at a barrier. Gate and up share the slice, which lets the
+   swiglu happen here rather than in a pass of its own. */
+static void expand_worker(void *state, int worker, int n_workers) {
+    const ExpandJob *job = state;
+    Runtime *runtime = job->runtime;
+    int n_embd = runtime->model->n_embd;
+    int begin = (int)((long long)job->total_ff * worker / n_workers);
+    int end = (int)((long long)job->total_ff * (worker + 1) / n_workers);
+
+    for (int b = 0; b < job->n_branches; b++) {
+        const Branch *branch = &runtime->branches[b];
+        int lo = begin - branch->offset;
+        int hi = end - branch->offset;
+        if (lo < 0) lo = 0;
+        if (hi > branch_width(branch)) hi = branch_width(branch);
+        if (lo >= hi) continue;
+
+        float *gate = runtime->gate + branch->offset;
+        float *up = runtime->up + branch->offset;
+        matvec(gate, matrix_at(branch->ffn->gate, branch->matrix_index),
+               branch->ffn->gate->type, n_embd, lo, hi, job->x);
+        matvec(up, matrix_at(branch->ffn->up, branch->matrix_index),
+               branch->ffn->up->type, n_embd, lo, hi, job->x);
+        swiglu(runtime->activated + branch->offset + lo, gate + lo, up + lo,
+               hi - lo);
+    }
+}
+
+typedef struct {
+    Runtime *runtime;
+    int n_branches;
+} ContractJob;
+
+/* Every branch projects back onto the same n_embd output, so here a worker
+   owns output rows instead: it walks all the branches and sums them into the
+   rows it owns, and the mixture needs no reduction afterwards. */
+static void contract_worker(void *state, int worker, int n_workers) {
+    const ContractJob *job = state;
+    Runtime *runtime = job->runtime;
+    int n_embd = runtime->model->n_embd;
+    int begin = (int)((long long)n_embd * worker / n_workers);
+    int end = (int)((long long)n_embd * (worker + 1) / n_workers);
+
+    float *out = runtime->projected;
+    memset(out + begin, 0, (size_t)(end - begin) * sizeof *out);
+    for (int b = 0; b < job->n_branches; b++) {
+        const Branch *branch = &runtime->branches[b];
+        matvec(runtime->branch_out,
+               matrix_at(branch->ffn->down, branch->matrix_index),
+               branch->ffn->down->type, branch_width(branch), begin, end,
+               &runtime->activations[b]);
+        add_scaled(out + begin, runtime->branch_out + begin, branch->weight,
+                   end - begin);
+    }
+}
+
+static void run_branches(Runtime *runtime, int n_branches) {
+    int total_ff = branch_layout(runtime->branches, n_branches);
+
+    Activation input;
+    activation_set(&input, activation_slot(runtime, 0), runtime->normed,
+                   runtime->model->n_embd);
+    ExpandJob expand = {runtime, n_branches, total_ff, &input};
+    pool_run(runtime->pool, expand_worker, &expand);
+
+    for (int b = 0; b < n_branches; b++)
+        activation_set(&runtime->activations[b], activation_slot(runtime, b),
+                       runtime->activated + runtime->branches[b].offset,
+                       branch_width(&runtime->branches[b]));
+
+    ContractJob contract = {runtime, n_branches};
+    pool_run(runtime->pool, contract_worker, &contract);
 }
 
 /* Experts are ranked by probability plus a learned bias, but weighted by the
    probability alone -- the bias steers load balancing, not the mixture. */
-static void select_experts(Runtime *runtime, const float *bias) {
+static int select_experts(Runtime *runtime, const Layer *layer) {
     const Model *model = runtime->model;
+    const float *bias = layer->router_bias->data;
     float *probs = runtime->router_probs;
+    Branch *branches = runtime->branches;
 
     for (int e = 0; e < model->n_expert; e++)
         probs[e] = 1.0f / (1.0f + expf(-probs[e]));
@@ -198,7 +300,7 @@ static void select_experts(Runtime *runtime, const float *bias) {
         for (int e = 0; e < model->n_expert; e++) {
             int taken = 0;
             for (int s = 0; s < slot; s++)
-                if (runtime->chosen[s].index == e) taken = 1;
+                if (branches[s].matrix_index == e) taken = 1;
             if (taken) continue;
             float score = probs[e] + bias[e];
             if (best < 0 || score > best_score) {
@@ -206,39 +308,38 @@ static void select_experts(Runtime *runtime, const float *bias) {
                 best_score = score;
             }
         }
-        runtime->chosen[slot].index = best;
-        runtime->chosen[slot].weight = probs[best];
+        branches[slot].ffn = &layer->experts;
+        branches[slot].matrix_index = best;
+        branches[slot].weight = probs[best];
     }
 
     float scale = model->expert_weights_scale;
     if (model->expert_weights_norm) {
         float sum = 0;
         for (int slot = 0; slot < model->n_expert_used; slot++)
-            sum += runtime->chosen[slot].weight;
+            sum += branches[slot].weight;
         if (sum > 0) scale /= sum;
     }
     for (int slot = 0; slot < model->n_expert_used; slot++)
-        runtime->chosen[slot].weight *= scale;
+        branches[slot].weight *= scale;
+
+    branches[model->n_expert_used].ffn = &layer->shared_expert;
+    branches[model->n_expert_used].matrix_index = 0;
+    branches[model->n_expert_used].weight = 1.0f;
+    return model->n_expert_used + 1;
 }
 
-static void mixture_of_experts(Runtime *runtime, const Layer *layer) {
-    const Model *model = runtime->model;
-
+static void feed_forward(Runtime *runtime, const Layer *layer) {
+    if (!layer->has_experts) {
+        runtime->branches[0].ffn = &layer->dense;
+        runtime->branches[0].matrix_index = 0;
+        runtime->branches[0].weight = 1.0f;
+        run_branches(runtime, 1);
+        return;
+    }
     run_matvec(runtime, runtime->router_probs, layer->router, 0,
                runtime->normed);
-    select_experts(runtime, layer->router_bias->data);
-
-    memset(runtime->projected, 0,
-           (size_t)model->n_embd * sizeof *runtime->projected);
-    for (int slot = 0; slot < model->n_expert_used; slot++) {
-        feed_forward(runtime, &layer->experts, runtime->chosen[slot].index,
-                     runtime->normed, runtime->expert_out);
-        add_scaled(runtime->projected, runtime->expert_out,
-                   runtime->chosen[slot].weight, model->n_embd);
-    }
-    feed_forward(runtime, &layer->shared_expert, 0, runtime->normed,
-                 runtime->expert_out);
-    add_scaled(runtime->projected, runtime->expert_out, 1.0f, model->n_embd);
+    run_branches(runtime, select_experts(runtime, layer));
 }
 
 const float *forward(Runtime *runtime, int token, int position) {
@@ -260,11 +361,7 @@ const float *forward(Runtime *runtime, int token, int position) {
 
         rmsnorm(runtime->normed, runtime->residual, layer->ffn_norm->data,
                 n_embd, model->rms_eps);
-        if (layer->has_experts)
-            mixture_of_experts(runtime, layer);
-        else
-            feed_forward(runtime, &layer->dense, 0, runtime->normed,
-                         runtime->projected);
+        feed_forward(runtime, layer);
         add_scaled(runtime->residual, runtime->projected, 1.0f, n_embd);
     }
 
@@ -297,10 +394,12 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     if (n_threads < 1) n_threads = pool_default_workers();
     runtime->pool = pool_start(n_threads);
 
-    int inner = model->n_ff > model->n_ff_expert ? model->n_ff
-                                                 : model->n_ff_expert;
-    int shared = model->n_ff_expert * model->n_expert_shared;
-    if (shared > inner) inner = shared;
+    /* The gate/up/activated buffers hold every branch of a block at once, so
+       they are sized for whichever block concatenates to the most rows. */
+    int n_branches = model->n_expert_used + model->n_expert_shared;
+    if (n_branches < 1) n_branches = 1;
+    int inner = n_branches * model->n_ff_expert;
+    if (model->n_ff > inner) inner = model->n_ff;
 
     if (!runtime->pool) {
         snprintf(err, errsz, "could not start %d worker threads", n_threads);
@@ -312,11 +411,18 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     int widest = inner > model->n_head * model->head_dim_v
                      ? inner
                      : model->n_head * model->head_dim_v;
+    int n_slots = pool_workers(runtime->pool) > n_branches
+                      ? pool_workers(runtime->pool)
+                      : n_branches;
     runtime->activation_slot_bytes = activation_bytes(widest);
     runtime->activation_scratch =
-        calloc((size_t)pool_workers(runtime->pool),
-               runtime->activation_slot_bytes);
-    if (!runtime->activation_scratch) ok = 0;
+        calloc((size_t)n_slots, runtime->activation_slot_bytes);
+    runtime->activations = calloc((size_t)n_branches,
+                                  sizeof *runtime->activations);
+    runtime->branches = calloc((size_t)n_branches, sizeof *runtime->branches);
+    if (!runtime->activation_scratch || !runtime->activations ||
+        !runtime->branches)
+        ok = 0;
 
     size_t cache_elements = (size_t)model->n_layer * n_ctx *
                             runtime->cache_width;
@@ -340,14 +446,10 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     runtime->gate = alloc_floats((size_t)inner, &ok);
     runtime->up = alloc_floats((size_t)inner, &ok);
     runtime->activated = alloc_floats((size_t)inner, &ok);
-    runtime->expert_out = alloc_floats((size_t)model->n_embd, &ok);
+    runtime->branch_out = alloc_floats((size_t)model->n_embd, &ok);
     runtime->logits = alloc_floats((size_t)model->n_vocab, &ok);
-    if (model->n_expert > 0) {
+    if (model->n_expert > 0)
         runtime->router_probs = alloc_floats((size_t)model->n_expert, &ok);
-        runtime->chosen = calloc((size_t)model->n_expert_used,
-                                 sizeof *runtime->chosen);
-        if (!runtime->chosen) ok = 0;
-    }
 
     if (!ok) {
         snprintf(err, errsz,
@@ -377,9 +479,10 @@ void runtime_stop(Runtime *runtime) {
     free(runtime->up);
     free(runtime->activated);
     free(runtime->router_probs);
-    free(runtime->expert_out);
+    free(runtime->branch_out);
     free(runtime->logits);
-    free(runtime->chosen);
+    free(runtime->branches);
+    free(runtime->activations);
     free(runtime->activation_scratch);
     free(runtime);
 }
