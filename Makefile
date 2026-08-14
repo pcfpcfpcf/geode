@@ -8,7 +8,7 @@ PROBE_SRC = src/probe/probe.c src/probe/dram.c src/probe/flops.c \
 all: probe manifest planner
 
 probe: $(PROBE_SRC) src/probe/*.h src/common/json.h
-	$(CC) $(CFLAGS) -o $@ $(PROBE_SRC) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(PROBE_SRC) $(LDLIBS) -lm
 
 manifest: src/manifest/manifest.c src/common/json.c src/common/json.h
 	$(CC) $(CFLAGS) -o $@ src/manifest/manifest.c src/common/json.c

@@ -91,12 +91,13 @@ static void print_summary(const DramNode *dram, int ndram,
             printf("  gpu   %-24s  %12s  bandwidth unmeasured (%s)\n",
                    gpu[i].name, size,
                    gpu[i].bw_error[0] ? gpu[i].bw_error : "no CUDA driver");
-        if (gpu[i].flops_measured && gpu[i].dequant_measured)
+        if (gpu[i].flops_measured && gpu[i].dequant_measured &&
+            gpu[i].sgemm_measured)
             printf("  gpu   %-24s  %12s  %6.1f GFLOPS fp32, %6.1f q4k "
-                   "dequant (%.0f%%)\n",
+                   "dequant, %6.1f sgemm (%.0f%%)\n",
                    "", size, gpu[i].fp32_flops / 1e9,
-                   gpu[i].q4k_dequant_flops / 1e9,
-                   100.0 * gpu[i].q4k_dequant_flops / gpu[i].fp32_flops);
+                   gpu[i].q4k_dequant_flops / 1e9, gpu[i].sgemm_flops / 1e9,
+                   100.0 * gpu[i].sgemm_flops / gpu[i].fp32_flops);
         else if (gpu[i].flops_measured)
             printf("  gpu   %-24s  %12s  %6.1f GFLOPS fp32\n", "", size,
                    gpu[i].fp32_flops / 1e9);
@@ -164,6 +165,8 @@ static void write_json(FILE *f, const DramNode *dram, int ndram,
         json_u64(&j, "flops_measured", gpu[i].flops_measured);
         json_double(&j, "q4k_dequant_flops", gpu[i].q4k_dequant_flops);
         json_u64(&j, "dequant_measured", gpu[i].dequant_measured);
+        json_double(&j, "sgemm_flops", gpu[i].sgemm_flops);
+        json_u64(&j, "sgemm_measured", gpu[i].sgemm_measured);
         json_close(&j);
     }
     json_close(&j);

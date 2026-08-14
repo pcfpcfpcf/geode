@@ -44,11 +44,13 @@ typedef struct {
     int bw_measured;
     int flops_measured;
     int dequant_measured;
+    int sgemm_measured;
     char name[128];
     unsigned long long vram;
     double hbm_bw;
     double fp32_flops;
     double dequant_flops;
+    double sgemm_flops;
 } GpuTier;
 
 typedef struct {
@@ -190,6 +192,8 @@ static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
         gpu->flops_measured = (int)jnum(g, "flops_measured", &ok);
         gpu->dequant_flops = jnum(g, "q4k_dequant_flops", &ok);
         gpu->dequant_measured = (int)jnum(g, "dequant_measured", &ok);
+        gpu->sgemm_flops = jnum(g, "sgemm_flops", &ok);
+        gpu->sgemm_measured = (int)jnum(g, "sgemm_measured", &ok);
         jstr(g, "name", gpu->name, sizeof gpu->name);
     }
 
@@ -469,24 +473,33 @@ int main(int argc, char **argv) {
     double flops_bound = cpu_flops > 0
                              ? cpu_flops / (2.0 * m.active_params * batch)
                              : INFINITY;
-    /* Measured dequant flops are the honest bound; the fp32 peak scaled by
-       an assumed efficiency is the fallback for old probes. */
-    double gpu_effective = 0;
+    /* Decode-side kernels are fused dequant GEMV/GEMM; prefill on a gpu
+       without tensor cores runs dequant + SGEMM, with dequant amortized to
+       noise at prefill context lengths. Each phase gets the measurement
+       with the matching shape; fp32 peak scaled by an assumed efficiency
+       is the fallback for old probes. */
+    double gpu_decode_flops = 0;
+    double gpu_prefill_flops = 0;
     int gpu_estimated = 0;
-    if (gpu.dequant_measured && gpu.dequant_flops > 0) {
-        gpu_effective = gpu.dequant_flops;
-    } else if (gpu.flops_measured) {
-        gpu_effective = gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY;
+    if (gpu.dequant_measured && gpu.dequant_flops > 0)
+        gpu_decode_flops = gpu.dequant_flops;
+    if (gpu.sgemm_measured && gpu.sgemm_flops > 0)
+        gpu_prefill_flops = gpu.sgemm_flops;
+    if (gpu.flops_measured &&
+        (!gpu_decode_flops || !gpu_prefill_flops)) {
+        double fallback = gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY;
+        if (!gpu_decode_flops) gpu_decode_flops = fallback;
+        if (!gpu_prefill_flops) gpu_prefill_flops = fallback;
         gpu_estimated = 1;
     }
     double gpu_flops_bound =
-        gpu_effective > 0 ? gpu_effective / (2.0 * m.active_params * batch)
-                          : INFINITY;
+        gpu_decode_flops > 0 ? gpu_decode_flops / (2.0 * m.active_params * batch)
+                             : INFINITY;
 
     /* Prefill is GEMM-shaped, computed wherever each component lives. */
     double cpu_prefill = cpu_flops > 0 ? cpu_flops / (2.0 * m.active_params) : 0;
     double gpu_prefill =
-        gpu_effective > 0 ? gpu_effective / (2.0 * m.active_params) : 0;
+        gpu_prefill_flops > 0 ? gpu_prefill_flops / (2.0 * m.active_params) : 0;
 
     /* Per decode step: attention+base are read once and amortize over the
        batch, but each token routes independently, so expert reads grow with

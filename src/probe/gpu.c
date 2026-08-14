@@ -1,6 +1,7 @@
 #include "gpu.h"
 
 #include <dlfcn.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -506,6 +507,282 @@ static int cuda_dequant(void *cuda, int ordinal, double *flops, char *err,
     return 0;
 }
 
+/* Tiled SGEMM: what a real executor's prefill actually runs on a gpu
+   without tensor cores (dequant amortizes to noise at prefill context
+   lengths). 64x64 block tiles, 4x4 register micro-tile, 8-deep k-tiles,
+   A stored row-major in shared (stride 9), B padded to stride 68 for
+   16B-aligned float4 access. */
+#define SG_DIM 1024
+#define SG_KTILES (SG_DIM / 8)
+#define SG_BENCH_SECONDS 0.5
+
+#define SG_STEP(a0, a1, a2, a3, bo)                                       \
+    "    ld.shared.f32 %f0, [%r16+" #a0 "];\n"                            \
+    "    ld.shared.f32 %f1, [%r16+" #a1 "];\n"                            \
+    "    ld.shared.f32 %f2, [%r16+" #a2 "];\n"                            \
+    "    ld.shared.f32 %f3, [%r16+" #a3 "];\n"                            \
+    "    ld.shared.v4.f32 {%f4,%f5,%f6,%f7}, [%r17+" #bo "];\n"           \
+    "    fma.rn.f32 %f16, %f0, %f4, %f16;\n"                              \
+    "    fma.rn.f32 %f17, %f0, %f5, %f17;\n"                              \
+    "    fma.rn.f32 %f18, %f0, %f6, %f18;\n"                              \
+    "    fma.rn.f32 %f19, %f0, %f7, %f19;\n"                              \
+    "    fma.rn.f32 %f20, %f1, %f4, %f20;\n"                              \
+    "    fma.rn.f32 %f21, %f1, %f5, %f21;\n"                              \
+    "    fma.rn.f32 %f22, %f1, %f6, %f22;\n"                              \
+    "    fma.rn.f32 %f23, %f1, %f7, %f23;\n"                              \
+    "    fma.rn.f32 %f24, %f2, %f4, %f24;\n"                              \
+    "    fma.rn.f32 %f25, %f2, %f5, %f25;\n"                              \
+    "    fma.rn.f32 %f26, %f2, %f6, %f26;\n"                              \
+    "    fma.rn.f32 %f27, %f2, %f7, %f27;\n"                              \
+    "    fma.rn.f32 %f28, %f3, %f4, %f28;\n"                              \
+    "    fma.rn.f32 %f29, %f3, %f5, %f29;\n"                              \
+    "    fma.rn.f32 %f30, %f3, %f6, %f30;\n"                              \
+    "    fma.rn.f32 %f31, %f3, %f7, %f31;\n"
+
+static const char sgemm_ptx[] =
+    ".version 6.0\n"
+    ".target sm_50\n"
+    ".address_size 64\n"
+    ".shared .align 16 .b8 geode_s[4480];\n" /* As 64x9 f32, then Bs 8x68 */
+    ".visible .entry geode_sgemm_kernel(\n"
+    "    .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,\n"
+    "    .param .u32 p_kt)\n"
+    "{\n"
+    "    .reg .pred %p<4>;\n"
+    "    .reg .f32 %f<32>;\n"
+    "    .reg .u32 %r<24>;\n"
+    "    .reg .u64 %rd<12>;\n"
+    "    ld.param.u64 %rd1, [p_a];\n"
+    "    ld.param.u64 %rd2, [p_b];\n"
+    "    ld.param.u64 %rd3, [p_c];\n"
+    "    ld.param.u32 %r20, [p_kt];\n"
+    "    mov.u32 %r1, %tid.x;\n"
+    "    mov.u32 %r2, %ctaid.x;\n"
+    "    mov.u32 %r3, %ctaid.y;\n"
+    "    shr.u32 %r4, %r1, 4;\n"              /* ty */
+    "    and.b32 %r5, %r1, 15;\n"             /* tx */
+    "    mov.u32 %r13, geode_s;\n"
+    "    mov.f32 %f16, 0f00000000;\n"
+    "    mov.f32 %f17, 0f00000000;\n"
+    "    mov.f32 %f18, 0f00000000;\n"
+    "    mov.f32 %f19, 0f00000000;\n"
+    "    mov.f32 %f20, 0f00000000;\n"
+    "    mov.f32 %f21, 0f00000000;\n"
+    "    mov.f32 %f22, 0f00000000;\n"
+    "    mov.f32 %f23, 0f00000000;\n"
+    "    mov.f32 %f24, 0f00000000;\n"
+    "    mov.f32 %f25, 0f00000000;\n"
+    "    mov.f32 %f26, 0f00000000;\n"
+    "    mov.f32 %f27, 0f00000000;\n"
+    "    mov.f32 %f28, 0f00000000;\n"
+    "    mov.f32 %f29, 0f00000000;\n"
+    "    mov.f32 %f30, 0f00000000;\n"
+    "    mov.f32 %f31, 0f00000000;\n"
+    "    setp.lt.s32 %p1, %r1, 128;\n"
+    /* A loader (tid<128): row = tid/2, half = tid%2 */
+    "    shr.u32 %r6, %r1, 1;\n"
+    "    and.b32 %r7, %r1, 1;\n"
+    "    shl.b32 %r8, %r3, 6;\n"
+    "    add.u32 %r8, %r8, %r6;\n"
+    "    shl.b32 %r8, %r8, 12;\n"             /* (by*64+row) x 4096 */
+    "    shl.b32 %r9, %r7, 4;\n"              /* half x 16 */
+    "    add.u32 %r8, %r8, %r9;\n"
+    "    cvt.u64.u32 %rd4, %r8;\n"
+    "    add.s64 %rd4, %rd4, %rd1;\n"
+    "    mul.lo.u32 %r14, %r6, 36;\n"         /* shared As: row x 36B */
+    "    add.u32 %r14, %r14, %r9;\n"
+    "    add.u32 %r14, %r14, %r13;\n"
+    /* B loader (tid>=128): t2 = tid-128, row = t2/16, colv = t2%16 */
+    "    add.s32 %r10, %r1, -128;\n"
+    "    shr.u32 %r11, %r10, 4;\n"
+    "    and.b32 %r12, %r10, 15;\n"
+    "    shl.b32 %r8, %r2, 8;\n"              /* bx x 256 */
+    "    shl.b32 %r9, %r12, 4;\n"             /* colv x 16 */
+    "    add.u32 %r8, %r8, %r9;\n"
+    "    shl.b32 %r9, %r11, 12;\n"            /* row x 4096 */
+    "    add.u32 %r8, %r8, %r9;\n"
+    "    cvt.u64.u32 %rd5, %r8;\n"
+    "    add.s64 %rd5, %rd5, %rd2;\n"
+    "    mul.lo.u32 %r15, %r11, 272;\n"       /* shared Bs: 2304 + row x 272 */
+    "    shl.b32 %r18, %r12, 4;\n"
+    "    add.u32 %r15, %r15, %r18;\n"
+    "    add.u32 %r15, %r15, %r13;\n"
+    "    add.u32 %r15, %r15, 2304;\n"
+    /* compute bases */
+    "    mul.lo.u32 %r16, %r4, 144;\n"        /* As + ty x 144 */
+    "    add.u32 %r16, %r16, %r13;\n"
+    "    shl.b32 %r17, %r5, 4;\n"             /* Bs + tx x 16 */
+    "    add.u32 %r17, %r17, %r13;\n"
+    "    add.u32 %r17, %r17, 2304;\n"
+    "    mov.u32 %r19, %r20;\n"
+    "$L_sg_tile:\n"
+    "    @%p1 bra $L_sg_load_a;\n"
+    "    ld.global.v4.f32 {%f0,%f1,%f2,%f3}, [%rd5];\n"
+    "    st.shared.v4.f32 [%r15], {%f0,%f1,%f2,%f3};\n"
+    "    add.s64 %rd5, %rd5, 32768;\n"
+    "    bra.uni $L_sg_loaded;\n"
+    "$L_sg_load_a:\n"
+    "    ld.global.v4.f32 {%f0,%f1,%f2,%f3}, [%rd4];\n"
+    "    st.shared.f32 [%r14], %f0;\n"
+    "    st.shared.f32 [%r14+4], %f1;\n"
+    "    st.shared.f32 [%r14+8], %f2;\n"
+    "    st.shared.f32 [%r14+12], %f3;\n"
+    "    add.s64 %rd4, %rd4, 32;\n"
+    "$L_sg_loaded:\n"
+    "    bar.sync 0;\n"
+    SG_STEP(0, 36, 72, 108, 0)
+    SG_STEP(4, 40, 76, 112, 272)
+    SG_STEP(8, 44, 80, 116, 544)
+    SG_STEP(12, 48, 84, 120, 816)
+    SG_STEP(16, 52, 88, 124, 1088)
+    SG_STEP(20, 56, 92, 128, 1360)
+    SG_STEP(24, 60, 96, 132, 1632)
+    SG_STEP(28, 64, 100, 136, 1904)
+    "    bar.sync 0;\n"
+    "    add.s32 %r19, %r19, -1;\n"
+    "    setp.ne.s32 %p2, %r19, 0;\n"
+    "    @%p2 bra $L_sg_tile;\n"
+    /* store C tile: rows by*64+ty*4+i, cols bx*64+tx*4 */
+    "    shl.b32 %r6, %r3, 6;\n"
+    "    shl.b32 %r7, %r4, 2;\n"
+    "    add.u32 %r6, %r6, %r7;\n"
+    "    shl.b32 %r6, %r6, 12;\n"
+    "    shl.b32 %r7, %r2, 8;\n"
+    "    add.u32 %r6, %r6, %r7;\n"
+    "    shl.b32 %r7, %r5, 4;\n"
+    "    add.u32 %r6, %r6, %r7;\n"
+    "    cvt.u64.u32 %rd6, %r6;\n"
+    "    add.s64 %rd6, %rd6, %rd3;\n"
+    "    st.global.v4.f32 [%rd6], {%f16,%f17,%f18,%f19};\n"
+    "    st.global.v4.f32 [%rd6+4096], {%f20,%f21,%f22,%f23};\n"
+    "    st.global.v4.f32 [%rd6+8192], {%f24,%f25,%f26,%f27};\n"
+    "    st.global.v4.f32 [%rd6+12288], {%f28,%f29,%f30,%f31};\n"
+    "    ret;\n"
+    "}\n";
+
+static int cuda_sgemm(void *cuda, double *flops, char *err, size_t errsz) {
+    *flops = 0.0;
+    typedef int (*cumem_t)(unsigned long long *, size_t);
+    typedef int (*cufree_t)(unsigned long long);
+    typedef int (*cumod_t)(void *, const void *);
+    typedef int (*cufunc_t)(void *, void *, const char *);
+    typedef int (*culaunch_t)(void *, unsigned, unsigned, unsigned, unsigned,
+                              unsigned, unsigned, unsigned, void *, void **,
+                              void **);
+    typedef int (*cusync_t)(void);
+    typedef int (*cuhtd_t)(unsigned long long, const void *, size_t);
+    typedef int (*cudth_t)(void *, unsigned long long, size_t);
+    typedef int (*curc_t)(int, const char **);
+
+    cumem_t cuMemAlloc = sym(cuda, "cuMemAlloc");
+    cufree_t cuMemFree = sym(cuda, "cuMemFree");
+    cumod_t cuModuleLoadData = sym(cuda, "cuModuleLoadData");
+    cufunc_t cuModuleGetFunction = sym(cuda, "cuModuleGetFunction");
+    culaunch_t cuLaunchKernel = sym(cuda, "cuLaunchKernel");
+    cusync_t cuCtxSynchronize = sym(cuda, "cuCtxSynchronize");
+    cuhtd_t cuHtoD = sym(cuda, "cuMemcpyHtoD");
+    cudth_t cuDtoH = sym(cuda, "cuMemcpyDtoH");
+    curc_t cuGetError = sym(cuda, "cuGetErrorString");
+
+    if (!cuMemAlloc || !cuMemFree || !cuModuleLoadData ||
+        !cuModuleGetFunction || !cuLaunchKernel || !cuCtxSynchronize ||
+        !cuHtoD || !cuDtoH) {
+        snprintf(err, errsz, "CUDA driver API incomplete");
+        return -1;
+    }
+
+    void *module = NULL;
+    int r = cuModuleLoadData(&module, sgemm_ptx);
+    if (r) {
+        const char *es = NULL;
+        if (cuGetError && !cuGetError(r, &es) && es)
+            snprintf(err, errsz, "ptx jit: %d (%s)", r, es);
+        else
+            snprintf(err, errsz, "ptx jit: %d", r);
+        return -1;
+    }
+    void *kernel = NULL;
+    if (cuModuleGetFunction(&kernel, module, "geode_sgemm_kernel")) {
+        snprintf(err, errsz, "cuModuleGetFunction failed");
+        return -1;
+    }
+
+    size_t mat_bytes = (size_t)SG_DIM * SG_DIM * 4;
+    unsigned long long d_a = 0, d_b = 0, d_c = 0;
+    if (cuMemAlloc(&d_a, mat_bytes) || cuMemAlloc(&d_b, mat_bytes) ||
+        cuMemAlloc(&d_c, mat_bytes)) {
+        snprintf(err, errsz, "cuMemAlloc failed");
+        return -1;
+    }
+    float *h_a = malloc(mat_bytes);
+    float *h_b = malloc(mat_bytes);
+    if (!h_a || !h_b) {
+        snprintf(err, errsz, "out of memory");
+        free(h_a);
+        free(h_b);
+        return -1;
+    }
+    uint64_t rng = 0x243F6A8885A308D3ull;
+    for (int i = 0; i < SG_DIM * SG_DIM; i++) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        h_a[i] = (float)(rng & 0xFF) / 512.0f;
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        h_b[i] = (float)(rng & 0xFF) / 512.0f;
+    }
+    cuHtoD(d_a, h_a, mat_bytes);
+    cuHtoD(d_b, h_b, mat_bytes);
+
+    int ktiles = SG_KTILES;
+    void *params[] = {&d_a, &d_b, &d_c, &ktiles};
+    r = cuLaunchKernel(kernel, 16, 16, 1, 256, 1, 1, 0, NULL, params, NULL);
+    if (r || cuCtxSynchronize()) {
+        snprintf(err, errsz, "kernel launch failed");
+        free(h_a);
+        free(h_b);
+        return -1;
+    }
+
+    /* Self-check: C[0][0] must equal dot(A row 0, B col 0). */
+    double expect = 0;
+    for (int k = 0; k < SG_DIM; k++)
+        expect += (double)h_a[k] * h_b[k * SG_DIM];
+    float got = 0;
+    cuDtoH(&got, d_c, 4);
+    double tol = fabs(expect) * 1e-3 + 1e-6;
+    free(h_a);
+    free(h_b);
+    if (fabs(got - expect) > tol) {
+        snprintf(err, errsz, "sgemm self-check failed (got %g, want %g)",
+                 got, expect);
+        return -1;
+    }
+
+    double best = 0;
+    double t_end = now_s() + SG_BENCH_SECONDS;
+    while (now_s() < t_end) {
+        double t0 = now_s();
+        r = cuLaunchKernel(kernel, 16, 16, 1, 256, 1, 1, 0, NULL, params,
+                           NULL);
+        if (r || cuCtxSynchronize()) break;
+        double dt = now_s() - t0;
+        double rate = 2.0 * SG_DIM * SG_DIM * SG_DIM / dt;
+        if (rate > best) best = rate;
+    }
+    cuMemFree(d_a);
+    cuMemFree(d_b);
+    cuMemFree(d_c);
+    if (best <= 0) {
+        snprintf(err, errsz, "kernel launch failed");
+        return -1;
+    }
+    *flops = best;
+    return 0;
+}
+
 static int cuda_flops(void *cuda, int ordinal, double *flops, char *err,
                       size_t errsz) {
     *flops = 0.0;
@@ -707,6 +984,10 @@ int gpu_probe(Gpu **out) {
             if (!g->dequant_measured)
                 snprintf(g->dequant_error, sizeof g->dequant_error, "%s",
                          err);
+            g->sgemm_measured =
+                cuda_sgemm(cuda, &g->sgemm_flops, err, sizeof err) == 0;
+            if (!g->sgemm_measured)
+                snprintf(g->sgemm_error, sizeof g->sgemm_error, "%s", err);
             typedef int (*cud_t)(void *);
             cud_t cuCtxDestroy = sym(cuda, "cuCtxDestroy");
             if (cuCtxDestroy) cuCtxDestroy(ctx);
