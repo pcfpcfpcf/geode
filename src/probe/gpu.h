@@ -13,6 +13,9 @@ typedef struct {
     double fp32_flops;
     int flops_measured;
     char flops_error[128];
+    double q4k_dequant_flops;
+    int dequant_measured;
+    char dequant_error[128];
 } Gpu;
 
 int gpu_probe(Gpu **out);

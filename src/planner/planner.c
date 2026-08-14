@@ -43,10 +43,12 @@ typedef struct {
     int present;
     int bw_measured;
     int flops_measured;
+    int dequant_measured;
     char name[128];
     unsigned long long vram;
     double hbm_bw;
     double fp32_flops;
+    double dequant_flops;
 } GpuTier;
 
 typedef struct {
@@ -186,6 +188,8 @@ static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
         gpu->bw_measured = (int)jnum(g, "bw_measured", &ok);
         gpu->fp32_flops = jnum(g, "fp32_flops", &ok);
         gpu->flops_measured = (int)jnum(g, "flops_measured", &ok);
+        gpu->dequant_flops = jnum(g, "q4k_dequant_flops", &ok);
+        gpu->dequant_measured = (int)jnum(g, "dequant_measured", &ok);
         jstr(g, "name", gpu->name, sizeof gpu->name);
     }
 
@@ -465,18 +469,24 @@ int main(int argc, char **argv) {
     double flops_bound = cpu_flops > 0
                              ? cpu_flops / (2.0 * m.active_params * batch)
                              : INFINITY;
+    /* Measured dequant flops are the honest bound; the fp32 peak scaled by
+       an assumed efficiency is the fallback for old probes. */
+    double gpu_effective = 0;
+    int gpu_estimated = 0;
+    if (gpu.dequant_measured && gpu.dequant_flops > 0) {
+        gpu_effective = gpu.dequant_flops;
+    } else if (gpu.flops_measured) {
+        gpu_effective = gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY;
+        gpu_estimated = 1;
+    }
     double gpu_flops_bound =
-        gpu.flops_measured ? gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY /
-                                 (2.0 * m.active_params * batch)
-                           : INFINITY;
+        gpu_effective > 0 ? gpu_effective / (2.0 * m.active_params * batch)
+                          : INFINITY;
 
-    /* Prefill is GEMM-shaped, computed wherever each component lives.
-       The gpu number rests on an assumed dequant efficiency. */
+    /* Prefill is GEMM-shaped, computed wherever each component lives. */
     double cpu_prefill = cpu_flops > 0 ? cpu_flops / (2.0 * m.active_params) : 0;
     double gpu_prefill =
-        gpu.flops_measured ? gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY /
-                                 (2.0 * m.active_params)
-                           : 0;
+        gpu_effective > 0 ? gpu_effective / (2.0 * m.active_params) : 0;
 
     /* Per decode step: attention+base are read once and amortize over the
        batch, but each token routes independently, so expert reads grow with
@@ -591,7 +601,7 @@ int main(int argc, char **argv) {
         else if (best == &cands[2]) device = "gpu+cpu";
         printf(", prefill ~%.0f tok/s on %s%s, TTFT ~%.0fs @ %ld ctx",
                best->prefill, device,
-               best != &cands[1] && best != &cands[3]
+               gpu_estimated && best != &cands[1] && best != &cands[3]
                    ? " (estimated from fp32 peak)"
                    : "",
                context / best->prefill, context);

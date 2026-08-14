@@ -240,6 +240,272 @@ static const char flops_ptx[] =
     "    ret;\n"
     "}\n";
 
+/* Q4_K dequant+dot shaped kernel, warp-cooperative like a real mmq GEMM:
+   the activation tile lives in shared memory with one row per lane (full
+   bank utilization), and each warp dequantizes its weight blocks into a
+   shared staging area once per sub-block. A naive thread-per-block layout
+   measures ~10% of peak: every lane re-reads the same activations from L2
+   and the kernel goes load-bound. Min correction is dropped: values are
+   garbage either way, only the instruction stream matters. */
+#define DQ_THREADS 512          /* 16 warps per block */
+#define DQ_PAIRS_PER_WARP 128   /* block-pairs per warp per launch */
+#define DQ_BENCH_SECONDS 0.5
+
+static const char dequant_ptx[] =
+    ".version 6.0\n"
+    ".target sm_50\n"
+    ".address_size 64\n"
+    /* Row stride is padded to 260 floats: at 256 every row starts in bank
+       0 and all 32 lanes conflict 32-way on every float4 load. */
+    ".shared .align 16 .b8 geode_x[33280];\n"   /* 32 rows x 260 floats */
+    ".shared .align 16 .b8 geode_q[4096];\n"    /* 16 warps x 64 floats */
+    ".visible .entry geode_dequant_kernel(\n"
+    "    .param .u64 p_weights, .param .u64 p_x, .param .u64 p_out)\n"
+    "{\n"
+    "    .reg .pred %p<4>;\n"
+    "    .reg .f32 %f<24>;\n"
+    "    .reg .u32 %r<20>;\n"
+    "    .reg .u64 %rd<12>;\n"
+    "    ld.param.u64 %rd1, [p_weights];\n"
+    "    ld.param.u64 %rd2, [p_x];\n"
+    "    ld.param.u64 %rd3, [p_out];\n"
+    "    mov.u32 %r1, %tid.x;\n"
+    "    and.b32 %r2, %r1, 31;\n"                /* lane */
+    "    shr.u32 %r3, %r1, 5;\n"                 /* warp in block */
+    "    mov.u32 %r13, geode_x;\n"
+    "    mov.u32 %r14, geode_q;\n"
+    /* stage the activation tile: 512 threads x 16 floats, packed global
+       rows into padded shared rows */
+    "    shr.u32 %r15, %r1, 4;\n"                 /* row = tid/16 */
+    "    mul.lo.u32 %r15, %r15, 1040;\n"
+    "    and.b32 %r16, %r1, 15;\n"
+    "    shl.b32 %r16, %r16, 6;\n"                /* col byte = (tid%16)*64 */
+    "    add.u32 %r15, %r15, %r16;\n"
+    "    add.u32 %r15, %r15, %r13;\n"
+    "    mul.wide.u32 %rd7, %r1, 64;\n"
+    "    add.s64 %rd7, %rd7, %rd2;\n"
+    "    ld.global.v4.f32 {%f3,%f4,%f5,%f6}, [%rd7];\n"
+    "    st.shared.v4.f32 [%r15], {%f3,%f4,%f5,%f6};\n"
+    "    ld.global.v4.f32 {%f3,%f4,%f5,%f6}, [%rd7+16];\n"
+    "    st.shared.v4.f32 [%r15+16], {%f3,%f4,%f5,%f6};\n"
+    "    ld.global.v4.f32 {%f3,%f4,%f5,%f6}, [%rd7+32];\n"
+    "    st.shared.v4.f32 [%r15+32], {%f3,%f4,%f5,%f6};\n"
+    "    ld.global.v4.f32 {%f3,%f4,%f5,%f6}, [%rd7+48];\n"
+    "    st.shared.v4.f32 [%r15+48], {%f3,%f4,%f5,%f6};\n"
+    "    bar.sync 0;\n"
+    /* per-lane x row base, per-warp staging base */
+    "    mul.lo.u32 %r11, %r2, 1040;\n"
+    "    add.u32 %r11, %r11, %r13;\n"
+    "    mul.lo.u32 %r12, %r3, 256;\n"
+    "    add.u32 %r12, %r12, %r14;\n"
+    /* weights: warp global id x (pairs x 2 blocks x 144B) */
+    "    mov.u32 %r4, %ctaid.x;\n"
+    "    shl.b32 %r4, %r4, 4;\n"
+    "    add.u32 %r4, %r4, %r3;\n"
+    "    mul.wide.u32 %rd4, %r4, 36864;\n"       /* wgid x 128 pairs x 288B */
+    "    add.s64 %rd4, %rd4, %rd1;\n"
+    "    mov.f32 %f12, 0f00000000;\n"
+    "    mov.f32 %f13, 0f00000000;\n"
+    "    mov.f32 %f14, 0f00000000;\n"
+    "    mov.f32 %f15, 0f00000000;\n"
+    "    mov.u32 %r7, 128;\n"                    /* pairs remaining */
+    "$L_dq_pair:\n"
+    /* running addresses, advanced per sub-block: value bytes, scales, x */
+    "    shr.u32 %r10, %r2, 1;\n"                /* lane/2: byte in sub-block */
+    "    cvt.u64.u32 %rd5, %r10;\n"
+    "    add.s64 %rd5, %rd4, %rd5;\n"
+    "    add.s64 %rd5, %rd5, 16;\n"              /* qs + lane/2 */
+    "    mov.u64 %rd6, %rd4;\n"
+    "    add.s64 %rd6, %rd6, 4;\n"               /* scales */
+    "    mov.u32 %r17, %r11;\n"                  /* x row base */
+    "    mov.u32 %r5, 0;\n"                      /* sub-block j */
+    "$L_dq_j:\n"
+    /* unpack one value per lane per block, scale folded, into staging */
+    "    ld.global.u8 %r8, [%rd5];\n"            /* block 0 value byte */
+    "    ld.global.u8 %r9, [%rd5+144];\n"        /* block 1 value byte */
+    "    and.b32 %r10, %r2, 1;\n"
+    "    setp.eq.s32 %p1, %r10, 0;\n"
+    "    and.b32 %r10, %r8, 15;\n"
+    "    shr.u32 %r8, %r8, 4;\n"
+    "    selp.b32 %r8, %r10, %r8, %p1;\n"        /* even lane: lo, odd: hi */
+    "    and.b32 %r10, %r9, 15;\n"
+    "    shr.u32 %r9, %r9, 4;\n"
+    "    selp.b32 %r9, %r10, %r9, %p1;\n"
+    "    ld.global.u8 %r10, [%rd6];\n"           /* block 0 scales[j] */
+    "    ld.global.u8 %r16, [%rd6+144];\n"       /* block 1 scales[j] */
+    "    and.b32 %r10, %r10, 63;\n"
+    "    and.b32 %r16, %r16, 63;\n"
+    "    cvt.rn.f32.u32 %f1, %r10;\n"
+    "    cvt.rn.f32.u32 %f2, %r16;\n"
+    "    cvt.rn.f32.u32 %f11, %r8;\n"
+    "    mul.f32 %f11, %f11, %f1;\n"
+    "    cvt.rn.f32.u32 %f16, %r9;\n"
+    "    mul.f32 %f16, %f16, %f2;\n"
+    "    mul.lo.u32 %r15, %r2, 4;\n"
+    "    add.u32 %r15, %r15, %r12;\n"
+    "    st.shared.f32 [%r15], %f11;\n"
+    "    st.shared.f32 [%r15+128], %f16;\n"
+    "    bar.warp.sync 0xffffffff;\n"
+    /* row dot: lane's row against all 64 staged quants, 8 float4 chunks */
+    "    mov.u32 %r15, %r17;\n"
+#define DQ_CHUNK(off, acc)                                                \
+    "    ld.shared.v4.f32 {%f3,%f4,%f5,%f6}, [%r15+" #off "];\n"          \
+    "    ld.shared.v4.f32 {%f7,%f8,%f9,%f10}, [%r12+" #off "];\n"         \
+    "    fma.rn.f32 %f" #acc ", %f7, %f3, %f" #acc ";\n"                  \
+    "    fma.rn.f32 %f" #acc ", %f8, %f4, %f" #acc ";\n"                  \
+    "    fma.rn.f32 %f" #acc ", %f9, %f5, %f" #acc ";\n"                  \
+    "    fma.rn.f32 %f" #acc ", %f10, %f6, %f" #acc ";\n"                 \
+    "    ld.shared.v4.f32 {%f7,%f8,%f9,%f10}, [%r12+" #off "+128];\n"     \
+    "    fma.rn.f32 %f" #acc ", %f7, %f3, %f" #acc ";\n"                  \
+    "    fma.rn.f32 %f" #acc ", %f8, %f4, %f" #acc ";\n"                  \
+    "    fma.rn.f32 %f" #acc ", %f9, %f5, %f" #acc ";\n"                  \
+    "    fma.rn.f32 %f" #acc ", %f10, %f6, %f" #acc ";\n"
+    DQ_CHUNK(0, 12) DQ_CHUNK(16, 13) DQ_CHUNK(32, 14) DQ_CHUNK(48, 15)
+    DQ_CHUNK(64, 12) DQ_CHUNK(80, 13) DQ_CHUNK(96, 14) DQ_CHUNK(112, 15)
+    "    add.s64 %rd5, %rd5, 16;\n"
+    "    add.s64 %rd6, %rd6, 1;\n"
+    "    add.u32 %r17, %r17, 128;\n"
+    "    add.s32 %r5, %r5, 1;\n"
+    "    setp.lt.s32 %p1, %r5, 8;\n"
+    "    @%p1 bra $L_dq_j;\n"
+    "    add.s64 %rd4, %rd4, 288;\n"
+    "    add.s32 %r7, %r7, -1;\n"
+    "    setp.ne.s32 %p2, %r7, 0;\n"
+    "    @%p2 bra $L_dq_pair;\n"
+    "    add.f32 %f12, %f12, %f13;\n"
+    "    add.f32 %f14, %f14, %f15;\n"
+    "    add.f32 %f12, %f12, %f14;\n"
+    "    mov.u32 %r4, %ctaid.x;\n"
+    "    shl.b32 %r4, %r4, 9;\n"
+    "    add.u32 %r4, %r4, %r1;\n"               /* global tid */
+    "    cvt.u64.u32 %rd10, %r4;\n"
+    "    shl.b64 %rd10, %rd10, 2;\n"
+    "    add.s64 %rd10, %rd3, %rd10;\n"
+    "    st.global.f32 [%rd10], %f12;\n"
+    "    ret;\n"
+    "}\n";
+
+static int cuda_dequant(void *cuda, int ordinal, double *flops, char *err,
+                        size_t errsz) {
+    *flops = 0.0;
+    typedef int (*cumem_t)(unsigned long long *, size_t);
+    typedef int (*cufree_t)(unsigned long long);
+    typedef int (*cumod_t)(void *, const void *);
+    typedef int (*cufunc_t)(void *, void *, const char *);
+    typedef int (*cuattr_t)(int *, int, int);
+    typedef int (*culaunch_t)(void *, unsigned, unsigned, unsigned, unsigned,
+                              unsigned, unsigned, unsigned, void *, void **,
+                              void **);
+    typedef int (*cusync_t)(void);
+    typedef int (*cuhtd_t)(unsigned long long, const void *, size_t);
+    typedef int (*curc_t)(int, const char **);
+
+    cumem_t cuMemAlloc = sym(cuda, "cuMemAlloc");
+    cufree_t cuMemFree = sym(cuda, "cuMemFree");
+    cumod_t cuModuleLoadData = sym(cuda, "cuModuleLoadData");
+    cufunc_t cuModuleGetFunction = sym(cuda, "cuModuleGetFunction");
+    cuattr_t cuDeviceGetAttribute = sym(cuda, "cuDeviceGetAttribute");
+    culaunch_t cuLaunchKernel = sym(cuda, "cuLaunchKernel");
+    cusync_t cuCtxSynchronize = sym(cuda, "cuCtxSynchronize");
+    cuhtd_t cuHtoD = sym(cuda, "cuMemcpyHtoD");
+    curc_t cuGetError = sym(cuda, "cuGetErrorString");
+
+    if (!cuMemAlloc || !cuMemFree || !cuModuleLoadData ||
+        !cuModuleGetFunction || !cuDeviceGetAttribute || !cuLaunchKernel ||
+        !cuCtxSynchronize || !cuHtoD) {
+        snprintf(err, errsz, "CUDA driver API incomplete");
+        return -1;
+    }
+
+    void *module = NULL;
+    int r = cuModuleLoadData(&module, dequant_ptx);
+    if (r) {
+        const char *es = NULL;
+        if (cuGetError && !cuGetError(r, &es) && es)
+            snprintf(err, errsz, "ptx jit: %d (%s)", r, es);
+        else
+            snprintf(err, errsz, "ptx jit: %d", r);
+        return -1;
+    }
+    void *kernel = NULL;
+    if (cuModuleGetFunction(&kernel, module, "geode_dequant_kernel")) {
+        snprintf(err, errsz, "cuModuleGetFunction failed");
+        return -1;
+    }
+    int sm_count = 0;
+    if (cuDeviceGetAttribute(&sm_count, 16 /* multiprocessor count */,
+                             ordinal) ||
+        sm_count <= 0) {
+        snprintf(err, errsz, "cuDeviceGetAttribute failed");
+        return -1;
+    }
+    int blocks = sm_count; /* one block per sm: ~36KB shared each */
+    long long threads = (long long)blocks * DQ_THREADS;
+    long long warps = threads / 32;
+    size_t weights_bytes = (size_t)warps * DQ_PAIRS_PER_WARP * 288;
+    size_t x_bytes = 32 * 256 * 4;
+
+    unsigned long long d_weights = 0, d_x = 0, d_out = 0;
+    if (cuMemAlloc(&d_weights, weights_bytes) ||
+        cuMemAlloc(&d_x, x_bytes) ||
+        cuMemAlloc(&d_out, threads * 4)) {
+        snprintf(err, errsz, "cuMemAlloc failed");
+        return -1;
+    }
+    uint8_t *h_weights = malloc(weights_bytes);
+    float *h_x = malloc(x_bytes);
+    if (!h_weights || !h_x) {
+        snprintf(err, errsz, "out of memory");
+        free(h_weights);
+        free(h_x);
+        return -1;
+    }
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < weights_bytes; i += 8) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        *(uint64_t *)(h_weights + i) = rng;
+    }
+    for (int i = 0; i < 32 * 256; i++) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        h_x[i] = (float)(rng & 0xFF) / 128.0f - 1.0f;
+    }
+    cuHtoD(d_weights, h_weights, weights_bytes);
+    cuHtoD(d_x, h_x, x_bytes);
+    free(h_weights);
+    free(h_x);
+
+    void *params[] = {&d_weights, &d_x, &d_out};
+    cuLaunchKernel(kernel, blocks, 1, 1, DQ_THREADS, 1, 1, 0, NULL,
+                   params, NULL);
+    cuCtxSynchronize(); /* warmup: absorb jit + first-launch cost */
+
+    double best = 0;
+    double t_end = now_s() + DQ_BENCH_SECONDS;
+    while (now_s() < t_end) {
+        double t0 = now_s();
+        r = cuLaunchKernel(kernel, blocks, 1, 1, DQ_THREADS, 1, 1, 0,
+                           NULL, params, NULL);
+        if (r || cuCtxSynchronize()) break;
+        double dt = now_s() - t0;
+        double rate = (double)warps * DQ_PAIRS_PER_WARP * 2 * 256.0 * 32 *
+                      2 / dt;
+        if (rate > best) best = rate;
+    }
+    cuMemFree(d_weights);
+    cuMemFree(d_x);
+    cuMemFree(d_out);
+    if (best <= 0) {
+        snprintf(err, errsz, "kernel launch failed");
+        return -1;
+    }
+    *flops = best;
+    return 0;
+}
+
 static int cuda_flops(void *cuda, int ordinal, double *flops, char *err,
                       size_t errsz) {
     *flops = 0.0;
@@ -435,6 +701,12 @@ int gpu_probe(Gpu **out) {
                 cuda_flops(cuda, i, &g->fp32_flops, err, sizeof err) == 0;
             if (!g->flops_measured)
                 snprintf(g->flops_error, sizeof g->flops_error, "%s", err);
+            g->dequant_measured =
+                cuda_dequant(cuda, i, &g->q4k_dequant_flops, err,
+                             sizeof err) == 0;
+            if (!g->dequant_measured)
+                snprintf(g->dequant_error, sizeof g->dequant_error, "%s",
+                         err);
             typedef int (*cud_t)(void *);
             cud_t cuCtxDestroy = sym(cuda, "cuCtxDestroy");
             if (cuCtxDestroy) cuCtxDestroy(ctx);
