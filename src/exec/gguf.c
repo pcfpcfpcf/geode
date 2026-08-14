@@ -158,6 +158,15 @@ int gguf_meta_str(const GgufFile *g, const char *key, char *out,
     return 1;
 }
 
+int gguf_meta_arr(const GgufFile *g, const char *key, GgufArray *out) {
+    unsigned type;
+    Cur c;
+    if (!find_key(g, key, &type, &c) || type != KV_ARR) return 0;
+    if (!cur_u32(&c, &out->elem_type) || !cur_u64(&c, &out->count)) return 0;
+    out->data = c.p;
+    return 1;
+}
+
 const GgufTensor *gguf_find(const GgufFile *g, const char *name) {
     for (unsigned long long i = 0; i < g->n_tensors; i++)
         if (strcmp(g->tensors[i].name, name) == 0) return &g->tensors[i];

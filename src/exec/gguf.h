@@ -26,11 +26,18 @@ typedef struct {
     unsigned long long kv_count;
 } GgufFile;
 
+typedef struct {
+    unsigned elem_type;
+    unsigned long long count;
+    const unsigned char *data;
+} GgufArray;
+
 int gguf_open(GgufFile *g, const char *path, char *err, size_t errsz);
 void gguf_close(GgufFile *g);
 const GgufTensor *gguf_find(const GgufFile *g, const char *name);
 int gguf_meta_u64(const GgufFile *g, const char *key, unsigned long long *out);
 int gguf_meta_f64(const GgufFile *g, const char *key, double *out);
 int gguf_meta_str(const GgufFile *g, const char *key, char *out, size_t outsz);
+int gguf_meta_arr(const GgufFile *g, const char *key, GgufArray *out);
 
 #endif

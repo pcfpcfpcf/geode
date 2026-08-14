@@ -2,6 +2,7 @@
 #include "kernels.h"
 #include "modules.h"
 #include "quant.h"
+#include "tokenizer.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -109,6 +110,42 @@ static int kernels_test(const GgufFile *g) {
     return ok ? 0 : 1;
 }
 
+static int tokenize_test(const GgufFile *g) {
+    char err[256];
+    Tokenizer t;
+    if (!tokenizer_init(&t, g, err, sizeof err)) {
+        printf("tokenizer: %s\n", err);
+        return 1;
+    }
+    printf("tokenizer: %d tokens, bos=%d eos=%d add_bos=%d\n", t.n_tokens,
+           t.bos_id, t.eos_id, t.add_bos);
+
+    const char *prompts[] = {
+        "Hello, world!",
+        "Привет, как дела?",
+        "The quick brown fox jumps over the lazy dog.",
+        "def fib(n):\n    return n if n < 2 else fib(n-1) + fib(n-2)",
+    };
+    int ok = 1;
+    for (unsigned i = 0; i < sizeof prompts / sizeof prompts[0]; i++) {
+        int ids[512];
+        int n = tokenizer_encode(&t, prompts[i], ids, 512);
+        char back[1024];
+        tokenizer_decode(&t, ids, n, back, sizeof back);
+        printf("  \"%s\" -> %d tokens: [", prompts[i], n);
+        for (int j = 0; j < n && j < 16; j++) printf("%s%d", j ? " " : "", ids[j]);
+        if (n > 16) printf(" ...");
+        printf("]\n  decode: \"%s\"\n", back);
+        if (strcmp(prompts[i], back) != 0) {
+            printf("  ROUND-TRIP MISMATCH\n");
+            ok = 0;
+        }
+    }
+    tokenizer_free(&t);
+    printf(ok ? "tokenizer: PASS\n" : "tokenizer: FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int exec_main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s MODEL.gguf\n", argv[0]);
@@ -123,6 +160,11 @@ int exec_main(int argc, char **argv) {
 
     if (strcmp(argv[0], "exec-kernels") == 0) {
         int rc = kernels_test(&g);
+        gguf_close(&g);
+        return rc;
+    }
+    if (strcmp(argv[0], "exec-tokenize") == 0) {
+        int rc = tokenize_test(&g);
         gguf_close(&g);
         return rc;
     }
