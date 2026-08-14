@@ -1,8 +1,11 @@
 #include "gguf.h"
+#include "kernels.h"
 #include "modules.h"
 #include "quant.h"
 
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void cfg(const GgufFile *g, const char *arch, const char *key) {
@@ -62,6 +65,50 @@ static void dump_layer_tensors(const GgufFile *g, int layer) {
     }
 }
 
+/* Dequant the first 256 elements of a tensor, print them, and check gemv_row
+   against a naive dequant-then-dot reference. */
+static int check_tensor(const GgufFile *g, const char *name) {
+    const GgufTensor *t = gguf_find(g, name);
+    if (!t) {
+        printf("  %s: NOT FOUND\n", name);
+        return 0;
+    }
+    int n = (int)t->dims[0];
+    float *deq = malloc((size_t)n * sizeof(float));
+    float *x = malloc((size_t)n * sizeof(float));
+    dequant_row(t->data, t->type, n, deq);
+
+    printf("  %-28s %-5s n=%d\n", name, quant_types[t->type].name, n);
+    printf("    dequant[0..255]:");
+    for (int i = 0; i < 256 && i < n; i++) printf(" %.6f", deq[i]);
+    printf("\n");
+
+    int ok = 1;
+    for (int i = 0; i < n; i++) x[i] = (float)(i % 7) - 3.0f;
+    float got = gemv_row(t->data, t->type, n, x);
+    float want = 0;
+    for (int i = 0; i < n; i++) want += deq[i] * x[i];
+    if (fabsf(got - want) > 1e-3f * (1.0f + fabsf(want))) {
+        printf("    gemv MISMATCH: got %.6f want %.6f\n", got, want);
+        ok = 0;
+    } else {
+        printf("    gemv ok: %.6f\n", got);
+    }
+    free(x);
+    free(deq);
+    return ok;
+}
+
+static int kernels_test(const GgufFile *g) {
+    int ok = 1;
+    ok &= check_tensor(g, "blk.0.attn_q.weight");      /* Q4_K */
+    ok &= check_tensor(g, "blk.0.ffn_down.weight");    /* Q6_K */
+    ok &= check_tensor(g, "blk.0.attn_k_b.weight");    /* Q5_0 */
+    ok &= check_tensor(g, "blk.0.attn_norm.weight");    /* F32 */
+    printf(ok ? "kernels: PASS\n" : "kernels: FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int exec_main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s MODEL.gguf\n", argv[0]);
@@ -72,6 +119,12 @@ int exec_main(int argc, char **argv) {
     if (!gguf_open(&g, argv[1], err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         return 1;
+    }
+
+    if (strcmp(argv[0], "exec-kernels") == 0) {
+        int rc = kernels_test(&g);
+        gguf_close(&g);
+        return rc;
     }
 
     char arch[128] = "";

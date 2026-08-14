@@ -71,6 +71,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "planner") == 0)
         return planner_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "exec") == 0) return exec_main(argc - 1, argv + 1);
+    if (strcmp(argv[1], "exec-kernels") == 0)
+        return exec_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
         usage(argv[0]);
