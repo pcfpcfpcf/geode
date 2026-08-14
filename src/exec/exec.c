@@ -165,7 +165,8 @@ static int argmax(const float *values, int n) {
     return best;
 }
 
-static int run_prompt(const GgufFile *g, const char *prompt, int n_predict) {
+static int run_prompt(const GgufFile *g, const char *prompt, int n_predict,
+                      int n_threads) {
     char err[256];
     Model model;
     if (!model_load(&model, g, err, sizeof err)) {
@@ -193,8 +194,8 @@ static int run_prompt(const GgufFile *g, const char *prompt, int n_predict) {
         return 1;
     }
 
-    Runtime *runtime =
-        runtime_start(&model, n_prompt + n_predict, 0, err, sizeof err);
+    Runtime *runtime = runtime_start(&model, n_prompt + n_predict, n_threads,
+                                     err, sizeof err);
     if (!runtime) {
         fprintf(stderr, "%s\n", err);
         tokenizer_free(&tokenizer);
@@ -240,9 +241,9 @@ static int run_prompt(const GgufFile *g, const char *prompt, int n_predict) {
 
 int exec_main(int argc, char **argv) {
     int generating = strcmp(argv[0], "exec-run") == 0;
-    if (argc < 2 || (generating ? argc > 4 : argc != 2)) {
+    if (argc < 2 || (generating ? argc > 5 : argc != 2)) {
         fprintf(stderr, "usage: %s MODEL.gguf%s\n", argv[0],
-                generating ? " [PROMPT] [N_PREDICT]" : "");
+                generating ? " [PROMPT] [N_PREDICT] [THREADS]" : "");
         return 2;
     }
     char err[256];
@@ -261,7 +262,8 @@ int exec_main(int argc, char **argv) {
             gguf_close(&g);
             return 2;
         }
-        int rc = run_prompt(&g, prompt, n_predict);
+        int rc = run_prompt(&g, prompt, n_predict,
+                            argc > 4 ? atoi(argv[4]) : 0);
         gguf_close(&g);
         return rc;
     }

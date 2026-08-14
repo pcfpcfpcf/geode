@@ -3,7 +3,9 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 /* Long enough to cover the handoff between two parallel regions, short enough
    that an oversubscribed box gives the cpu back instead of burning it. */
@@ -25,6 +27,43 @@ typedef struct Worker {
     ThreadPool *pool;
     int index;
 } Worker;
+
+#define CORES_MAX 256
+
+static int read_topology_id(int cpu, const char *field) {
+    char path[128];
+    snprintf(path, sizeof path,
+             "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, field);
+    FILE *file = fopen(path, "r");
+    if (!file) return -1;
+    int value;
+    if (fscanf(file, "%d", &value) != 1) value = -1;
+    fclose(file);
+    return value;
+}
+
+int pool_default_workers(void) {
+    long logical = sysconf(_SC_NPROCESSORS_ONLN);
+    if (logical < 1) return 1;
+
+    int packages[CORES_MAX], cores[CORES_MAX];
+    int n_cores = 0;
+    for (int cpu = 0; cpu < logical && cpu < CORES_MAX; cpu++) {
+        int package = read_topology_id(cpu, "physical_package_id");
+        int core = read_topology_id(cpu, "core_id");
+        if (package < 0 || core < 0) return (int)logical;
+
+        int seen = 0;
+        for (int i = 0; i < n_cores; i++)
+            if (packages[i] == package && cores[i] == core) seen = 1;
+        if (!seen) {
+            packages[n_cores] = package;
+            cores[n_cores] = core;
+            n_cores++;
+        }
+    }
+    return n_cores > 0 ? n_cores : (int)logical;
+}
 
 static void spin(int *spins) {
     if (++*spins < SPINS_BEFORE_YIELD) return;

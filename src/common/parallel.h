@@ -10,6 +10,11 @@ typedef void (*ParallelFn)(void *state, int worker, int n_workers);
 
 typedef struct ThreadPool ThreadPool;
 
+/* Physical cores, not logical cpus: hyperthread siblings share the vector
+   units that dequant saturates, so counting siblings oversubscribes and
+   measurably slows the work down rather than speeding it up. */
+int pool_default_workers(void);
+
 ThreadPool *pool_start(int n_workers);
 void pool_stop(ThreadPool *pool);
 int pool_workers(const ThreadPool *pool);

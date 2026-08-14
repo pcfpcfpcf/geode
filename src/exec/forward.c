@@ -275,7 +275,7 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
               model->qk_rope_dim, model->rope_orig_ctx, model->rope_beta_fast,
               model->rope_beta_slow);
 
-    if (n_threads < 1) n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (n_threads < 1) n_threads = pool_default_workers();
     runtime->pool = pool_start(n_threads);
 
     int inner = model->n_ff > model->n_ff_expert ? model->n_ff
