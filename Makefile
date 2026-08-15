@@ -9,15 +9,16 @@ GEODE_SRC = src/geode.c \
             src/manifest/manifest.c \
             src/planner/planner.c \
             src/exec/gguf.c src/exec/kernels.c src/exec/tokenizer.c \
-            src/exec/model.c src/exec/forward.c src/exec/exec.c \
+            src/exec/model.c src/exec/forward.c \
+            src/exec/plan.c src/exec/strategy.c src/exec/cpu_stream.c \
+            src/exec/selftest.c src/exec/exec.c \
             src/common/json.c src/common/quant.c src/common/parallel.c
 
 BIN   := bin/geode
 
 all: $(BIN)
 
-$(BIN): $(GEODE_SRC) src/common/json.h src/common/modules.h \
-         src/common/quant.h src/probe/*.h src/exec/*.h
+$(BIN): $(GEODE_SRC) src/common/*.h src/probe/*.h src/exec/*.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ $(GEODE_SRC) $(LDLIBS)
 

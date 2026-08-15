@@ -1,27 +1,31 @@
-#include "forward.h"
 #include "gguf.h"
+#include "home.h"
 #include "kernels.h"
 #include "model.h"
 #include "modules.h"
+#include "plan.h"
 #include "quant.h"
+#include "selftest.h"
+#include "strategy.h"
 #include "tokenizer.h"
 
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-static void cfg(const GgufFile *g, const char *arch, const char *key) {
-    char full[160];
-    unsigned long long u;
-    double f;
-    snprintf(full, sizeof full, "%s.%s", arch, key);
-    if (gguf_meta_u64(g, full, &u))
-        printf("  %-42s %llu\n", key, u);
-    else if (gguf_meta_f64(g, full, &f))
-        printf("  %-42s %g\n", key, f);
-}
+#define PROMPT_TOKENS_MAX 2048
+#define DEFAULT_PROMPT "The capital of France is"
+#define DEFAULT_PREDICT_TOKENS 32
+
+/* PROMPT, N_PREDICT, THREADS. */
+#define MAX_OPTIONS 3
+
+typedef struct {
+    const char *prompt;
+    int n_predict;
+    int n_threads;
+} RunArgs;
 
 static const char *config_keys[] = {
     "block_count",
@@ -55,126 +59,65 @@ static const char *config_keys[] = {
     "vocab_size",
 };
 
-static void dump_layer_tensors(const GgufFile *g, int layer) {
+static void print_config_key(const GgufFile *g, const char *arch,
+                             const char *key) {
+    char full[160];
+    unsigned long long integer;
+    double real;
+    snprintf(full, sizeof full, "%s.%s", arch, key);
+    if (gguf_meta_u64(g, full, &integer))
+        printf("  %-42s %llu\n", key, integer);
+    else if (gguf_meta_f64(g, full, &real))
+        printf("  %-42s %g\n", key, real);
+}
+
+static void print_layer_tensors(const GgufFile *g, int layer) {
     char prefix[16];
     snprintf(prefix, sizeof prefix, "blk.%d.", layer);
-    size_t plen = strlen(prefix);
+    size_t prefix_len = strlen(prefix);
+
     for (unsigned long long i = 0; i < g->n_tensors; i++) {
         const GgufTensor *t = &g->tensors[i];
-        if (strncmp(t->name, prefix, plen) != 0) continue;
-        printf("  %-34s %-5s [", t->name + plen, quant_types[t->type].name);
+        if (strncmp(t->name, prefix, prefix_len) != 0) continue;
+        printf("  %-34s %-5s [", t->name + prefix_len, quant_types[t->type].name);
         for (int d = 0; d < t->n_dims; d++)
             printf("%s%llu", d ? ", " : "", t->dims[d]);
         printf("]  %.2f MB\n", t->n_bytes / 1e6);
     }
 }
 
-/* Rounding an activation to int8 costs a fraction of a percent per dot; well
-   past this the quantization is not the explanation and the kernel is wrong. */
-#define ACTIVATION_TOLERANCE 0.02f
+static int describe_model(const GgufFile *g, const RunArgs *args) {
+    (void)args;
+    char arch[128] = "";
+    char name[256] = "";
+    gguf_meta_str(g, "general.architecture", arch, sizeof arch);
+    gguf_meta_str(g, "general.name", name, sizeof name);
+    printf("model: %s (%s), %llu tensors, file %.2f GB\n\n", name, arch,
+           g->n_tensors, g->map_size / 1e9);
 
-/* Dequant the first 256 elements of a tensor, print them, and check gemv_row
-   against a naive dequant-then-dot reference. */
-static int check_tensor(const GgufFile *g, const char *name) {
-    const GgufTensor *t = gguf_find(g, name);
-    if (!t) {
-        printf("  %s: NOT FOUND\n", name);
-        return 0;
+    printf("config:\n");
+    for (unsigned i = 0; i < sizeof config_keys / sizeof *config_keys; i++)
+        print_config_key(g, arch, config_keys[i]);
+
+    unsigned long long histogram[64] = {0};
+    unsigned long long bytes = 0;
+    for (unsigned long long i = 0; i < g->n_tensors; i++) {
+        histogram[g->tensors[i].type]++;
+        bytes += g->tensors[i].n_bytes;
     }
-    int n = (int)t->dims[0];
-    float *deq = malloc((size_t)n * sizeof(float));
-    float *x = malloc((size_t)n * sizeof(float));
-    dequant_row(t->data, t->type, n, deq);
+    printf("\nquant histogram:");
+    for (int type = 0; type < n_quant_types; type++)
+        if (histogram[type])
+            printf("  %s x%llu", quant_types[type].name, histogram[type]);
+    printf("\ntensor bytes: %.2f GB (file %.2f GB)\n", bytes / 1e9,
+           g->map_size / 1e9);
 
-    printf("  %-28s %-5s n=%d\n", name, quant_types[t->type].name, n);
-    printf("    dequant[0..255]:");
-    for (int i = 0; i < 256 && i < n; i++) printf(" %.6f", deq[i]);
-    printf("\n");
-
-    int ok = 1;
-    for (int i = 0; i < n; i++) x[i] = (float)(i % 7) - 3.0f;
-    float want = 0;
-    for (int i = 0; i < n; i++) want += deq[i] * x[i];
-
-    float got = gemv_row(t->data, t->type, n, x);
-    if (fabsf(got - want) > 1e-3f * (1.0f + fabsf(want))) {
-        printf("    gemv MISMATCH: got %.6f want %.6f\n", got, want);
-        ok = 0;
-    } else {
-        printf("    gemv ok: %.6f\n", got);
-    }
-
-    /* matmul is the path decode and prefill actually take, and it quantizes
-       activations to int8 first, so it is held to int8 tolerance rather than
-       gemv's. */
-    void *scratch = malloc(activation_bytes(n, 1) + 1);
-    ActivationBatch activation;
-    float quantized = 0;
-    activation_set(&activation, scratch, x, (size_t)n, n, 1);
-    matmul(&quantized, 1, t->data, t->type, n, 0, 1, &activation);
-    float tolerance = ACTIVATION_TOLERANCE * (1.0f + fabsf(want));
-    if (fabsf(quantized - want) > tolerance) {
-        printf("    matvec MISMATCH: got %.6f want %.6f (tolerance %.6f)\n",
-               quantized, want, tolerance);
-        ok = 0;
-    } else {
-        printf("    matvec ok: %.6f (%.3f%% off reference)\n", quantized,
-               100.0f * fabsf(quantized - want) / (1.0f + fabsf(want)));
-    }
-    free(scratch);
-    free(x);
-    free(deq);
-    return ok;
+    printf("\nblk.0 (dense) tensors:\n");
+    print_layer_tensors(g, 0);
+    printf("\nblk.1 (moe) tensors:\n");
+    print_layer_tensors(g, 1);
+    return 0;
 }
-
-static int kernels_test(const GgufFile *g) {
-    int ok = 1;
-    ok &= check_tensor(g, "blk.0.attn_q.weight");      /* Q4_K */
-    ok &= check_tensor(g, "blk.0.ffn_down.weight");    /* Q6_K */
-    ok &= check_tensor(g, "blk.0.attn_k_b.weight");    /* Q5_0 */
-    ok &= check_tensor(g, "blk.0.attn_norm.weight");    /* F32 */
-    printf(ok ? "kernels: PASS\n" : "kernels: FAIL\n");
-    return ok ? 0 : 1;
-}
-
-static int tokenize_test(const GgufFile *g) {
-    char err[256];
-    Tokenizer t;
-    if (!tokenizer_init(&t, g, err, sizeof err)) {
-        printf("tokenizer: %s\n", err);
-        return 1;
-    }
-    printf("tokenizer: %d tokens, bos=%d eos=%d add_bos=%d\n", t.n_tokens,
-           t.bos_id, t.eos_id, t.add_bos);
-
-    const char *prompts[] = {
-        "Hello, world!",
-        "Привет, как дела?",
-        "The quick brown fox jumps over the lazy dog.",
-        "def fib(n):\n    return n if n < 2 else fib(n-1) + fib(n-2)",
-    };
-    int ok = 1;
-    for (unsigned i = 0; i < sizeof prompts / sizeof prompts[0]; i++) {
-        int ids[512];
-        int n = tokenizer_encode(&t, prompts[i], ids, 512);
-        char back[1024];
-        tokenizer_decode(&t, ids, n, back, sizeof back);
-        printf("  \"%s\" -> %d tokens: [", prompts[i], n);
-        for (int j = 0; j < n && j < 16; j++) printf("%s%d", j ? " " : "", ids[j]);
-        if (n > 16) printf(" ...");
-        printf("]\n  decode: \"%s\"\n", back);
-        if (strcmp(prompts[i], back) != 0) {
-            printf("  ROUND-TRIP MISMATCH\n");
-            ok = 0;
-        }
-    }
-    tokenizer_free(&t);
-    printf(ok ? "tokenizer: PASS\n" : "tokenizer: FAIL\n");
-    return ok ? 0 : 1;
-}
-
-#define PROMPT_TOKENS_MAX 2048
-#define DEFAULT_PREDICT_TOKENS 32
 
 static double now_seconds(void) {
     struct timespec ts;
@@ -189,243 +132,193 @@ static int argmax(const float *values, int n) {
     return best;
 }
 
-static const float *prefill(Runtime *runtime, const int *ids, int n_prompt,
-                            int chunk) {
+static void print_plan(const Plan *plan) {
+    printf("plan:     %s", plan->strategy);
+    if (plan->n_ctx) printf(" @ %d ctx", plan->n_ctx);
+    for (int i = 0; i < plan->n_placements; i++)
+        printf("%s%s->%s", i ? ", " : " (", plan->placements[i].component,
+               plan->placements[i].tier);
+    printf("%s\n", plan->n_placements ? ")" : "");
+}
+
+/* Prefills the prompt, then samples greedily until the model emits its end
+   token or the budget runs out, printing tokens as they arrive. */
+static void stream_tokens(const Strategy *strategy, Runtime *runtime,
+                          const Model *model, const Tokenizer *tokenizer,
+                          const int *ids, int n_prompt, int n_predict) {
+    double started = now_seconds();
     const float *logits = NULL;
-    for (int i = 0; i < n_prompt; i += chunk) {
+    for (int i = 0; i < n_prompt; i += PREFILL_CHUNK) {
         int n = n_prompt - i;
-        if (n > chunk) n = chunk;
-        logits = forward(runtime, ids + i, i, n);
+        if (n > PREFILL_CHUNK) n = PREFILL_CHUNK;
+        logits = strategy->forward(runtime, ids + i, i, n);
     }
-    return logits;
+    double prefilled = now_seconds();
+
+    int generated = 0;
+    for (int i = 0; i < n_predict; i++) {
+        int token = argmax(logits, model->n_vocab);
+        if (token == tokenizer->eos_id) break;
+        char text[512];
+        tokenizer_decode(tokenizer, &token, 1, text, sizeof text);
+        printf("%s", text);
+        fflush(stdout);
+        generated++;
+        logits = strategy->forward(runtime, &token, n_prompt + i, 1);
+    }
+    double finished = now_seconds();
+
+    double prefill_seconds = prefilled - started;
+    printf("\n\nprefill: %d tokens in %.2fs (%.1f tok/s)\n", n_prompt,
+           prefill_seconds, n_prompt / prefill_seconds);
+    if (generated > 0)
+        printf("decode:  %d tokens in %.2fs (%.2f tok/s)\n", generated,
+               finished - prefilled, generated / (finished - prefilled));
 }
 
-/* A fresh runtime per width, because the kv cache each one leaves behind is
-   half of what the next would read. */
-static int prefill_logits(const Model *model, const int *ids, int n_prompt,
-                          int chunk, float *out, char *err, size_t errsz) {
-    Runtime *runtime = runtime_start(model, n_prompt, 0, err, errsz);
-    if (!runtime) return 0;
-    memcpy(out, prefill(runtime, ids, n_prompt, chunk),
-           (size_t)model->n_vocab * sizeof *out);
-    runtime_stop(runtime);
-    return 1;
-}
-
-/* Long enough to span several chunks and to put tokens either side of a chunk
-   boundary in each other's attention. */
-#define PREFILL_TEST_PROMPT                                                    \
-    "The stored-program computer keeps instructions and data in one memory, "  \
-    "which is why a program can be written by another program. Compilers, "    \
-    "linkers and operating systems all follow from that single decision, and " \
-    "so does most of what makes a machine general rather than special."
-
-/* A chunk changes which weights are read together, not what is computed, so
-   prefilling in chunks has to land where feeding the same tokens one at a time
-   lands. It currently lands there exactly, but the check is a tolerance rather
-   than an equality: every token's experts are summed in the same order at any
-   width, and nothing promises a future kernel will keep it that way. */
-#define PREFILL_TOLERANCE 0.01f
-
-static int prefill_test(const GgufFile *g) {
+static int generate(const GgufFile *g, const RunArgs *args) {
     char err[256];
+    Plan plan;
+    int planned = plan_load(&plan, geode_home("plan.json"), err, sizeof err);
+    if (!planned) plan_default(&plan);
+
+    double predicted[2];
+    char note[256];
+    const Strategy *strategy =
+        strategy_choose(&plan, predicted, note, sizeof note);
+    if (!strategy) {
+        fprintf(stderr, "%s\n", note);
+        return 1;
+    }
+
+    if (planned) print_plan(&plan);
+    else printf("plan:     none (%s)\n", err);
+    printf("%s\n", note);
+    if (predicted[1] > 0)
+        printf("predict:  %.1f-%.1f tok/s decode\n", predicted[0], predicted[1]);
+
     Model model;
     if (!model_load(&model, g, err, sizeof err)) {
-        printf("prefill: %s\n", err);
+        fprintf(stderr, "%s\n", err);
         return 1;
     }
     Tokenizer tokenizer;
     if (!tokenizer_init(&tokenizer, g, err, sizeof err)) {
-        printf("prefill: %s\n", err);
+        fprintf(stderr, "%s\n", err);
         model_free(&model);
         return 1;
     }
 
     int ids[PROMPT_TOKENS_MAX];
-    int n_prompt = 0;
-    if (tokenizer.add_bos) ids[n_prompt++] = tokenizer.bos_id;
-    n_prompt += tokenizer_encode(&tokenizer, PREFILL_TEST_PROMPT,
-                                 ids + n_prompt, PROMPT_TOKENS_MAX - n_prompt);
-
-    float *single = malloc((size_t)model.n_vocab * sizeof *single);
-    float *chunked = malloc((size_t)model.n_vocab * sizeof *chunked);
-    int ok = single && chunked &&
-             prefill_logits(&model, ids, n_prompt, 1, single, err, sizeof err) &&
-             prefill_logits(&model, ids, n_prompt, PREFILL_CHUNK, chunked, err,
-                            sizeof err);
-
-    if (!ok) {
-        printf("prefill: %s\n", single && chunked ? err : "out of memory");
-    } else {
-        float worst = 0, largest = 0;
-        for (int i = 0; i < model.n_vocab; i++) {
-            float diff = fabsf(single[i] - chunked[i]);
-            if (diff > worst) worst = diff;
-            if (fabsf(single[i]) > largest) largest = fabsf(single[i]);
-        }
-        float tolerance = PREFILL_TOLERANCE * (1.0f + largest);
-        int token = argmax(chunked, model.n_vocab);
-        int wanted = argmax(single, model.n_vocab);
-
-        printf("prefill: %d tokens, chunk 1 vs %d\n", n_prompt, PREFILL_CHUNK);
-        printf("  logits differ by at most %.6f of %.3f (tolerance %.6f)\n",
-               worst, largest, tolerance);
-        printf("  argmax %d vs %d\n", wanted, token);
-        if (worst > tolerance || token != wanted) ok = 0;
-    }
-
-    free(single);
-    free(chunked);
-    tokenizer_free(&tokenizer);
-    model_free(&model);
-    printf(ok ? "prefill: PASS\n" : "prefill: FAIL\n");
-    return ok ? 0 : 1;
-}
-
-static int run_prompt(const GgufFile *g, const char *prompt, int n_predict,
-                      int n_threads) {
-    char err[256];
-    Model model;
-    if (!model_load(&model, g, err, sizeof err)) {
-        fprintf(stderr, "%s\n", err);
-        return 1;
-    }
-    Tokenizer tokenizer;
-    if (!tokenizer_init(&tokenizer, g, err, sizeof err)) {
-        fprintf(stderr, "%s\n", err);
-        model_free(&model);
-        return 1;
-    }
-
-    int prompt_ids[PROMPT_TOKENS_MAX];
-    int n_prompt = 0;
-    if (tokenizer.add_bos) prompt_ids[n_prompt++] = tokenizer.bos_id;
-    int n_text = tokenizer_encode(&tokenizer, prompt, prompt_ids + n_prompt,
-                                  PROMPT_TOKENS_MAX - n_prompt);
-    if (n_text > 0) n_prompt += n_text;
+    int n_prompt = tokenizer_encode_prompt(&tokenizer, args->prompt, ids,
+                                           PROMPT_TOKENS_MAX);
+    int rc = 1;
     if (n_prompt < 1) {
         fprintf(stderr, "prompt encoded to %d tokens; expected at least 1\n",
                 n_prompt);
-        tokenizer_free(&tokenizer);
-        model_free(&model);
-        return 1;
+    } else {
+        if (n_prompt == PROMPT_TOKENS_MAX)
+            fprintf(stderr, "warning: prompt truncated to %d tokens\n",
+                    n_prompt);
+
+        Runtime *runtime =
+            strategy->start(&model, &plan, n_prompt + args->n_predict,
+                            args->n_threads, err, sizeof err);
+        if (!runtime) {
+            fprintf(stderr, "%s\n", err);
+        } else {
+            printf("%s", args->prompt);
+            fflush(stdout);
+            stream_tokens(strategy, runtime, &model, &tokenizer, ids, n_prompt,
+                          args->n_predict);
+            strategy->stop(runtime);
+            rc = 0;
+        }
     }
 
-    Runtime *runtime = runtime_start(&model, n_prompt + n_predict, n_threads,
-                                     err, sizeof err);
-    if (!runtime) {
-        fprintf(stderr, "%s\n", err);
-        tokenizer_free(&tokenizer);
-        model_free(&model);
-        return 1;
-    }
-
-    double started = now_seconds();
-    const float *logits = prefill(runtime, prompt_ids, n_prompt, PREFILL_CHUNK);
-    double prefilled = now_seconds();
-
-    printf("%s", prompt);
-    fflush(stdout);
-
-    int generated = 0;
-    for (int i = 0; i < n_predict; i++) {
-        int token = argmax(logits, model.n_vocab);
-        if (token == tokenizer.eos_id) break;
-        char text[512];
-        tokenizer_decode(&tokenizer, &token, 1, text, sizeof text);
-        printf("%s", text);
-        fflush(stdout);
-        generated++;
-        logits = forward(runtime, &token, n_prompt + i, 1);
-    }
-    double finished = now_seconds();
-
-    double prefill_seconds = prefilled - started;
-    double decode_seconds = finished - prefilled;
-    printf("\n\nprefill: %d tokens in %.2fs (%.1f tok/s)\n", n_prompt,
-           prefill_seconds, n_prompt / prefill_seconds);
-    if (generated > 0)
-        printf("decode:  %d tokens in %.2fs (%.2f tok/s)\n", generated,
-               decode_seconds, generated / decode_seconds);
-
-    runtime_stop(runtime);
     tokenizer_free(&tokenizer);
     model_free(&model);
-    return 0;
+    return rc;
+}
+
+static int run_kernels(const GgufFile *g, const RunArgs *a) {
+    (void)a;
+    return selftest_kernels(g);
+}
+
+static int run_tokenizer(const GgufFile *g, const RunArgs *a) {
+    (void)a;
+    return selftest_tokenizer(g);
+}
+
+static int run_prefill(const GgufFile *g, const RunArgs *a) {
+    (void)a;
+    return selftest_prefill(g);
+}
+
+typedef struct {
+    const char *name;
+    const char *options; /* NULL for a command taking only a model */
+    const char *summary;
+    int (*run)(const GgufFile *g, const RunArgs *args);
+} Command;
+
+static const Command commands[] = {
+    {"exec", NULL, "print config, quant histogram and layer tensors",
+     describe_model},
+    {"exec-run", "[PROMPT] [N_PREDICT] [THREADS]",
+     "generate, using the cached plan to pick an executor", generate},
+    {"exec-kernels", NULL, "check the quant kernels against a dequant reference",
+     run_kernels},
+    {"exec-tokenize", NULL, "round-trip a few prompts through the tokenizer",
+     run_tokenizer},
+    {"exec-prefill", NULL, "check chunked prefill against one token at a time",
+     run_prefill},
+};
+
+static const Command *find_command(const char *name) {
+    for (unsigned i = 0; i < sizeof commands / sizeof *commands; i++)
+        if (strcmp(commands[i].name, name) == 0) return &commands[i];
+    return NULL;
+}
+
+int exec_handles(const char *name) { return find_command(name) != NULL; }
+
+static void print_usage(void) {
+    fprintf(stderr, "usage: geode COMMAND MODEL.gguf [options]\n\n");
+    for (unsigned i = 0; i < sizeof commands / sizeof *commands; i++) {
+        fprintf(stderr, "  %-14s %s\n", commands[i].name, commands[i].summary);
+        if (commands[i].options)
+            fprintf(stderr, "  %-14s options: %s\n", "", commands[i].options);
+    }
 }
 
 int exec_main(int argc, char **argv) {
-    int generating = strcmp(argv[0], "exec-run") == 0;
-    if (argc < 2 || (generating ? argc > 5 : argc != 2)) {
-        fprintf(stderr, "usage: %s MODEL.gguf%s\n", argv[0],
-                generating ? " [PROMPT] [N_PREDICT] [THREADS]" : "");
+    const Command *command = find_command(argv[0]);
+    int n_options = argc - 2;
+    if (!command || argc < 2 ||
+        n_options > (command->options ? MAX_OPTIONS : 0)) {
+        print_usage();
         return 2;
     }
+
+    RunArgs args = {DEFAULT_PROMPT, DEFAULT_PREDICT_TOKENS, 0};
+    if (n_options > 0) args.prompt = argv[2];
+    if (n_options > 1) args.n_predict = atoi(argv[3]);
+    if (n_options > 2) args.n_threads = atoi(argv[4]);
+    if (args.n_predict < 1) {
+        fprintf(stderr, "N_PREDICT is %d; expected at least 1\n",
+                args.n_predict);
+        return 2;
+    }
+
     char err[256];
     GgufFile g;
     if (!gguf_open(&g, argv[1], err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         return 1;
     }
-
-    if (generating) {
-        const char *prompt = argc > 2 ? argv[2] : "The capital of France is";
-        int n_predict = argc > 3 ? atoi(argv[3]) : DEFAULT_PREDICT_TOKENS;
-        if (n_predict < 1) {
-            fprintf(stderr, "N_PREDICT is %d; expected at least 1\n",
-                    n_predict);
-            gguf_close(&g);
-            return 2;
-        }
-        int rc = run_prompt(&g, prompt, n_predict,
-                            argc > 4 ? atoi(argv[4]) : 0);
-        gguf_close(&g);
-        return rc;
-    }
-    if (strcmp(argv[0], "exec-kernels") == 0) {
-        int rc = kernels_test(&g);
-        gguf_close(&g);
-        return rc;
-    }
-    if (strcmp(argv[0], "exec-tokenize") == 0) {
-        int rc = tokenize_test(&g);
-        gguf_close(&g);
-        return rc;
-    }
-    if (strcmp(argv[0], "exec-prefill") == 0) {
-        int rc = prefill_test(&g);
-        gguf_close(&g);
-        return rc;
-    }
-
-    char arch[128] = "";
-    char name[256] = "";
-    gguf_meta_str(&g, "general.architecture", arch, sizeof arch);
-    gguf_meta_str(&g, "general.name", name, sizeof name);
-    printf("model: %s (%s), %llu tensors, file %.2f GB\n\n", name, arch,
-           g.n_tensors, g.map_size / 1e9);
-
-    printf("config:\n");
-    for (unsigned i = 0; i < sizeof config_keys / sizeof config_keys[0]; i++)
-        cfg(&g, arch, config_keys[i]);
-
-    unsigned long long hist[64] = {0};
-    unsigned long long bytes = 0;
-    for (unsigned long long i = 0; i < g.n_tensors; i++) {
-        hist[g.tensors[i].type]++;
-        bytes += g.tensors[i].n_bytes;
-    }
-    printf("\nquant histogram:");
-    for (int t = 0; t < n_quant_types; t++)
-        if (hist[t]) printf("  %s x%llu", quant_types[t].name, hist[t]);
-    printf("\ntensor bytes: %.2f GB (file %.2f GB)\n", bytes / 1e9,
-           g.map_size / 1e9);
-
-    printf("\nblk.0 (dense) tensors:\n");
-    dump_layer_tensors(&g, 0);
-    printf("\nblk.1 (moe) tensors:\n");
-    dump_layer_tensors(&g, 1);
-
+    int rc = command->run(&g, &args);
     gguf_close(&g);
-    return 0;
+    return rc;
 }

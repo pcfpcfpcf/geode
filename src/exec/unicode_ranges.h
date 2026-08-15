@@ -2275,7 +2275,7 @@ static const UcRange uc_ranges[] = {
     {0x10FFFE, 0x0001},
     {0x110000, 0x0000},
 };
-static const int n_uc_ranges = 2273;
+static const int n_uc_ranges = sizeof uc_ranges / sizeof *uc_ranges;
 static const unsigned uc_whitespace[] = {
     0x000009,
     0x00000A,
@@ -2303,4 +2303,4 @@ static const unsigned uc_whitespace[] = {
     0x00205F,
     0x003000,
 };
-static const int n_uc_whitespace = 25;
+static const int n_uc_whitespace = sizeof uc_whitespace / sizeof *uc_whitespace;

@@ -1,3 +1,4 @@
+#include "home.h"
 #include "modules.h"
 
 #include <stdio.h>
@@ -5,17 +6,9 @@
 #include <string.h>
 #include <sys/stat.h>
 
-static const char *home_geode(const char *name) {
-    static char buf[1024];
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-    snprintf(buf, sizeof buf, "%s/.geode/%s", home, name);
-    return buf;
-}
-
 static int have_cached(const char *name) {
     struct stat st;
-    return stat(home_geode(name), &st) == 0 && st.st_size > 0;
+    return stat(geode_home(name), &st) == 0 && st.st_size > 0;
 }
 
 static int run_cached_planner(const char *argv0, int nargs, char **args) {
@@ -56,10 +49,11 @@ static void usage(const char *argv0) {
             "  %s plan [opts]        same, with planner opts\n"
             "                        (--context N --batch N --out plan.json)\n"
             "  %s probe|manifest|planner [args...]   run one step\n"
-            "  %s exec-run MODEL.gguf [PROMPT] [N]   generate on the cpu\n"
+            "  %s exec-run MODEL.gguf [PROMPT] [N]   generate, per the plan\n"
+            "  %s exec MODEL.gguf                    exec commands and checks\n"
             "\n"
             "cache: ~/.geode/probe.json, manifest.json, plan.json\n",
-            argv0, argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -71,14 +65,7 @@ int main(int argc, char **argv) {
         return manifest_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "planner") == 0)
         return planner_main(argc - 1, argv + 1);
-    if (strcmp(argv[1], "exec") == 0) return exec_main(argc - 1, argv + 1);
-    if (strcmp(argv[1], "exec-kernels") == 0)
-        return exec_main(argc - 1, argv + 1);
-    if (strcmp(argv[1], "exec-tokenize") == 0)
-        return exec_main(argc - 1, argv + 1);
-    if (strcmp(argv[1], "exec-prefill") == 0)
-        return exec_main(argc - 1, argv + 1);
-    if (strcmp(argv[1], "exec-run") == 0) return exec_main(argc - 1, argv + 1);
+    if (exec_handles(argv[1])) return exec_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
         usage(argv[0]);
