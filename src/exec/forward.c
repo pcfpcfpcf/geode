@@ -31,6 +31,8 @@ struct Runtime {
     int cache_width;
 
     uint16_t *cache;
+    float *cache_row;
+    float *cos_sin;
 
     float *residual;
     float *normed;
@@ -91,18 +93,23 @@ static void matvec_worker(void *state, int worker, int n_workers) {
     matvec(job->out, job->rows, job->type, job->n_in, begin, end, job->x);
 }
 
+/* Takes the input already quantized, because the matrices that read the same
+   vector -- q and kv_a from the attention norm, the router and the expert
+   branches from the feed-forward norm -- would otherwise each pay for it. */
 static void run_matvec(Runtime *runtime, float *out, const GgufTensor *tensor,
-                       int matrix_index, const float *x) {
-    Activation activation;
-    activation_set(&activation, activation_slot(runtime, 0), x,
-                   (int)tensor->dims[0]);
+                       int matrix_index, const Activation *x) {
     MatvecJob job = {out,
                      matrix_at(tensor, matrix_index),
                      tensor->type,
                      (int)tensor->dims[0],
                      (int)tensor->dims[1],
-                     &activation};
+                     x};
     pool_run(runtime->pool, matvec_worker, &job);
+}
+
+static void quantize_normed(Runtime *runtime, Activation *activation) {
+    activation_set(activation, activation_slot(runtime, 0), runtime->normed,
+                   runtime->model->n_embd);
 }
 
 typedef struct {
@@ -114,46 +121,72 @@ typedef struct {
 } AttentionJob;
 
 /* One worker owns whole heads, so scoring, softmax, the weighted sum over the
-   cache and the value projection all run without a barrier between them. */
+   cache and the value projection all run without a barrier between them.
+
+   Under MLA every head reads the same cache rows, so the two passes over the
+   cache are the outer loops and the worker's heads the inner ones. Walking the
+   cache once per head instead multiplies the read -- and the fp16 expansion --
+   by the head count, which at a few thousand positions costs more than every
+   weight in the layer. */
 static void attention_worker(void *state, int worker, int n_workers) {
     const AttentionJob *job = state;
     Runtime *runtime = job->runtime;
     const Model *model = runtime->model;
     int rank = model->kv_lora_rank;
+    float *cache_row =
+        runtime->cache_row + (size_t)worker * runtime->cache_width;
 
     int head_begin = model->n_head * worker / n_workers;
     int head_end = model->n_head * (worker + 1) / n_workers;
 
     for (int head = head_begin; head < head_end; head++) {
         float *query = runtime->query + (size_t)head * model->head_dim_k;
-        float *query_rope = query + model->qk_nope_dim;
-        float *query_latent = runtime->query_latent + (size_t)head * rank;
-        float *scores = runtime->scores + (size_t)head * runtime->n_ctx;
-        float *attn_latent = runtime->attn_latent + (size_t)head * rank;
-
         Activation activation;
-        rope_apply(query_rope, &runtime->rope, job->position);
+
+        rope_apply(query + model->qk_nope_dim, runtime->cos_sin,
+                   model->qk_rope_dim);
         activation_set(&activation, activation_slot(runtime, worker), query,
                        model->qk_nope_dim);
-        matvec(query_latent, matrix_at(job->layer->k_b, head),
-               job->layer->k_b->type, model->qk_nope_dim, 0, rank, &activation);
+        matvec(runtime->query_latent + (size_t)head * rank,
+               matrix_at(job->layer->k_b, head), job->layer->k_b->type,
+               model->qk_nope_dim, 0, rank, &activation);
+    }
 
-        for (int p = 0; p < job->n_cached; p++) {
-            const uint16_t *slot = cache_slot(runtime, job->layer_index, p);
-            float score = dot_fp16(slot, query_latent, rank) +
-                          dot_fp16(slot + rank, query_rope, model->qk_rope_dim);
-            scores[p] = score * model->kq_scale;
+    for (int p = 0; p < job->n_cached; p++) {
+        expand_fp16(cache_row, cache_slot(runtime, job->layer_index, p),
+                    runtime->cache_width);
+        for (int head = head_begin; head < head_end; head++) {
+            float score =
+                dot_f32(cache_row, runtime->query_latent + (size_t)head * rank,
+                        rank) +
+                dot_f32(cache_row + rank,
+                        runtime->query + (size_t)head * model->head_dim_k +
+                            model->qk_nope_dim,
+                        model->qk_rope_dim);
+            runtime->scores[(size_t)head * runtime->n_ctx + p] =
+                score * model->kq_scale;
         }
-        softmax(scores, job->n_cached);
+    }
 
-        memset(attn_latent, 0, (size_t)rank * sizeof *attn_latent);
-        for (int p = 0; p < job->n_cached; p++)
-            accumulate_fp16(attn_latent,
-                            cache_slot(runtime, job->layer_index, p), scores[p],
-                            rank);
+    for (int head = head_begin; head < head_end; head++) {
+        softmax(runtime->scores + (size_t)head * runtime->n_ctx,
+                job->n_cached);
+        memset(runtime->attn_latent + (size_t)head * rank, 0,
+               (size_t)rank * sizeof *runtime->attn_latent);
+    }
 
+    for (int p = 0; p < job->n_cached; p++) {
+        expand_fp16(cache_row, cache_slot(runtime, job->layer_index, p), rank);
+        for (int head = head_begin; head < head_end; head++)
+            add_scaled(runtime->attn_latent + (size_t)head * rank, cache_row,
+                       runtime->scores[(size_t)head * runtime->n_ctx + p],
+                       rank);
+    }
+
+    for (int head = head_begin; head < head_end; head++) {
+        Activation activation;
         activation_set(&activation, activation_slot(runtime, worker),
-                       attn_latent, rank);
+                       runtime->attn_latent + (size_t)head * rank, rank);
         matvec(runtime->attn_out + (size_t)head * model->head_dim_v,
                matrix_at(job->layer->v_b, head), job->layer->v_b->type, rank, 0,
                model->head_dim_v, &activation);
@@ -165,13 +198,15 @@ static void attention(Runtime *runtime, const Layer *layer, int layer_index,
     const Model *model = runtime->model;
     int rank = model->kv_lora_rank;
 
-    run_matvec(runtime, runtime->query, layer->attn_q, 0, runtime->normed);
-    run_matvec(runtime, runtime->kv_projected, layer->kv_a_mqa, 0,
-               runtime->normed);
+    Activation normed;
+    quantize_normed(runtime, &normed);
+    run_matvec(runtime, runtime->query, layer->attn_q, 0, &normed);
+    run_matvec(runtime, runtime->kv_projected, layer->kv_a_mqa, 0, &normed);
 
     rmsnorm(runtime->kv_normed, runtime->kv_projected,
             layer->kv_a_norm->data, rank, model->rms_eps);
-    rope_apply(runtime->kv_projected + rank, &runtime->rope, position);
+    rope_apply(runtime->kv_projected + rank, runtime->cos_sin,
+               model->qk_rope_dim);
 
     uint16_t *slot = cache_slot(runtime, layer_index, position);
     for (int i = 0; i < rank; i++) slot[i] = fp32_to_fp16(runtime->kv_normed[i]);
@@ -181,8 +216,10 @@ static void attention(Runtime *runtime, const Layer *layer, int layer_index,
     AttentionJob job = {runtime, layer, layer_index, position, position + 1};
     pool_run(runtime->pool, attention_worker, &job);
 
-    run_matvec(runtime, runtime->projected, layer->attn_output, 0,
-               runtime->attn_out);
+    Activation heads;
+    activation_set(&heads, activation_slot(runtime, 0), runtime->attn_out,
+                   model->n_head * model->head_dim_v);
+    run_matvec(runtime, runtime->projected, layer->attn_output, 0, &heads);
 }
 
 static int branch_width(const Branch *branch) {
@@ -265,13 +302,11 @@ static void contract_worker(void *state, int worker, int n_workers) {
     }
 }
 
-static void run_branches(Runtime *runtime, int n_branches) {
+static void run_branches(Runtime *runtime, int n_branches,
+                         const Activation *input) {
     int total_ff = branch_layout(runtime->branches, n_branches);
 
-    Activation input;
-    activation_set(&input, activation_slot(runtime, 0), runtime->normed,
-                   runtime->model->n_embd);
-    ExpandJob expand = {runtime, n_branches, total_ff, &input};
+    ExpandJob expand = {runtime, n_branches, total_ff, input};
     pool_run(runtime->pool, expand_worker, &expand);
 
     for (int b = 0; b < n_branches; b++)
@@ -330,16 +365,18 @@ static int select_experts(Runtime *runtime, const Layer *layer) {
 }
 
 static void feed_forward(Runtime *runtime, const Layer *layer) {
+    Activation normed;
+    quantize_normed(runtime, &normed);
+
     if (!layer->has_experts) {
         runtime->branches[0].ffn = &layer->dense;
         runtime->branches[0].matrix_index = 0;
         runtime->branches[0].weight = 1.0f;
-        run_branches(runtime, 1);
+        run_branches(runtime, 1, &normed);
         return;
     }
-    run_matvec(runtime, runtime->router_probs, layer->router, 0,
-               runtime->normed);
-    run_branches(runtime, select_experts(runtime, layer));
+    run_matvec(runtime, runtime->router_probs, layer->router, 0, &normed);
+    run_branches(runtime, select_experts(runtime, layer), &normed);
 }
 
 const float *forward(Runtime *runtime, int token, int position) {
@@ -350,6 +387,7 @@ const float *forward(Runtime *runtime, int token, int position) {
         (const unsigned char *)model->token_embd->data +
         (size_t)token * row_bytes(model->token_embd->type, n_embd);
     dequant_row(embedding, model->token_embd->type, n_embd, runtime->residual);
+    rope_position(runtime->cos_sin, &runtime->rope, position);
 
     for (int index = 0; index < model->n_layer; index++) {
         const Layer *layer = &model->layers[index];
@@ -367,7 +405,9 @@ const float *forward(Runtime *runtime, int token, int position) {
 
     rmsnorm(runtime->normed, runtime->residual, model->output_norm->data,
             n_embd, model->rms_eps);
-    run_matvec(runtime, runtime->logits, model->output, 0, runtime->normed);
+    Activation normed;
+    quantize_normed(runtime, &normed);
+    run_matvec(runtime, runtime->logits, model->output, 0, &normed);
     return runtime->logits;
 }
 
@@ -429,6 +469,9 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     runtime->cache = calloc(cache_elements, sizeof *runtime->cache);
     if (!runtime->cache) ok = 0;
 
+    runtime->cache_row = alloc_floats(
+        (size_t)pool_workers(runtime->pool) * runtime->cache_width, &ok);
+    runtime->cos_sin = alloc_floats((size_t)model->qk_rope_dim, &ok);
     runtime->residual = alloc_floats((size_t)model->n_embd, &ok);
     runtime->normed = alloc_floats((size_t)model->n_embd, &ok);
     runtime->query =
@@ -465,6 +508,8 @@ void runtime_stop(Runtime *runtime) {
     if (!runtime) return;
     pool_stop(runtime->pool);
     free(runtime->cache);
+    free(runtime->cache_row);
+    free(runtime->cos_sin);
     free(runtime->residual);
     free(runtime->normed);
     free(runtime->query);

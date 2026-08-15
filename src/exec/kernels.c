@@ -417,22 +417,37 @@ q50_quants(const block_q5_0 *b) {
    between them. */
 #define Q50_ROWS 4
 
+/* One block of one row, folded into that row's running products and its
+   running offset. The accumulators are passed by pointer so that the row loop
+   below can hold them in named locals: an array of them is what gcc spills. */
+__attribute__((target("avx2,fma,f16c"), always_inline)) static inline void
+q50_block(__m256 *acc, float *offset, const block_q5_0 *b, __m256i xq,
+          float activation_scale, float group_sums) {
+    __m256i sumi = _mm256_madd_epi16(
+        _mm256_maddubs_epi16(q50_quants(b), xq), _mm256_set1_epi16(1));
+    float scale = half_to_float(b->d) * activation_scale;
+    *acc = _mm256_fmadd_ps(_mm256_set1_ps(scale), _mm256_cvtepi32_ps(sumi),
+                           *acc);
+    *offset -= scale * 16.0f * group_sums;
+}
+
 __attribute__((target("avx2,fma,f16c"))) static void
 gemv_q50_q8_avx2(float *out, const void *rows, size_t stride, int row_begin,
                  int row_end, int n, const ActivationBlock *x) {
-    const __m256i ones = _mm256_set1_epi16(1);
     const unsigned char *base =
         (const unsigned char *)rows + (size_t)row_begin * stride;
     int blocks = n / QUANT_GRANULE;
     int r = row_begin;
 
     for (; r + Q50_ROWS <= row_end; r += Q50_ROWS, base += Q50_ROWS * stride) {
-        __m256 acc[Q50_ROWS];
-        float offset[Q50_ROWS];
-        for (int k = 0; k < Q50_ROWS; k++) {
-            acc[k] = _mm256_setzero_ps();
-            offset[k] = 0;
-        }
+        const block_q5_0 *row0 = (const block_q5_0 *)base;
+        const block_q5_0 *row1 = (const block_q5_0 *)(base + stride);
+        const block_q5_0 *row2 = (const block_q5_0 *)(base + 2 * stride);
+        const block_q5_0 *row3 = (const block_q5_0 *)(base + 3 * stride);
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0, acc2 = acc0,
+               acc3 = acc0;
+        float off0 = 0, off1 = 0, off2 = 0, off3 = 0;
+
         for (int i = 0; i < blocks; i++) {
             int sub = i % (QK_K / QUANT_GRANULE);
             const ActivationBlock *a = &x[i / (QK_K / QUANT_GRANULE)];
@@ -441,19 +456,15 @@ gemv_q50_q8_avx2(float *out, const void *rows, size_t stride, int row_begin,
             float sums = (float)(a->group_sums[2 * sub] +
                                  a->group_sums[2 * sub + 1]);
 
-            for (int k = 0; k < Q50_ROWS; k++) {
-                const block_q5_0 *b =
-                    &((const block_q5_0 *)(base + (size_t)k * stride))[i];
-                __m256i sumi = _mm256_madd_epi16(
-                    _mm256_maddubs_epi16(q50_quants(b), xq), ones);
-                float scale = half_to_float(b->d) * a->scale;
-                acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(scale),
-                                         _mm256_cvtepi32_ps(sumi), acc[k]);
-                offset[k] -= scale * 16.0f * sums;
-            }
+            q50_block(&acc0, &off0, &row0[i], xq, a->scale, sums);
+            q50_block(&acc1, &off1, &row1[i], xq, a->scale, sums);
+            q50_block(&acc2, &off2, &row2[i], xq, a->scale, sums);
+            q50_block(&acc3, &off3, &row3[i], xq, a->scale, sums);
         }
-        for (int k = 0; k < Q50_ROWS; k++)
-            out[r + k] = hsum256(acc[k]) + offset[k];
+        out[r + 0] = hsum256(acc0) + off0;
+        out[r + 1] = hsum256(acc1) + off1;
+        out[r + 2] = hsum256(acc2) + off2;
+        out[r + 3] = hsum256(acc3) + off3;
     }
 
     for (; r < row_end; r++, base += stride) {
@@ -462,47 +473,126 @@ gemv_q50_q8_avx2(float *out, const void *rows, size_t stride, int row_begin,
         for (int i = 0; i < blocks; i++) {
             int sub = i % (QK_K / QUANT_GRANULE);
             const ActivationBlock *a = &x[i / (QK_K / QUANT_GRANULE)];
-            const block_q5_0 *b = &((const block_q5_0 *)base)[i];
-            __m256i sumi = _mm256_madd_epi16(
-                _mm256_maddubs_epi16(
-                    q50_quants(b),
-                    _mm256_loadu_si256(
-                        (const __m256i *)(a->qs + QUANT_GRANULE * sub))),
-                ones);
-            float scale = half_to_float(b->d) * a->scale;
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(scale),
-                                  _mm256_cvtepi32_ps(sumi), acc);
-            offset -= scale * 16.0f * (float)(a->group_sums[2 * sub] +
-                                              a->group_sums[2 * sub + 1]);
+            q50_block(&acc, &offset, &((const block_q5_0 *)base)[i],
+                      _mm256_loadu_si256(
+                          (const __m256i *)(a->qs + QUANT_GRANULE * sub)),
+                      a->scale,
+                      (float)(a->group_sums[2 * sub] +
+                              a->group_sums[2 * sub + 1]));
         }
         out[r] = hsum256(acc) + offset;
     }
 }
 
-__attribute__((target("avx2,fma,f16c"))) static float
-dot_fp16_avx2(const uint16_t *values, const float *x, int n) {
-    __m256 acc = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 8 <= n; i += 8)
-        acc = _mm256_fmadd_ps(
-            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(values + i))),
-            _mm256_loadu_ps(x + i), acc);
-    float sum = hsum256(acc);
-    for (; i < n; i++) sum += fp16_to_fp32(values[i]) * x[i];
-    return sum;
-}
-
 __attribute__((target("avx2,fma,f16c"))) static void
-accumulate_fp16_avx2(float *dst, const uint16_t *values, float weight, int n) {
-    __m256 w = _mm256_set1_ps(weight);
+expand_fp16_avx2(float *dst, const uint16_t *values, int n) {
     int i = 0;
     for (; i + 8 <= n; i += 8)
         _mm256_storeu_ps(
             dst + i,
-            _mm256_fmadd_ps(
-                _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(values + i))),
-                w, _mm256_loadu_ps(dst + i)));
-    for (; i < n; i++) dst[i] += fp16_to_fp32(values[i]) * weight;
+            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(values + i))));
+    for (; i < n; i++) dst[i] = fp16_to_fp32(values[i]);
+}
+
+/* Four accumulators rather than one: a single chain retires at fma latency and
+   leaves three quarters of the pipeline idle on vectors this short. They are
+   named rather than held in an array because gcc declines to unroll the loop
+   an array would need and spills all four to the stack, which turns every
+   fma into a load-modify-store and costs more than the extra chains win. */
+__attribute__((target("avx2,fma,f16c"))) static float
+dot_f32_avx2(const float *a, const float *b, int n) {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 0),
+                               _mm256_loadu_ps(b + i + 0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),
+                               _mm256_loadu_ps(b + i + 8), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16),
+                               _mm256_loadu_ps(b + i + 16), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24),
+                               _mm256_loadu_ps(b + i + 24), acc3);
+    }
+    for (; i + 8 <= n; i += 8)
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i),
+                               acc0);
+    float sum = hsum256(_mm256_add_ps(_mm256_add_ps(acc0, acc1),
+                                      _mm256_add_ps(acc2, acc3)));
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+__attribute__((target("avx2,fma,f16c"))) static void
+add_scaled_avx2(float *dst, const float *src, float scale, int n) {
+    __m256 w = _mm256_set1_ps(scale);
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(dst + i,
+                         _mm256_fmadd_ps(_mm256_loadu_ps(src + i), w,
+                                         _mm256_loadu_ps(dst + i)));
+    for (; i < n; i++) dst[i] += src[i] * scale;
+}
+
+/* Horizontal sum of eight int32 lanes. */
+__attribute__((target("avx2,fma,f16c"), always_inline)) static inline int
+hsum256i(__m256i v) {
+    __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(v),
+                               _mm256_extracti128_si256(v, 1));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0x4E));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0xB1));
+    return _mm_cvtsi128_si32(lo);
+}
+
+/* Quantizes one block and returns its scale, or 0 when every value was zero
+   and the caller should leave the zeroed block alone. The signed extreme is
+   the wider of the block's maximum and its negated minimum, which is the
+   largest magnitude with the sign of the end that saturates. */
+__attribute__((target("avx2,fma,f16c"))) static float
+quantize_block_avx2(ActivationBlock *block, const float *x, int count) {
+    __m256 hi = _mm256_loadu_ps(x), lo = hi;
+    for (int i = 8; i < count; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        hi = _mm256_max_ps(hi, v);
+        lo = _mm256_min_ps(lo, v);
+    }
+    __m128 h = _mm_max_ps(_mm256_castps256_ps128(hi),
+                          _mm256_extractf128_ps(hi, 1));
+    h = _mm_max_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_max_ss(h, _mm_movehdup_ps(h));
+    __m128 l = _mm_min_ps(_mm256_castps256_ps128(lo),
+                          _mm256_extractf128_ps(lo, 1));
+    l = _mm_min_ps(l, _mm_movehl_ps(l, l));
+    l = _mm_min_ss(l, _mm_movehdup_ps(l));
+
+    float highest = _mm_cvtss_f32(h), lowest = _mm_cvtss_f32(l);
+    float extreme = highest >= -lowest ? highest : lowest;
+    if (extreme == 0) return 0;
+
+    float inverse_scale = -127.0f / extreme;
+    __m256 scale = _mm256_set1_ps(inverse_scale);
+    const __m256i lane_order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    for (int j = 0; j < count; j += QUANT_GRANULE) {
+        __m256i q[4];
+        for (int k = 0; k < 4; k++)
+            q[k] = _mm256_cvtps_epi32(
+                _mm256_mul_ps(_mm256_loadu_ps(x + j + 8 * k), scale));
+
+        /* Summed as int32 before the pack, which is where the group sums are
+           cheapest to take. */
+        block->group_sums[j / 16 + 0] =
+            (int16_t)hsum256i(_mm256_add_epi32(q[0], q[1]));
+        block->group_sums[j / 16 + 1] =
+            (int16_t)hsum256i(_mm256_add_epi32(q[2], q[3]));
+
+        /* Both packs interleave the two 128-bit lanes; one permute puts the
+           32 bytes back in element order. */
+        __m256i packed = _mm256_packs_epi16(_mm256_packs_epi32(q[0], q[1]),
+                                            _mm256_packs_epi32(q[2], q[3]));
+        _mm256_storeu_si256((__m256i *)(block->qs + j),
+                            _mm256_permutevar8x32_epi32(packed, lane_order));
+    }
+    return 1.0f / inverse_scale;
 }
 
 /* One row per weight type that has an integer kernel. Anything missing here
@@ -568,6 +658,9 @@ void activation_set(Activation *activation, void *scratch, const float *values,
     activation->blocks = NULL;
     if (n % QUANT_GRANULE != 0 || !scratch) return;
 
+#ifdef HAVE_AVX2
+    int vector = have_avx2();
+#endif
     ActivationBlock *blocks = scratch;
     for (int i = 0; i < activation_blocks(n); i++) {
         ActivationBlock *block = &blocks[i];
@@ -575,6 +668,12 @@ void activation_set(Activation *activation, void *scratch, const float *values,
         int count = n - i * QK_K < QK_K ? n - i * QK_K : QK_K;
 
         memset(block, 0, sizeof *block);
+#ifdef HAVE_AVX2
+        if (vector) {
+            block->scale = quantize_block_avx2(block, x, count);
+            continue;
+        }
+#endif
         float extreme = 0, largest = 0;
         for (int j = 0; j < count; j++) {
             float magnitude = fabsf(x[j]);
@@ -586,6 +685,7 @@ void activation_set(Activation *activation, void *scratch, const float *values,
         if (largest == 0) continue;
 
         float inverse_scale = -127.0f / extreme;
+        block->scale = 1.0f / inverse_scale;
         for (int j = 0; j < count; j++) {
             int q = (int)lrintf(inverse_scale * x[j]);
             block->qs[j] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
@@ -595,7 +695,6 @@ void activation_set(Activation *activation, void *scratch, const float *values,
             for (int k = 0; k < 16; k++) sum += block->qs[g * 16 + k];
             block->group_sums[g] = (int16_t)sum;
         }
-        block->scale = 1.0f / inverse_scale;
     }
     activation->blocks = blocks;
 }
@@ -647,26 +746,32 @@ void swiglu(float *out, const float *gate, const float *up, int n) {
 }
 
 void add_scaled(float *dst, const float *src, float scale, int n) {
-    for (int i = 0; i < n; i++) dst[i] += src[i] * scale;
-}
-
-float dot_fp16(const uint16_t *values, const float *x, int n) {
-#ifdef HAVE_AVX2
-    if (have_avx2()) return dot_fp16_avx2(values, x, n);
-#endif
-    float acc = 0;
-    for (int i = 0; i < n; i++) acc += fp16_to_fp32(values[i]) * x[i];
-    return acc;
-}
-
-void accumulate_fp16(float *dst, const uint16_t *values, float weight, int n) {
 #ifdef HAVE_AVX2
     if (have_avx2()) {
-        accumulate_fp16_avx2(dst, values, weight, n);
+        add_scaled_avx2(dst, src, scale, n);
         return;
     }
 #endif
-    for (int i = 0; i < n; i++) dst[i] += fp16_to_fp32(values[i]) * weight;
+    for (int i = 0; i < n; i++) dst[i] += src[i] * scale;
+}
+
+float dot_f32(const float *a, const float *b, int n) {
+#ifdef HAVE_AVX2
+    if (have_avx2()) return dot_f32_avx2(a, b, n);
+#endif
+    float acc = 0;
+    for (int i = 0; i < n; i++) acc += a[i] * b[i];
+    return acc;
+}
+
+void expand_fp16(float *dst, const uint16_t *values, int n) {
+#ifdef HAVE_AVX2
+    if (have_avx2()) {
+        expand_fp16_avx2(dst, values, n);
+        return;
+    }
+#endif
+    for (int i = 0; i < n; i++) dst[i] = fp16_to_fp32(values[i]);
 }
 
 static float corr_dim(int n_dims, int orig_ctx, float n_rot, float base) {
@@ -683,12 +788,7 @@ void rope_init(RopeConfig *rope, float freq_base, float freq_scale, int n_dims,
     rope->corr_high = ceilf(corr_dim(n_dims, orig_ctx, beta_slow, freq_base));
 }
 
-/* Interleaved pairing: dimension 2i rotates against 2i+1. DeepSeek emits its
-   rotary dimensions in that order, so the split-half pairing that most recent
-   architectures use yields text that reads fluently but has lost track of
-   position -- it recalls facts and cannot continue "1, 2, 3".
-   Magnitude is left alone -- see the mscale note in model.c. */
-void rope_apply(float *vec, const RopeConfig *rope, int position) {
+void rope_position(float *cos_sin, const RopeConfig *rope, int position) {
     int n_pairs = rope->n_dims / 2;
     float theta_extrap = (float)position;
     float span = rope->corr_high - rope->corr_low;
@@ -701,11 +801,20 @@ void rope_apply(float *vec, const RopeConfig *rope, int position) {
 
         float theta_interp = rope->freq_scale * theta_extrap;
         float theta = theta_interp * (1.0f - ramp) + theta_extrap * ramp;
-        float cos_theta = cosf(theta);
-        float sin_theta = sinf(theta);
+        cos_sin[2 * i] = cosf(theta);
+        cos_sin[2 * i + 1] = sinf(theta);
+    }
+}
 
-        float low = vec[2 * i];
-        float high = vec[2 * i + 1];
+/* Interleaved pairing: dimension 2i rotates against 2i+1. DeepSeek emits its
+   rotary dimensions in that order, so the split-half pairing that most recent
+   architectures use yields text that reads fluently but has lost track of
+   position -- it recalls facts and cannot continue "1, 2, 3".
+   Magnitude is left alone -- see the mscale note in model.c. */
+void rope_apply(float *vec, const float *cos_sin, int n_dims) {
+    for (int i = 0; i < n_dims / 2; i++) {
+        float cos_theta = cos_sin[2 * i], sin_theta = cos_sin[2 * i + 1];
+        float low = vec[2 * i], high = vec[2 * i + 1];
         vec[2 * i] = low * cos_theta - high * sin_theta;
         vec[2 * i + 1] = low * sin_theta + high * cos_theta;
     }
@@ -713,12 +822,8 @@ void rope_apply(float *vec, const RopeConfig *rope, int position) {
 
 float gemv_row(const void *data, unsigned type, int n_in, const float *x) {
     switch (type) {
-    case GGML_TYPE_F32: {
-        const float *w = data;
-        float acc = 0;
-        for (int i = 0; i < n_in; i++) acc += w[i] * x[i];
-        return acc;
-    }
+    case GGML_TYPE_F32:
+        return dot_f32(data, x, n_in);
     case GGML_TYPE_F16: {
         const uint16_t *w = data;
         float acc = 0;

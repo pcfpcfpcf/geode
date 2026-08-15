@@ -11,22 +11,31 @@
    that an oversubscribed box gives the cpu back instead of burning it. */
 #define SPINS_BEFORE_YIELD 4096
 
+#define CACHE_LINE 64
+
+/* Each worker reports done in its own slot, and the padding keeps sizeof over
+   a cache line so that no two slots ever land on one. A shared counter puts
+   every worker's release on the line the others are spinning on, which turns
+   an idle wait into coherence traffic against the same interconnect the
+   weight stream needs. */
+typedef struct Worker {
+    ThreadPool *pool;
+    int index;
+    int cpu;
+    _Atomic unsigned finished_epoch;
+    char pad[CACHE_LINE];
+} Worker;
+
 struct ThreadPool {
     pthread_t *threads;
-    struct Worker *workers;
+    Worker *workers;
     int n_workers;
 
     ParallelFn fn;
     void *state;
     _Atomic unsigned epoch;
-    _Atomic int n_finished;
     _Atomic int stopping;
 };
-
-typedef struct Worker {
-    ThreadPool *pool;
-    int index;
-} Worker;
 
 #define CORES_MAX 256
 
@@ -42,16 +51,18 @@ static int read_topology_id(int cpu, const char *field) {
     return value;
 }
 
-int pool_default_workers(void) {
+/* Fills cpus with one logical cpu per physical core and returns how many there
+   were, or 0 when the topology is not readable. */
+static int physical_cores(int *cpus, int max) {
     long logical = sysconf(_SC_NPROCESSORS_ONLN);
-    if (logical < 1) return 1;
+    if (logical < 1) return 0;
 
     int packages[CORES_MAX], cores[CORES_MAX];
     int n_cores = 0;
-    for (int cpu = 0; cpu < logical && cpu < CORES_MAX; cpu++) {
+    for (int cpu = 0; cpu < logical && cpu < CORES_MAX && n_cores < max; cpu++) {
         int package = read_topology_id(cpu, "physical_package_id");
         int core = read_topology_id(cpu, "core_id");
-        if (package < 0 || core < 0) return (int)logical;
+        if (package < 0 || core < 0) return 0;
 
         int seen = 0;
         for (int i = 0; i < n_cores; i++)
@@ -59,10 +70,35 @@ int pool_default_workers(void) {
         if (!seen) {
             packages[n_cores] = package;
             cores[n_cores] = core;
+            cpus[n_cores] = cpu;
             n_cores++;
         }
     }
-    return n_cores > 0 ? n_cores : (int)logical;
+    return n_cores;
+}
+
+int pool_default_workers(void) {
+    int cpus[CORES_MAX];
+    int n_cores = physical_cores(cpus, CORES_MAX);
+    if (n_cores > 0) return n_cores;
+    long logical = sysconf(_SC_NPROCESSORS_ONLN);
+    return logical > 0 ? (int)logical : 1;
+}
+
+/* Pinned one worker per physical core, the calling thread included -- it runs
+   worker 0 and so carries its share of every region. Two workers landing on
+   one core's hyperthread siblings while another core idles costs about a
+   tenth of the achievable streaming bandwidth.
+
+   Left unpinned when the caller asked for more workers than there are cores:
+   there is no assignment that keeps them off each other, and the scheduler
+   moving them is better than us freezing a bad one in place. */
+static void pin_to_cpu(int cpu) {
+    if (cpu < 0) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
 }
 
 static void spin(int *spins) {
@@ -76,6 +112,7 @@ static void *pool_worker(void *arg) {
     ThreadPool *pool = worker->pool;
     unsigned seen = 0;
 
+    pin_to_cpu(worker->cpu);
     for (;;) {
         int spins = 0;
         unsigned epoch;
@@ -90,7 +127,8 @@ static void *pool_worker(void *arg) {
             return NULL;
 
         pool->fn(pool->state, worker->index, pool->n_workers);
-        atomic_fetch_add_explicit(&pool->n_finished, 1, memory_order_release);
+        atomic_store_explicit(&worker->finished_epoch, epoch,
+                              memory_order_release);
     }
 }
 
@@ -101,14 +139,20 @@ ThreadPool *pool_start(int n_workers) {
     if (!pool) return NULL;
     pool->n_workers = n_workers;
     atomic_init(&pool->epoch, 0);
-    atomic_init(&pool->n_finished, 0);
     atomic_init(&pool->stopping, 0);
 
+    int cpus[CORES_MAX];
+    int n_cores = physical_cores(cpus, CORES_MAX);
+    int pinning = n_cores >= n_workers;
+
     int n_spawned = n_workers - 1;
-    if (n_spawned == 0) return pool;
+    if (n_spawned == 0) {
+        if (pinning) pin_to_cpu(cpus[0]);
+        return pool;
+    }
 
     pool->threads = malloc((size_t)n_spawned * sizeof *pool->threads);
-    pool->workers = malloc((size_t)n_spawned * sizeof *pool->workers);
+    pool->workers = calloc((size_t)n_spawned, sizeof *pool->workers);
     if (!pool->threads || !pool->workers) {
         pool_stop(pool);
         return NULL;
@@ -116,12 +160,15 @@ ThreadPool *pool_start(int n_workers) {
     for (int i = 0; i < n_spawned; i++) {
         pool->workers[i].pool = pool;
         pool->workers[i].index = i + 1;
+        pool->workers[i].cpu = pinning ? cpus[i + 1] : -1;
+        atomic_init(&pool->workers[i].finished_epoch, 0);
         if (pthread_create(&pool->threads[i], NULL, pool_worker,
                            &pool->workers[i])) {
             pool->n_workers = i + 1;
             break;
         }
     }
+    if (pinning) pin_to_cpu(cpus[0]);
     return pool;
 }
 
@@ -132,15 +179,17 @@ void pool_run(ThreadPool *pool, ParallelFn fn, void *state) {
     }
     pool->fn = fn;
     pool->state = state;
-    atomic_store_explicit(&pool->n_finished, 0, memory_order_relaxed);
-    atomic_fetch_add_explicit(&pool->epoch, 1, memory_order_release);
+    unsigned epoch =
+        atomic_fetch_add_explicit(&pool->epoch, 1, memory_order_release) + 1;
 
     fn(state, 0, pool->n_workers);
 
-    int spins = 0;
-    while (atomic_load_explicit(&pool->n_finished, memory_order_acquire) <
-           pool->n_workers - 1)
-        spin(&spins);
+    for (int i = 0; i < pool->n_workers - 1; i++) {
+        int spins = 0;
+        while (atomic_load_explicit(&pool->workers[i].finished_epoch,
+                                    memory_order_acquire) != epoch)
+            spin(&spins);
+    }
 }
 
 void pool_stop(ThreadPool *pool) {

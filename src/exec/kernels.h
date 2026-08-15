@@ -19,7 +19,12 @@ typedef struct {
 
 void rope_init(RopeConfig *rope, float freq_base, float freq_scale, int n_dims,
                int orig_ctx, float beta_fast, float beta_slow);
-void rope_apply(float *vec, const RopeConfig *rope, int position);
+
+/* The rotation for a position is the same for every head and every layer, so
+   the transcendentals are paid once per token and rope_apply is left with the
+   rotation itself. cos_sin holds a cosine and a sine per rotary pair. */
+void rope_position(float *cos_sin, const RopeConfig *rope, int position);
+void rope_apply(float *vec, const float *cos_sin, int n_dims);
 
 float fp16_to_fp32(uint16_t half);
 uint16_t fp32_to_fp16(float value);
@@ -50,10 +55,11 @@ void softmax(float *values, int n);
 void swiglu(float *out, const float *gate, const float *up, int n);
 void add_scaled(float *dst, const float *src, float scale, int n);
 
-/* The latent kv cache is read as fp16 in both directions: once to score a
-   query against every cached position, once to fold those scores back into a
-   latent vector. */
-float dot_fp16(const uint16_t *values, const float *x, int n);
-void accumulate_fp16(float *dst, const uint16_t *values, float weight, int n);
+/* The latent kv cache is stored as fp16 and every attention head reads the
+   same rows, so a row is expanded to floats once and then scored and folded
+   back in fp32: converting inside each head made the conversion, not the
+   arithmetic, scale with head count. */
+void expand_fp16(float *dst, const uint16_t *values, int n);
+float dot_f32(const float *a, const float *b, int n);
 
 #endif
