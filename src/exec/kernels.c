@@ -31,14 +31,25 @@ typedef struct {
     uint16_t d;
 } block_q6_K;
 
-/* Activations quantized per 256, mirroring the weight block size. group_sums
-   holds the sum of each 16 quants: Q4_K needs them in pairs to cancel its
-   sub-block minimum without touching the quants again. */
+/* Activations quantized per 256, mirroring the widest weight block size.
+   group_sums holds the sum of each 16 quants: the types that store a constant
+   offset per sub-block cancel it against those sums instead of touching the
+   quants again. */
 typedef struct {
     float scale;
     int8_t qs[QK_K];
     int16_t group_sums[QK_K / 16];
 } ActivationBlock;
+
+/* A weight row is quantized in blocks of either 32 (the legacy types) or 256
+   (the K-quants), so one activation block spans one K-quant block or eight
+   legacy ones. */
+#define QUANT_GRANULE 32
+
+/* Dot of one weight row against an int8-quantized activation. n is elements,
+   not blocks, so each kernel counts its own blocks and no caller has to know
+   the type's geometry. */
+typedef float (*GemvQ8)(const void *row, int n, const ActivationBlock *x);
 
 float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
@@ -193,13 +204,13 @@ hsum256(__m256 v) {
    constant offset, so it folds into a sum of activations taken from the
    precomputed group sums instead of costing any multiplies. */
 __attribute__((target("avx2,fma,f16c"))) static float
-gemv_q4k_q8_avx2(const block_q4_K *blocks, int nb,
-                 const ActivationBlock *activations) {
+gemv_q4k_q8_avx2(const void *row, int n, const ActivationBlock *activations) {
+    const block_q4_K *blocks = row;
     const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
     __m256 acc = _mm256_setzero_ps();
     float offset_acc = 0;
 
-    for (int i = 0; i < nb; i++) {
+    for (int i = 0; i < n / QK_K; i++) {
         const block_q4_K *b = &blocks[i];
         const ActivationBlock *a = &activations[i];
         const uint8_t *q = b->qs;
@@ -245,14 +256,14 @@ gemv_q4k_q8_avx2(const block_q4_K *blocks, int nb,
 /* Q6_K is symmetric around 32 with no stored minimum, so the -32 is recovered
    by multiplying the activations against a constant 32 and subtracting. */
 __attribute__((target("avx2,fma,f16c"))) static float
-gemv_q6k_q8_avx2(const block_q6_K *blocks, int nb,
-                 const ActivationBlock *activations) {
+gemv_q6k_q8_avx2(const void *row, int n, const ActivationBlock *activations) {
+    const block_q6_K *blocks = row;
     const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
     const __m256i pair_mask = _mm256_set1_epi8(3);
     const __m256i thirty_two = _mm256_set1_epi8(32);
     __m256 acc = _mm256_setzero_ps();
 
-    for (int i = 0; i < nb; i++) {
+    for (int i = 0; i < n / QK_K; i++) {
         const block_q6_K *b = &blocks[i];
         const ActivationBlock *a = &activations[i];
         const uint8_t *ql = b->ql;
@@ -307,6 +318,63 @@ gemv_q6k_q8_avx2(const block_q6_K *blocks, int nb,
     return hsum256(acc);
 }
 
+/* Expands the low 32 bits at `bits` to one byte per bit, 0xFF where set. */
+__attribute__((target("avx2,fma,f16c"), always_inline)) static inline __m256i
+bytes_from_bits_32(const uint8_t *bits) {
+    uint32_t packed;
+    memcpy(&packed, bits, 4);
+    const __m256i byte_of_bit =
+        _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202,
+                          0x0101010101010101, 0x0000000000000000);
+    const __m256i keep_one_bit = _mm256_set1_epi64x((int64_t)0x7fbfdfeff7fbfdfeULL);
+    __m256i spread =
+        _mm256_shuffle_epi8(_mm256_set1_epi32((int)packed), byte_of_bit);
+    return _mm256_cmpeq_epi8(_mm256_or_si256(spread, keep_one_bit),
+                             _mm256_set1_epi64x(-1));
+}
+
+/* Q5_0 keeps a fifth bit for each quant in a 32-bit mask, and is symmetric
+   around 16 with no stored minimum -- so like Q6_K the offset comes off the
+   activation sums rather than the quants. Its blocks are 32 wide, so eight of
+   them share one activation block and pick up two group sums each. */
+__attribute__((target("avx2,fma,f16c"))) static float
+gemv_q50_q8_avx2(const void *row, int n, const ActivationBlock *activations) {
+    const block_q5_0 *blocks = row;
+    const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+    const __m256i fifth_bit = _mm256_set1_epi8(16);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    float offset_acc = 0;
+
+    for (int i = 0; i < n / QUANT_GRANULE; i++) {
+        const block_q5_0 *b = &blocks[i];
+        int sub = i % (QK_K / QUANT_GRANULE);
+        const ActivationBlock *a = &activations[i / (QK_K / QUANT_GRANULE)];
+
+        /* Low nibbles are elements 0-15 and high nibbles elements 16-31,
+           which is the order the activation quants already sit in. */
+        __m128i packed = _mm_loadu_si128((const __m128i *)b->qs);
+        __m256i nibbles = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(_mm_and_si128(packed, nibble_mask)),
+            _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask), 1);
+        __m256i quants = _mm256_or_si256(
+            nibbles, _mm256_and_si256(bytes_from_bits_32(b->qh), fifth_bit));
+
+        __m256i x = _mm256_loadu_si256(
+            (const __m256i *)(a->qs + QUANT_GRANULE * sub));
+        __m256i sumi =
+            _mm256_madd_epi16(_mm256_maddubs_epi16(quants, x), ones);
+
+        float scale = fp16_to_fp32(b->d) * a->scale;
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(scale),
+                              _mm256_cvtepi32_ps(sumi), acc);
+        offset_acc -= scale * 16.0f *
+                      (float)(a->group_sums[2 * sub] +
+                              a->group_sums[2 * sub + 1]);
+    }
+    return hsum256(acc) + offset_acc;
+}
+
 __attribute__((target("avx2,fma,f16c"))) static float
 dot_fp16_avx2(const uint16_t *values, const float *x, int n) {
     __m256 acc = _mm256_setzero_ps();
@@ -332,7 +400,26 @@ accumulate_fp16_avx2(float *dst, const uint16_t *values, float weight, int n) {
                 w, _mm256_loadu_ps(dst + i)));
     for (; i < n; i++) dst[i] += fp16_to_fp32(values[i]) * weight;
 }
+
+/* One row per weight type that has an integer kernel. Anything missing here
+   falls back to the scalar reference, so adding a type is a kernel and a
+   row -- nothing else in this file learns its name. */
+static const GemvQ8 gemv_q8_kernels[] = {
+    [GGML_TYPE_Q5_0] = gemv_q50_q8_avx2,
+    [GGML_TYPE_Q4_K] = gemv_q4k_q8_avx2,
+    [GGML_TYPE_Q6_K] = gemv_q6k_q8_avx2,
+};
 #endif
+
+static GemvQ8 gemv_q8_kernel(unsigned type) {
+#ifdef HAVE_AVX2
+    if (have_avx2() && type < sizeof gemv_q8_kernels / sizeof *gemv_q8_kernels)
+        return gemv_q8_kernels[type];
+#else
+    (void)type;
+#endif
+    return NULL;
+}
 
 uint16_t fp32_to_fp16(float value) {
     uint32_t bits;
@@ -355,44 +442,51 @@ uint16_t fp32_to_fp16(float value) {
     return half;
 }
 
+static int activation_blocks(int n) { return (n + QK_K - 1) / QK_K; }
+
 size_t activation_bytes(int n) {
-    return (size_t)(n / QK_K) * sizeof(ActivationBlock);
+    return (size_t)activation_blocks(n) * sizeof(ActivationBlock);
 }
 
 /* Scale so the largest-magnitude value lands on -127: taking the signed
    extreme rather than the absolute one keeps the quantization symmetric
-   around whichever end actually saturates. */
+   around whichever end actually saturates.
+
+   A vector shorter than QK_K still quantizes -- the last block is zero-filled
+   past the end, and zero quants and zero group sums contribute nothing to any
+   kernel. Only whole 32-element groups are accepted, which is the smallest
+   block any weight type uses and so the smallest span a weight scale can
+   cover. */
 void activation_set(Activation *activation, void *scratch, const float *values,
                     int n) {
     activation->values = values;
     activation->n = n;
     activation->blocks = NULL;
-    if (n % QK_K != 0 || !scratch) return;
+    if (n % QUANT_GRANULE != 0 || !scratch) return;
 
     ActivationBlock *blocks = scratch;
-    for (int i = 0; i < n / QK_K; i++) {
+    for (int i = 0; i < activation_blocks(n); i++) {
         ActivationBlock *block = &blocks[i];
         const float *x = values + i * QK_K;
+        int count = n - i * QK_K < QK_K ? n - i * QK_K : QK_K;
 
+        memset(block, 0, sizeof *block);
         float extreme = 0, largest = 0;
-        for (int j = 0; j < QK_K; j++) {
+        for (int j = 0; j < count; j++) {
             float magnitude = fabsf(x[j]);
             if (magnitude > largest) {
                 largest = magnitude;
                 extreme = x[j];
             }
         }
-        if (largest == 0) {
-            memset(block, 0, sizeof *block);
-            continue;
-        }
+        if (largest == 0) continue;
 
         float inverse_scale = -127.0f / extreme;
-        for (int j = 0; j < QK_K; j++) {
+        for (int j = 0; j < count; j++) {
             int q = (int)lrintf(inverse_scale * x[j]);
             block->qs[j] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
         }
-        for (int g = 0; g < QK_K / 16; g++) {
+        for (int g = 0; g < count / 16; g++) {
             int sum = 0;
             for (int k = 0; k < 16; k++) sum += block->qs[g * 16 + k];
             block->group_sums[g] = (int16_t)sum;
@@ -413,19 +507,12 @@ void matvec(float *out, const void *rows, unsigned type, int n_in,
     const unsigned char *row =
         (const unsigned char *)rows + (size_t)row_begin * stride;
 
-#ifdef HAVE_AVX2
-    if (x->blocks && have_avx2() &&
-        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K)) {
-        int nb = n_in / QK_K;
+    GemvQ8 gemv = x->blocks ? gemv_q8_kernel(type) : NULL;
+    if (gemv) {
         for (int r = row_begin; r < row_end; r++, row += stride)
-            out[r] = type == GGML_TYPE_Q4_K
-                         ? gemv_q4k_q8_avx2((const block_q4_K *)row, nb,
-                                            x->blocks)
-                         : gemv_q6k_q8_avx2((const block_q6_K *)row, nb,
-                                            x->blocks);
+            out[r] = gemv(row, n_in, x->blocks);
         return;
     }
-#endif
     for (int r = row_begin; r < row_end; r++, row += stride)
         out[r] = gemv_row(row, type, n_in, x->values);
 }
