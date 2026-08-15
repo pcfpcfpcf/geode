@@ -9,18 +9,27 @@
 #include <string.h>
 #include <unistd.h>
 
-/* One feed-forward whose output is summed into the layer's result: a dense
-   block is a single branch of weight 1, an expert block is the routed experts
-   plus the shared one. They all read the same input and none reads another's
-   output, so every branch's gate and up rows are one parallel region and every
-   branch's down rows are a second -- three regions per expert block instead of
-   sixteen. `offset` is where the branch's rows start in the concatenated
-   gate/up/activated buffers. */
+/* One feed-forward applied to a set of the chunk's tokens, whose output is
+   summed into each of their results: a dense block is a single branch of
+   weight 1 over every token, an expert block is one branch per expert that any
+   token routed to, plus the shared one over every token. They all read the
+   same inputs and none reads another's output, so every branch's gate and up
+   rows are one parallel region and every branch's down rows are a second --
+   three regions per expert block however many experts the chunk touched.
+
+   Regrouping the chunk by expert is what makes a routed layer affordable: a
+   token reads four experts, but four tokens rarely read four *different*
+   experts, so one sweep of the expert stack per chunk beats one per token.
+   `token_begin` is where the branch's tokens start in the concatenated token
+   list, and its rows start at the same place in the gate/up/activated
+   buffers. */
 typedef struct {
     const FeedForward *ffn;
     int matrix_index;
-    int offset;
-    float weight;
+    int token_begin;
+    int n_tokens;
+    long long work_begin;
+    size_t scratch_begin;
 } Branch;
 
 struct Runtime {
@@ -29,6 +38,7 @@ struct Runtime {
     RopeConfig rope;
     int n_ctx;
     int cache_width;
+    int max_tokens;
 
     uint16_t *cache;
     float *cache_row;
@@ -50,21 +60,28 @@ struct Runtime {
     float *router_probs;
     float *branch_out;
     float *logits;
+
     Branch *branches;
+    int *branch_tokens;
+    float *branch_weights;
+    int *chosen;
+    float *chosen_weight;
 
-    /* Quantization slots, indexed by worker inside a parallel region and by
-       branch between the two feed-forward regions -- never both at once, so
-       there are as many as the larger of the two needs. Sequential callers use
-       slot 0 and are done with it before the region they feed returns. */
-    unsigned char *activation_scratch;
-    size_t activation_slot_bytes;
-    Activation *activations;
+    /* The normed activations feed the attention and expert matrices, the
+       activated ones feed the down matrices, and the head outputs feed the
+       output projection -- each quantized once for the whole chunk and read by
+       every row of every matrix that wants it. `head_scratch` is per worker
+       instead, because the per-head matrices are run inside a parallel region
+       rather than across one. */
+    ActivationBatch normed_batch;
+    ActivationBatch *branch_activations;
+    ActivationBatch heads_batch;
+    unsigned char *normed_scratch;
+    unsigned char *activated_scratch;
+    unsigned char *heads_scratch;
+    unsigned char *head_scratch;
+    size_t head_scratch_bytes;
 };
-
-static void *activation_slot(Runtime *runtime, int slot) {
-    return runtime->activation_scratch +
-           (size_t)slot * runtime->activation_slot_bytes;
-}
 
 static const void *matrix_at(const GgufTensor *tensor, int index) {
     size_t matrix_bytes = (size_t)tensor->dims[1] *
@@ -79,37 +96,48 @@ static uint16_t *cache_slot(Runtime *runtime, int layer, int position) {
 
 typedef struct {
     float *out;
+    size_t out_stride;
     const void *rows;
     unsigned type;
     int n_in;
     int n_out;
-    const Activation *x;
-} MatvecJob;
+    const ActivationBatch *x;
+} MatmulJob;
 
-static void matvec_worker(void *state, int worker, int n_workers) {
-    const MatvecJob *job = state;
+static void matmul_worker(void *state, int worker, int n_workers) {
+    const MatmulJob *job = state;
     int begin = (int)((long long)job->n_out * worker / n_workers);
     int end = (int)((long long)job->n_out * (worker + 1) / n_workers);
-    matvec(job->out, job->rows, job->type, job->n_in, begin, end, job->x);
+    matmul(job->out, job->out_stride, job->rows, job->type, job->n_in, begin,
+           end, job->x);
 }
 
 /* Takes the input already quantized, because the matrices that read the same
-   vector -- q and kv_a from the attention norm, the router and the expert
+   chunk -- q and kv_a from the attention norm, the router and the expert
    branches from the feed-forward norm -- would otherwise each pay for it. */
-static void run_matvec(Runtime *runtime, float *out, const GgufTensor *tensor,
-                       int matrix_index, const Activation *x) {
-    MatvecJob job = {out,
+static void run_matmul(Runtime *runtime, float *out, size_t out_stride,
+                       const GgufTensor *tensor, int matrix_index,
+                       const ActivationBatch *x) {
+    MatmulJob job = {out,
+                     out_stride,
                      matrix_at(tensor, matrix_index),
                      tensor->type,
                      (int)tensor->dims[0],
                      (int)tensor->dims[1],
                      x};
-    pool_run(runtime->pool, matvec_worker, &job);
+    pool_run(runtime->pool, matmul_worker, &job);
 }
 
-static void quantize_normed(Runtime *runtime, Activation *activation) {
-    activation_set(activation, activation_slot(runtime, 0), runtime->normed,
-                   runtime->model->n_embd);
+static void normalize(Runtime *runtime, const GgufTensor *weight,
+                      int n_tokens) {
+    const Model *model = runtime->model;
+    for (int t = 0; t < n_tokens; t++)
+        rmsnorm(runtime->normed + (size_t)t * model->n_embd,
+                runtime->residual + (size_t)t * model->n_embd, weight->data,
+                model->n_embd, model->rms_eps);
+    activation_set(&runtime->normed_batch, runtime->normed_scratch,
+                   runtime->normed, (size_t)model->n_embd, model->n_embd,
+                   n_tokens);
 }
 
 typedef struct {
@@ -117,6 +145,7 @@ typedef struct {
     const Layer *layer;
     int layer_index;
     int position;
+    int n_tokens;
     int n_cached;
 } AttentionJob;
 
@@ -124,127 +153,186 @@ typedef struct {
    cache and the value projection all run without a barrier between them.
 
    Under MLA every head reads the same cache rows, so the two passes over the
-   cache are the outer loops and the worker's heads the inner ones. Walking the
-   cache once per head instead multiplies the read -- and the fp16 expansion --
-   by the head count, which at a few thousand positions costs more than every
-   weight in the layer. */
+   cache are the outer loops and the worker's heads and the chunk's tokens the
+   inner ones. Walking the cache once per head instead multiplies the read --
+   and the fp16 expansion -- by the head count, which at a few thousand
+   positions costs more than every weight in the layer; a chunk divides that
+   read again by its width.
+
+   A token attends to its own position and no further, so a cache row written
+   by a later token of the same chunk is skipped rather than masked. */
 static void attention_worker(void *state, int worker, int n_workers) {
     const AttentionJob *job = state;
     Runtime *runtime = job->runtime;
     const Model *model = runtime->model;
     int rank = model->kv_lora_rank;
+    int n_tokens = job->n_tokens;
+    int query_width = model->n_head * model->head_dim_k;
+    int latent_width = model->n_head * rank;
     float *cache_row =
         runtime->cache_row + (size_t)worker * runtime->cache_width;
+    void *scratch =
+        runtime->head_scratch + (size_t)worker * runtime->head_scratch_bytes;
 
     int head_begin = model->n_head * worker / n_workers;
     int head_end = model->n_head * (worker + 1) / n_workers;
 
     for (int head = head_begin; head < head_end; head++) {
         float *query = runtime->query + (size_t)head * model->head_dim_k;
-        Activation activation;
+        for (int t = 0; t < n_tokens; t++)
+            rope_apply(query + (size_t)t * query_width + model->qk_nope_dim,
+                       runtime->cos_sin + (size_t)t * model->qk_rope_dim,
+                       model->qk_rope_dim);
 
-        rope_apply(query + model->qk_nope_dim, runtime->cos_sin,
-                   model->qk_rope_dim);
-        activation_set(&activation, activation_slot(runtime, worker), query,
-                       model->qk_nope_dim);
-        matvec(runtime->query_latent + (size_t)head * rank,
-               matrix_at(job->layer->k_b, head), job->layer->k_b->type,
-               model->qk_nope_dim, 0, rank, &activation);
+        ActivationBatch nope;
+        activation_set(&nope, scratch, query, (size_t)query_width,
+                       model->qk_nope_dim, n_tokens);
+        matmul(runtime->query_latent + (size_t)head * rank,
+               (size_t)latent_width, matrix_at(job->layer->k_b, head),
+               job->layer->k_b->type, model->qk_nope_dim, 0, rank, &nope);
     }
 
     for (int p = 0; p < job->n_cached; p++) {
+        int first = p - job->position > 0 ? p - job->position : 0;
         expand_fp16(cache_row, cache_slot(runtime, job->layer_index, p),
                     runtime->cache_width);
-        for (int head = head_begin; head < head_end; head++) {
-            float score =
-                dot_f32(cache_row, runtime->query_latent + (size_t)head * rank,
-                        rank) +
-                dot_f32(cache_row + rank,
-                        runtime->query + (size_t)head * model->head_dim_k +
-                            model->qk_nope_dim,
-                        model->qk_rope_dim);
-            runtime->scores[(size_t)head * runtime->n_ctx + p] =
-                score * model->kq_scale;
-        }
+        for (int head = head_begin; head < head_end; head++)
+            for (int t = first; t < n_tokens; t++) {
+                float score =
+                    dot_f32(cache_row,
+                            runtime->query_latent + (size_t)t * latent_width +
+                                (size_t)head * rank,
+                            rank) +
+                    dot_f32(cache_row + rank,
+                            runtime->query + (size_t)t * query_width +
+                                (size_t)head * model->head_dim_k +
+                                model->qk_nope_dim,
+                            model->qk_rope_dim);
+                runtime->scores[((size_t)head * n_tokens + t) * runtime->n_ctx +
+                                p] = score * model->kq_scale;
+            }
     }
 
-    for (int head = head_begin; head < head_end; head++) {
-        softmax(runtime->scores + (size_t)head * runtime->n_ctx,
-                job->n_cached);
-        memset(runtime->attn_latent + (size_t)head * rank, 0,
-               (size_t)rank * sizeof *runtime->attn_latent);
-    }
+    for (int head = head_begin; head < head_end; head++)
+        for (int t = 0; t < n_tokens; t++) {
+            softmax(runtime->scores +
+                        ((size_t)head * n_tokens + t) * runtime->n_ctx,
+                    job->position + t + 1);
+            memset(runtime->attn_latent + (size_t)t * latent_width +
+                       (size_t)head * rank,
+                   0, (size_t)rank * sizeof *runtime->attn_latent);
+        }
 
     for (int p = 0; p < job->n_cached; p++) {
+        int first = p - job->position > 0 ? p - job->position : 0;
         expand_fp16(cache_row, cache_slot(runtime, job->layer_index, p), rank);
         for (int head = head_begin; head < head_end; head++)
-            add_scaled(runtime->attn_latent + (size_t)head * rank, cache_row,
-                       runtime->scores[(size_t)head * runtime->n_ctx + p],
-                       rank);
+            for (int t = first; t < n_tokens; t++)
+                add_scaled(runtime->attn_latent + (size_t)t * latent_width +
+                               (size_t)head * rank,
+                           cache_row,
+                           runtime->scores[((size_t)head * n_tokens + t) *
+                                               runtime->n_ctx +
+                                           p],
+                           rank);
     }
 
     for (int head = head_begin; head < head_end; head++) {
-        Activation activation;
-        activation_set(&activation, activation_slot(runtime, worker),
-                       runtime->attn_latent + (size_t)head * rank, rank);
-        matvec(runtime->attn_out + (size_t)head * model->head_dim_v,
+        ActivationBatch latent;
+        activation_set(&latent, scratch,
+                       runtime->attn_latent + (size_t)head * rank,
+                       (size_t)latent_width, rank, n_tokens);
+        matmul(runtime->attn_out + (size_t)head * model->head_dim_v,
+               (size_t)model->n_head * model->head_dim_v,
                matrix_at(job->layer->v_b, head), job->layer->v_b->type, rank, 0,
-               model->head_dim_v, &activation);
+               model->head_dim_v, &latent);
     }
 }
 
 static void attention(Runtime *runtime, const Layer *layer, int layer_index,
-                      int position) {
+                      int position, int n_tokens) {
     const Model *model = runtime->model;
     int rank = model->kv_lora_rank;
 
-    Activation normed;
-    quantize_normed(runtime, &normed);
-    run_matvec(runtime, runtime->query, layer->attn_q, 0, &normed);
-    run_matvec(runtime, runtime->kv_projected, layer->kv_a_mqa, 0, &normed);
+    run_matmul(runtime, runtime->query,
+               (size_t)model->n_head * model->head_dim_k, layer->attn_q, 0,
+               &runtime->normed_batch);
+    run_matmul(runtime, runtime->kv_projected, (size_t)runtime->cache_width,
+               layer->kv_a_mqa, 0, &runtime->normed_batch);
 
-    rmsnorm(runtime->kv_normed, runtime->kv_projected,
-            layer->kv_a_norm->data, rank, model->rms_eps);
-    rope_apply(runtime->kv_projected + rank, runtime->cos_sin,
-               model->qk_rope_dim);
+    for (int t = 0; t < n_tokens; t++) {
+        float *projected = runtime->kv_projected + (size_t)t * runtime->cache_width;
+        float *normed = runtime->kv_normed + (size_t)t * rank;
+        rmsnorm(normed, projected, layer->kv_a_norm->data, rank,
+                model->rms_eps);
+        rope_apply(projected + rank,
+                   runtime->cos_sin + (size_t)t * model->qk_rope_dim,
+                   model->qk_rope_dim);
 
-    uint16_t *slot = cache_slot(runtime, layer_index, position);
-    for (int i = 0; i < rank; i++) slot[i] = fp32_to_fp16(runtime->kv_normed[i]);
-    for (int i = 0; i < model->qk_rope_dim; i++)
-        slot[rank + i] = fp32_to_fp16(runtime->kv_projected[rank + i]);
+        uint16_t *slot = cache_slot(runtime, layer_index, position + t);
+        for (int i = 0; i < rank; i++) slot[i] = fp32_to_fp16(normed[i]);
+        for (int i = 0; i < model->qk_rope_dim; i++)
+            slot[rank + i] = fp32_to_fp16(projected[rank + i]);
+    }
 
-    AttentionJob job = {runtime, layer, layer_index, position, position + 1};
+    AttentionJob job = {runtime,  layer,    layer_index,
+                        position, n_tokens, position + n_tokens};
     pool_run(runtime->pool, attention_worker, &job);
 
-    Activation heads;
-    activation_set(&heads, activation_slot(runtime, 0), runtime->attn_out,
-                   model->n_head * model->head_dim_v);
-    run_matvec(runtime, runtime->projected, layer->attn_output, 0, &heads);
+    activation_set(&runtime->heads_batch, runtime->heads_scratch,
+                   runtime->attn_out,
+                   (size_t)model->n_head * model->head_dim_v,
+                   model->n_head * model->head_dim_v, n_tokens);
+    run_matmul(runtime, runtime->projected, (size_t)model->n_embd,
+               layer->attn_output, 0, &runtime->heads_batch);
 }
 
 static int branch_width(const Branch *branch) {
     return (int)branch->ffn->gate->dims[1];
 }
 
-/* Lays the branches end to end and returns how many rows they occupy in
-   total, which is the row space the expand region divides between workers. */
-static int branch_layout(Branch *branches, int n_branches) {
-    int offset = 0;
+/* Lays the branches end to end and returns the work they occupy in total,
+   which is the space the expand region divides between workers. Work is rows
+   times tokens rather than rows alone: the shared expert takes every token of
+   the chunk while a routed expert often takes one, so splitting rows evenly
+   would leave whichever worker landed on the shared branch doing many times
+   what the others do.
+
+   Rows times tokens is also exactly how many floats the branch occupies in the
+   gate/up/activated buffers, so one running total places it in both. Branch
+   widths are not assumed equal -- a model with several shared experts makes
+   that branch wider than the routed ones. */
+static long long branch_layout(Branch *branches, int n_branches) {
+    long long work = 0;
+    size_t scratch = 0;
     for (int b = 0; b < n_branches; b++) {
-        branches[b].offset = offset;
-        offset += branch_width(&branches[b]);
+        int width = branch_width(&branches[b]);
+        branches[b].work_begin = work;
+        branches[b].scratch_begin = scratch;
+        work += (long long)width * branches[b].n_tokens;
+        scratch += activation_bytes(width, branches[b].n_tokens);
     }
-    return offset;
+    return work;
+}
+
+/* The branch's own view of the chunk: the same quantized vectors, indexed by
+   the tokens that routed to it. The input batch covers the whole chunk in
+   order, which is what makes a token list an index into it. */
+static void branch_input(ActivationBatch *batch, const ActivationBatch *input,
+                         const Runtime *runtime, const Branch *branch) {
+    *batch = *input;
+    batch->tokens = runtime->branch_tokens + branch->token_begin;
+    batch->n_x = branch->n_tokens;
 }
 
 typedef struct {
     Runtime *runtime;
     int n_branches;
-    int total_ff;
-    const Activation *x;
+    long long total_work;
+    const ActivationBatch *x;
 } ExpandJob;
 
-/* A worker takes a slice of the concatenated row space and runs whichever
+/* A worker takes a slice of the concatenated work space and runs whichever
    branches it lands in, so the last branch is never left to one thread while
    the rest wait at a barrier. Gate and up share the slice, which lets the
    swiglu happen here rather than in a pass of its own. */
@@ -252,90 +340,115 @@ static void expand_worker(void *state, int worker, int n_workers) {
     const ExpandJob *job = state;
     Runtime *runtime = job->runtime;
     int n_embd = runtime->model->n_embd;
-    int begin = (int)((long long)job->total_ff * worker / n_workers);
-    int end = (int)((long long)job->total_ff * (worker + 1) / n_workers);
+    long long begin = job->total_work * worker / n_workers;
+    long long end = job->total_work * (worker + 1) / n_workers;
 
     for (int b = 0; b < job->n_branches; b++) {
         const Branch *branch = &runtime->branches[b];
-        int lo = begin - branch->offset;
-        int hi = end - branch->offset;
+        int width = branch_width(branch);
+        long long lo = (begin - branch->work_begin) / branch->n_tokens;
+        long long hi = (end - branch->work_begin) / branch->n_tokens;
         if (lo < 0) lo = 0;
-        if (hi > branch_width(branch)) hi = branch_width(branch);
+        if (hi > width) hi = width;
         if (lo >= hi) continue;
 
-        float *gate = runtime->gate + branch->offset;
-        float *up = runtime->up + branch->offset;
-        matvec(gate, matrix_at(branch->ffn->gate, branch->matrix_index),
-               branch->ffn->gate->type, n_embd, lo, hi, job->x);
-        matvec(up, matrix_at(branch->ffn->up, branch->matrix_index),
-               branch->ffn->up->type, n_embd, lo, hi, job->x);
-        swiglu(runtime->activated + branch->offset + lo, gate + lo, up + lo,
-               hi - lo);
+        ActivationBatch x;
+        branch_input(&x, job->x, runtime, branch);
+
+        float *gate = runtime->gate + branch->work_begin;
+        float *up = runtime->up + branch->work_begin;
+        float *activated = runtime->activated + branch->work_begin;
+        matmul(gate, (size_t)width, matrix_at(branch->ffn->gate, branch->matrix_index),
+               branch->ffn->gate->type, n_embd, (int)lo, (int)hi, &x);
+        matmul(up, (size_t)width, matrix_at(branch->ffn->up, branch->matrix_index),
+               branch->ffn->up->type, n_embd, (int)lo, (int)hi, &x);
+        for (int t = 0; t < branch->n_tokens; t++)
+            swiglu(activated + (size_t)t * width + lo,
+                   gate + (size_t)t * width + lo, up + (size_t)t * width + lo,
+                   (int)(hi - lo));
     }
 }
 
 typedef struct {
     Runtime *runtime;
     int n_branches;
+    int n_tokens;
 } ContractJob;
 
 /* Every branch projects back onto the same n_embd output, so here a worker
-   owns output rows instead: it walks all the branches and sums them into the
-   rows it owns, and the mixture needs no reduction afterwards. */
+   owns output rows instead: it walks all the branches and sums each one into
+   the rows it owns of the tokens that routed to it, and the mixture needs no
+   reduction afterwards. Workers own disjoint columns, so two branches sharing
+   a token never collide. */
 static void contract_worker(void *state, int worker, int n_workers) {
     const ContractJob *job = state;
     Runtime *runtime = job->runtime;
     int n_embd = runtime->model->n_embd;
     int begin = (int)((long long)n_embd * worker / n_workers);
     int end = (int)((long long)n_embd * (worker + 1) / n_workers);
+    float *branch_out =
+        runtime->branch_out + (size_t)worker * runtime->max_tokens * n_embd;
 
-    float *out = runtime->projected;
-    memset(out + begin, 0, (size_t)(end - begin) * sizeof *out);
+    for (int t = 0; t < job->n_tokens; t++)
+        memset(runtime->projected + (size_t)t * n_embd + begin, 0,
+               (size_t)(end - begin) * sizeof *runtime->projected);
+
     for (int b = 0; b < job->n_branches; b++) {
         const Branch *branch = &runtime->branches[b];
-        matvec(runtime->branch_out,
+        matmul(branch_out, (size_t)n_embd,
                matrix_at(branch->ffn->down, branch->matrix_index),
                branch->ffn->down->type, branch_width(branch), begin, end,
-               &runtime->activations[b]);
-        add_scaled(out + begin, runtime->branch_out + begin, branch->weight,
-                   end - begin);
+               &runtime->branch_activations[b]);
+
+        for (int t = 0; t < branch->n_tokens; t++) {
+            int token = runtime->branch_tokens[branch->token_begin + t];
+            add_scaled(runtime->projected + (size_t)token * n_embd + begin,
+                       branch_out + (size_t)t * n_embd + begin,
+                       runtime->branch_weights[branch->token_begin + t],
+                       end - begin);
+        }
     }
 }
 
-static void run_branches(Runtime *runtime, int n_branches,
-                         const Activation *input) {
-    int total_ff = branch_layout(runtime->branches, n_branches);
-
-    ExpandJob expand = {runtime, n_branches, total_ff, input};
+static void run_branches(Runtime *runtime, int n_branches, int n_tokens,
+                         const ActivationBatch *input) {
+    ExpandJob expand = {runtime, n_branches,
+                        branch_layout(runtime->branches, n_branches), input};
     pool_run(runtime->pool, expand_worker, &expand);
 
-    for (int b = 0; b < n_branches; b++)
-        activation_set(&runtime->activations[b], activation_slot(runtime, b),
-                       runtime->activated + runtime->branches[b].offset,
-                       branch_width(&runtime->branches[b]));
+    for (int b = 0; b < n_branches; b++) {
+        const Branch *branch = &runtime->branches[b];
+        int width = branch_width(branch);
+        activation_set(&runtime->branch_activations[b],
+                       runtime->activated_scratch + branch->scratch_begin,
+                       runtime->activated + branch->work_begin, (size_t)width,
+                       width, branch->n_tokens);
+    }
 
-    ContractJob contract = {runtime, n_branches};
+    ContractJob contract = {runtime, n_branches, n_tokens};
     pool_run(runtime->pool, contract_worker, &contract);
 }
 
 /* Experts are ranked by probability plus a learned bias, but weighted by the
    probability alone -- the bias steers load balancing, not the mixture. */
-static int select_experts(Runtime *runtime, const Layer *layer) {
+static void rank_experts(Runtime *runtime, const Layer *layer, int token) {
     const Model *model = runtime->model;
     const float *bias = layer->router_bias->data;
-    float *probs = runtime->router_probs;
-    Branch *branches = runtime->branches;
+    int used = model->n_expert_used;
+    float *probs = runtime->router_probs + (size_t)token * model->n_expert;
+    int *chosen = runtime->chosen + (size_t)token * used;
+    float *weights = runtime->chosen_weight + (size_t)token * used;
 
     for (int e = 0; e < model->n_expert; e++)
         probs[e] = 1.0f / (1.0f + expf(-probs[e]));
 
-    for (int slot = 0; slot < model->n_expert_used; slot++) {
+    for (int slot = 0; slot < used; slot++) {
         int best = -1;
         float best_score = 0;
         for (int e = 0; e < model->n_expert; e++) {
             int taken = 0;
             for (int s = 0; s < slot; s++)
-                if (branches[s].matrix_index == e) taken = 1;
+                if (chosen[s] == e) taken = 1;
             if (taken) continue;
             float score = probs[e] + bias[e];
             if (best < 0 || score > best_score) {
@@ -343,71 +456,123 @@ static int select_experts(Runtime *runtime, const Layer *layer) {
                 best_score = score;
             }
         }
-        branches[slot].ffn = &layer->experts;
-        branches[slot].matrix_index = best;
-        branches[slot].weight = probs[best];
+        chosen[slot] = best;
+        weights[slot] = probs[best];
     }
 
     float scale = model->expert_weights_scale;
     if (model->expert_weights_norm) {
         float sum = 0;
-        for (int slot = 0; slot < model->n_expert_used; slot++)
-            sum += branches[slot].weight;
+        for (int slot = 0; slot < used; slot++) sum += weights[slot];
         if (sum > 0) scale /= sum;
     }
-    for (int slot = 0; slot < model->n_expert_used; slot++)
-        branches[slot].weight *= scale;
-
-    branches[model->n_expert_used].ffn = &layer->shared_expert;
-    branches[model->n_expert_used].matrix_index = 0;
-    branches[model->n_expert_used].weight = 1.0f;
-    return model->n_expert_used + 1;
+    for (int slot = 0; slot < used; slot++) weights[slot] *= scale;
 }
 
-static void feed_forward(Runtime *runtime, const Layer *layer) {
-    Activation normed;
-    quantize_normed(runtime, &normed);
+static void add_branch_token(Runtime *runtime, int flat, int token,
+                             float weight) {
+    runtime->branch_tokens[flat] = token;
+    runtime->branch_weights[flat] = weight;
+}
+
+/* Ranks every token's experts, then inverts the mapping so that each expert
+   appears once with the list of tokens that chose it. An expert no token chose
+   gets no branch and its weights are never read. */
+static int select_branches(Runtime *runtime, const Layer *layer, int n_tokens) {
+    const Model *model = runtime->model;
+    int used = model->n_expert_used;
+    int n_branches = 0;
+    int flat = 0;
+
+    for (int t = 0; t < n_tokens; t++) rank_experts(runtime, layer, t);
+
+    for (int e = 0; e < model->n_expert; e++) {
+        int begin = flat;
+        for (int t = 0; t < n_tokens; t++)
+            for (int slot = 0; slot < used; slot++)
+                if (runtime->chosen[(size_t)t * used + slot] == e)
+                    add_branch_token(
+                        runtime, flat++, t,
+                        runtime->chosen_weight[(size_t)t * used + slot]);
+        if (flat == begin) continue;
+
+        Branch *branch = &runtime->branches[n_branches++];
+        branch->ffn = &layer->experts;
+        branch->matrix_index = e;
+        branch->token_begin = begin;
+        branch->n_tokens = flat - begin;
+    }
+
+    Branch *shared = &runtime->branches[n_branches++];
+    shared->ffn = &layer->shared_expert;
+    shared->matrix_index = 0;
+    shared->token_begin = flat;
+    shared->n_tokens = n_tokens;
+    for (int t = 0; t < n_tokens; t++) add_branch_token(runtime, flat++, t, 1.0f);
+    return n_branches;
+}
+
+static void feed_forward(Runtime *runtime, const Layer *layer, int n_tokens) {
+    const Model *model = runtime->model;
 
     if (!layer->has_experts) {
-        runtime->branches[0].ffn = &layer->dense;
-        runtime->branches[0].matrix_index = 0;
-        runtime->branches[0].weight = 1.0f;
-        run_branches(runtime, 1, &normed);
+        Branch *branch = &runtime->branches[0];
+        branch->ffn = &layer->dense;
+        branch->matrix_index = 0;
+        branch->token_begin = 0;
+        branch->n_tokens = n_tokens;
+        for (int t = 0; t < n_tokens; t++)
+            add_branch_token(runtime, t, t, 1.0f);
+        run_branches(runtime, 1, n_tokens, &runtime->normed_batch);
         return;
     }
-    run_matvec(runtime, runtime->router_probs, layer->router, 0, &normed);
-    run_branches(runtime, select_experts(runtime, layer), &normed);
+    run_matmul(runtime, runtime->router_probs, (size_t)model->n_expert,
+               layer->router, 0, &runtime->normed_batch);
+    run_branches(runtime, select_branches(runtime, layer, n_tokens), n_tokens,
+                 &runtime->normed_batch);
 }
 
-const float *forward(Runtime *runtime, int token, int position) {
+const float *forward(Runtime *runtime, const int *tokens, int position,
+                     int n_tokens) {
     const Model *model = runtime->model;
     int n_embd = model->n_embd;
 
-    const unsigned char *embedding =
-        (const unsigned char *)model->token_embd->data +
-        (size_t)token * row_bytes(model->token_embd->type, n_embd);
-    dequant_row(embedding, model->token_embd->type, n_embd, runtime->residual);
-    rope_position(runtime->cos_sin, &runtime->rope, position);
+    for (int t = 0; t < n_tokens; t++) {
+        const unsigned char *embedding =
+            (const unsigned char *)model->token_embd->data +
+            (size_t)tokens[t] * row_bytes(model->token_embd->type, n_embd);
+        dequant_row(embedding, model->token_embd->type, n_embd,
+                    runtime->residual + (size_t)t * n_embd);
+        rope_position(runtime->cos_sin + (size_t)t * model->qk_rope_dim,
+                      &runtime->rope, position + t);
+    }
 
     for (int index = 0; index < model->n_layer; index++) {
         const Layer *layer = &model->layers[index];
 
-        rmsnorm(runtime->normed, runtime->residual, layer->attn_norm->data,
-                n_embd, model->rms_eps);
-        attention(runtime, layer, index, position);
-        add_scaled(runtime->residual, runtime->projected, 1.0f, n_embd);
+        normalize(runtime, layer->attn_norm, n_tokens);
+        attention(runtime, layer, index, position, n_tokens);
+        for (int t = 0; t < n_tokens; t++)
+            add_scaled(runtime->residual + (size_t)t * n_embd,
+                       runtime->projected + (size_t)t * n_embd, 1.0f, n_embd);
 
-        rmsnorm(runtime->normed, runtime->residual, layer->ffn_norm->data,
-                n_embd, model->rms_eps);
-        feed_forward(runtime, layer);
-        add_scaled(runtime->residual, runtime->projected, 1.0f, n_embd);
+        normalize(runtime, layer->ffn_norm, n_tokens);
+        feed_forward(runtime, layer, n_tokens);
+        for (int t = 0; t < n_tokens; t++)
+            add_scaled(runtime->residual + (size_t)t * n_embd,
+                       runtime->projected + (size_t)t * n_embd, 1.0f, n_embd);
     }
 
-    rmsnorm(runtime->normed, runtime->residual, model->output_norm->data,
-            n_embd, model->rms_eps);
-    Activation normed;
-    quantize_normed(runtime, &normed);
-    run_matvec(runtime, runtime->logits, model->output, 0, &normed);
+    /* Only the last token of a chunk is ever sampled, and the output matrix is
+       the widest in the model -- projecting the whole chunk would cost more
+       than the layers that produced it. */
+    rmsnorm(runtime->normed,
+            runtime->residual + (size_t)(n_tokens - 1) * n_embd,
+            model->output_norm->data, n_embd, model->rms_eps);
+    activation_set(&runtime->normed_batch, runtime->normed_scratch,
+                   runtime->normed, (size_t)n_embd, n_embd, 1);
+    run_matmul(runtime, runtime->logits, (size_t)model->n_vocab, model->output,
+               0, &runtime->normed_batch);
     return runtime->logits;
 }
 
@@ -416,6 +581,14 @@ static float *alloc_floats(size_t n, int *ok) {
     if (!buffer) *ok = 0;
     return buffer;
 }
+
+static unsigned char *alloc_bytes(size_t n, int *ok) {
+    unsigned char *buffer = calloc(n, 1);
+    if (!buffer) *ok = 0;
+    return buffer;
+}
+
+static size_t larger(size_t a, size_t b) { return a > b ? a : b; }
 
 Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
                        size_t errsz) {
@@ -427,72 +600,114 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     runtime->model = model;
     runtime->n_ctx = n_ctx;
     runtime->cache_width = model->kv_lora_rank + model->qk_rope_dim;
+    runtime->max_tokens = n_ctx < PREFILL_CHUNK ? n_ctx : PREFILL_CHUNK;
     rope_init(&runtime->rope, model->rope_freq_base, model->rope_freq_scale,
               model->qk_rope_dim, model->rope_orig_ctx, model->rope_beta_fast,
               model->rope_beta_slow);
 
     if (n_threads < 1) n_threads = pool_default_workers();
     runtime->pool = pool_start(n_threads);
-
-    /* The gate/up/activated buffers hold every branch of a block at once, so
-       they are sized for whichever block concatenates to the most rows. */
-    int n_branches = model->n_expert_used + model->n_expert_shared;
-    if (n_branches < 1) n_branches = 1;
-    int inner = n_branches * model->n_ff_expert;
-    if (model->n_ff > inner) inner = model->n_ff;
-
     if (!runtime->pool) {
         snprintf(err, errsz, "could not start %d worker threads", n_threads);
         runtime_stop(runtime);
         return NULL;
     }
 
+    int max_tokens = runtime->max_tokens;
+    int n_workers = pool_workers(runtime->pool);
+
+    /* A chunk can touch every expert at once, so the branch array is sized for
+       the whole stack rather than for one token's picks. */
+    int n_branches = model->n_expert + model->n_expert_shared;
+    if (n_branches < 1) n_branches = 1;
+    int per_token = model->n_expert_used + model->n_expert_shared;
+    if (per_token < 1) per_token = 1;
+    int flat_tokens = max_tokens * per_token;
+
+    /* The gate/up/activated buffers hold every branch of a block at once, so
+       they are sized for whichever block concatenates to the most rows: one
+       chunk through the widest dense block, or one chunk through every expert
+       it can route to. */
+    int inner = model->n_ff;
+    if (per_token * model->n_ff_expert > inner)
+        inner = per_token * model->n_ff_expert;
+    size_t ff_capacity = (size_t)max_tokens * inner;
+
     int ok = 1;
-    int widest = inner > model->n_head * model->head_dim_v
-                     ? inner
-                     : model->n_head * model->head_dim_v;
-    int n_slots = pool_workers(runtime->pool) > n_branches
-                      ? pool_workers(runtime->pool)
-                      : n_branches;
-    runtime->activation_slot_bytes = activation_bytes(widest);
-    runtime->activation_scratch =
-        calloc((size_t)n_slots, runtime->activation_slot_bytes);
-    runtime->activations = calloc((size_t)n_branches,
-                                  sizeof *runtime->activations);
+    runtime->normed_scratch =
+        alloc_bytes(activation_bytes(model->n_embd, max_tokens), &ok);
+    /* Every branch quantizes its own rows, so the routed branches together
+       cost one block set per (token, expert) however the tokens split between
+       them, and the shared branch one more per token. */
+    runtime->activated_scratch = alloc_bytes(
+        larger(activation_bytes(model->n_ff, max_tokens),
+               activation_bytes(model->n_ff_expert,
+                                max_tokens * model->n_expert_used) +
+                   activation_bytes(model->n_ff_expert *
+                                        model->n_expert_shared,
+                                    max_tokens)),
+        &ok);
+    runtime->heads_scratch = alloc_bytes(
+        activation_bytes(model->n_head * model->head_dim_v, max_tokens), &ok);
+    runtime->head_scratch_bytes =
+        larger(activation_bytes(model->qk_nope_dim, max_tokens),
+               activation_bytes(model->kv_lora_rank, max_tokens));
+    runtime->head_scratch =
+        alloc_bytes((size_t)n_workers * runtime->head_scratch_bytes, &ok);
+
     runtime->branches = calloc((size_t)n_branches, sizeof *runtime->branches);
-    if (!runtime->activation_scratch || !runtime->activations ||
-        !runtime->branches)
+    runtime->branch_activations =
+        calloc((size_t)n_branches, sizeof *runtime->branch_activations);
+    runtime->branch_tokens =
+        calloc((size_t)flat_tokens, sizeof *runtime->branch_tokens);
+    runtime->branch_weights =
+        calloc((size_t)flat_tokens, sizeof *runtime->branch_weights);
+    if (!runtime->branches || !runtime->branch_activations ||
+        !runtime->branch_tokens || !runtime->branch_weights)
         ok = 0;
+    if (model->n_expert > 0) {
+        runtime->chosen = calloc((size_t)max_tokens * model->n_expert_used,
+                                 sizeof *runtime->chosen);
+        runtime->chosen_weight =
+            calloc((size_t)max_tokens * model->n_expert_used,
+                   sizeof *runtime->chosen_weight);
+        runtime->router_probs =
+            alloc_floats((size_t)max_tokens * model->n_expert, &ok);
+        if (!runtime->chosen || !runtime->chosen_weight) ok = 0;
+    }
 
     size_t cache_elements = (size_t)model->n_layer * n_ctx *
                             runtime->cache_width;
     runtime->cache = calloc(cache_elements, sizeof *runtime->cache);
     if (!runtime->cache) ok = 0;
 
-    runtime->cache_row = alloc_floats(
-        (size_t)pool_workers(runtime->pool) * runtime->cache_width, &ok);
-    runtime->cos_sin = alloc_floats((size_t)model->qk_rope_dim, &ok);
-    runtime->residual = alloc_floats((size_t)model->n_embd, &ok);
-    runtime->normed = alloc_floats((size_t)model->n_embd, &ok);
-    runtime->query =
-        alloc_floats((size_t)model->n_head * model->head_dim_k, &ok);
-    runtime->query_latent =
-        alloc_floats((size_t)model->n_head * model->kv_lora_rank, &ok);
-    runtime->kv_projected = alloc_floats((size_t)runtime->cache_width, &ok);
-    runtime->kv_normed = alloc_floats((size_t)model->kv_lora_rank, &ok);
-    runtime->scores = alloc_floats((size_t)model->n_head * n_ctx, &ok);
-    runtime->attn_latent =
-        alloc_floats((size_t)model->n_head * model->kv_lora_rank, &ok);
-    runtime->attn_out =
-        alloc_floats((size_t)model->n_head * model->head_dim_v, &ok);
-    runtime->projected = alloc_floats((size_t)model->n_embd, &ok);
-    runtime->gate = alloc_floats((size_t)inner, &ok);
-    runtime->up = alloc_floats((size_t)inner, &ok);
-    runtime->activated = alloc_floats((size_t)inner, &ok);
-    runtime->branch_out = alloc_floats((size_t)model->n_embd, &ok);
+    runtime->cache_row =
+        alloc_floats((size_t)n_workers * runtime->cache_width, &ok);
+    runtime->cos_sin =
+        alloc_floats((size_t)max_tokens * model->qk_rope_dim, &ok);
+    runtime->residual = alloc_floats((size_t)max_tokens * model->n_embd, &ok);
+    runtime->normed = alloc_floats((size_t)max_tokens * model->n_embd, &ok);
+    runtime->query = alloc_floats(
+        (size_t)max_tokens * model->n_head * model->head_dim_k, &ok);
+    runtime->query_latent = alloc_floats(
+        (size_t)max_tokens * model->n_head * model->kv_lora_rank, &ok);
+    runtime->kv_projected =
+        alloc_floats((size_t)max_tokens * runtime->cache_width, &ok);
+    runtime->kv_normed =
+        alloc_floats((size_t)max_tokens * model->kv_lora_rank, &ok);
+    runtime->scores =
+        alloc_floats((size_t)model->n_head * max_tokens * n_ctx, &ok);
+    runtime->attn_latent = alloc_floats(
+        (size_t)max_tokens * model->n_head * model->kv_lora_rank, &ok);
+    runtime->attn_out = alloc_floats(
+        (size_t)max_tokens * model->n_head * model->head_dim_v, &ok);
+    runtime->projected = alloc_floats((size_t)max_tokens * model->n_embd, &ok);
+    runtime->gate = alloc_floats(ff_capacity, &ok);
+    runtime->up = alloc_floats(ff_capacity, &ok);
+    runtime->activated = alloc_floats(ff_capacity, &ok);
+    runtime->branch_out = alloc_floats(
+        (size_t)n_workers * max_tokens * model->n_embd, &ok);
     runtime->logits = alloc_floats((size_t)model->n_vocab, &ok);
-    if (model->n_expert > 0)
-        runtime->router_probs = alloc_floats((size_t)model->n_expert, &ok);
 
     if (!ok) {
         snprintf(err, errsz,
@@ -527,7 +742,14 @@ void runtime_stop(Runtime *runtime) {
     free(runtime->branch_out);
     free(runtime->logits);
     free(runtime->branches);
-    free(runtime->activations);
-    free(runtime->activation_scratch);
+    free(runtime->branch_activations);
+    free(runtime->branch_tokens);
+    free(runtime->branch_weights);
+    free(runtime->chosen);
+    free(runtime->chosen_weight);
+    free(runtime->normed_scratch);
+    free(runtime->activated_scratch);
+    free(runtime->heads_scratch);
+    free(runtime->head_scratch);
     free(runtime);
 }

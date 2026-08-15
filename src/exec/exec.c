@@ -104,13 +104,14 @@ static int check_tensor(const GgufFile *g, const char *name) {
         printf("    gemv ok: %.6f\n", got);
     }
 
-    /* matvec is the path decode actually takes, and it quantizes activations
-       to int8 first, so it is held to int8 tolerance rather than gemv's. */
-    void *scratch = malloc(activation_bytes(n) + 1);
-    Activation activation;
+    /* matmul is the path decode and prefill actually take, and it quantizes
+       activations to int8 first, so it is held to int8 tolerance rather than
+       gemv's. */
+    void *scratch = malloc(activation_bytes(n, 1) + 1);
+    ActivationBatch activation;
     float quantized = 0;
-    activation_set(&activation, scratch, x, n);
-    matvec(&quantized, t->data, t->type, n, 0, 1, &activation);
+    activation_set(&activation, scratch, x, (size_t)n, n, 1);
+    matmul(&quantized, 1, t->data, t->type, n, 0, 1, &activation);
     float tolerance = ACTIVATION_TOLERANCE * (1.0f + fabsf(want));
     if (fabsf(quantized - want) > tolerance) {
         printf("    matvec MISMATCH: got %.6f want %.6f (tolerance %.6f)\n",
@@ -188,6 +189,99 @@ static int argmax(const float *values, int n) {
     return best;
 }
 
+static const float *prefill(Runtime *runtime, const int *ids, int n_prompt,
+                            int chunk) {
+    const float *logits = NULL;
+    for (int i = 0; i < n_prompt; i += chunk) {
+        int n = n_prompt - i;
+        if (n > chunk) n = chunk;
+        logits = forward(runtime, ids + i, i, n);
+    }
+    return logits;
+}
+
+/* A fresh runtime per width, because the kv cache each one leaves behind is
+   half of what the next would read. */
+static int prefill_logits(const Model *model, const int *ids, int n_prompt,
+                          int chunk, float *out, char *err, size_t errsz) {
+    Runtime *runtime = runtime_start(model, n_prompt, 0, err, errsz);
+    if (!runtime) return 0;
+    memcpy(out, prefill(runtime, ids, n_prompt, chunk),
+           (size_t)model->n_vocab * sizeof *out);
+    runtime_stop(runtime);
+    return 1;
+}
+
+/* Long enough to span several chunks and to put tokens either side of a chunk
+   boundary in each other's attention. */
+#define PREFILL_TEST_PROMPT                                                    \
+    "The stored-program computer keeps instructions and data in one memory, "  \
+    "which is why a program can be written by another program. Compilers, "    \
+    "linkers and operating systems all follow from that single decision, and " \
+    "so does most of what makes a machine general rather than special."
+
+/* A chunk changes which weights are read together, not what is computed, so
+   prefilling in chunks has to land where feeding the same tokens one at a time
+   lands. It currently lands there exactly, but the check is a tolerance rather
+   than an equality: every token's experts are summed in the same order at any
+   width, and nothing promises a future kernel will keep it that way. */
+#define PREFILL_TOLERANCE 0.01f
+
+static int prefill_test(const GgufFile *g) {
+    char err[256];
+    Model model;
+    if (!model_load(&model, g, err, sizeof err)) {
+        printf("prefill: %s\n", err);
+        return 1;
+    }
+    Tokenizer tokenizer;
+    if (!tokenizer_init(&tokenizer, g, err, sizeof err)) {
+        printf("prefill: %s\n", err);
+        model_free(&model);
+        return 1;
+    }
+
+    int ids[PROMPT_TOKENS_MAX];
+    int n_prompt = 0;
+    if (tokenizer.add_bos) ids[n_prompt++] = tokenizer.bos_id;
+    n_prompt += tokenizer_encode(&tokenizer, PREFILL_TEST_PROMPT,
+                                 ids + n_prompt, PROMPT_TOKENS_MAX - n_prompt);
+
+    float *single = malloc((size_t)model.n_vocab * sizeof *single);
+    float *chunked = malloc((size_t)model.n_vocab * sizeof *chunked);
+    int ok = single && chunked &&
+             prefill_logits(&model, ids, n_prompt, 1, single, err, sizeof err) &&
+             prefill_logits(&model, ids, n_prompt, PREFILL_CHUNK, chunked, err,
+                            sizeof err);
+
+    if (!ok) {
+        printf("prefill: %s\n", single && chunked ? err : "out of memory");
+    } else {
+        float worst = 0, largest = 0;
+        for (int i = 0; i < model.n_vocab; i++) {
+            float diff = fabsf(single[i] - chunked[i]);
+            if (diff > worst) worst = diff;
+            if (fabsf(single[i]) > largest) largest = fabsf(single[i]);
+        }
+        float tolerance = PREFILL_TOLERANCE * (1.0f + largest);
+        int token = argmax(chunked, model.n_vocab);
+        int wanted = argmax(single, model.n_vocab);
+
+        printf("prefill: %d tokens, chunk 1 vs %d\n", n_prompt, PREFILL_CHUNK);
+        printf("  logits differ by at most %.6f of %.3f (tolerance %.6f)\n",
+               worst, largest, tolerance);
+        printf("  argmax %d vs %d\n", wanted, token);
+        if (worst > tolerance || token != wanted) ok = 0;
+    }
+
+    free(single);
+    free(chunked);
+    tokenizer_free(&tokenizer);
+    model_free(&model);
+    printf(ok ? "prefill: PASS\n" : "prefill: FAIL\n");
+    return ok ? 0 : 1;
+}
+
 static int run_prompt(const GgufFile *g, const char *prompt, int n_predict,
                       int n_threads) {
     char err[256];
@@ -227,9 +321,7 @@ static int run_prompt(const GgufFile *g, const char *prompt, int n_predict,
     }
 
     double started = now_seconds();
-    const float *logits = NULL;
-    for (int i = 0; i < n_prompt; i++)
-        logits = forward(runtime, prompt_ids[i], i);
+    const float *logits = prefill(runtime, prompt_ids, n_prompt, PREFILL_CHUNK);
     double prefilled = now_seconds();
 
     printf("%s", prompt);
@@ -244,7 +336,7 @@ static int run_prompt(const GgufFile *g, const char *prompt, int n_predict,
         printf("%s", text);
         fflush(stdout);
         generated++;
-        logits = forward(runtime, token, n_prompt + i);
+        logits = forward(runtime, &token, n_prompt + i, 1);
     }
     double finished = now_seconds();
 
@@ -297,6 +389,11 @@ int exec_main(int argc, char **argv) {
     }
     if (strcmp(argv[0], "exec-tokenize") == 0) {
         int rc = tokenize_test(&g);
+        gguf_close(&g);
+        return rc;
+    }
+    if (strcmp(argv[0], "exec-prefill") == 0) {
+        int rc = prefill_test(&g);
         gguf_close(&g);
         return rc;
     }

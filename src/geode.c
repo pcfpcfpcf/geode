@@ -76,6 +76,8 @@ int main(int argc, char **argv) {
         return exec_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "exec-tokenize") == 0)
         return exec_main(argc - 1, argv + 1);
+    if (strcmp(argv[1], "exec-prefill") == 0)
+        return exec_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "exec-run") == 0) return exec_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
