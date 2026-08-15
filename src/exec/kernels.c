@@ -46,10 +46,14 @@ typedef struct {
    legacy ones. */
 #define QUANT_GRANULE 32
 
-/* Dot of one weight row against an int8-quantized activation. n is elements,
-   not blocks, so each kernel counts its own blocks and no caller has to know
-   the type's geometry. */
-typedef float (*GemvQ8)(const void *row, int n, const ActivationBlock *x);
+/* Fills out[row_begin..row_end) with each weight row dotted against an
+   int8-quantized activation. n is elements, not blocks, so each kernel counts
+   its own blocks and no caller has to know the type's geometry. The kernel
+   owns the row loop because a type whose blocks are small needs several rows
+   in flight to fill the fma pipeline and to share the activation loads. */
+typedef void (*GemvQ8)(float *out, const void *rows, size_t stride,
+                       int row_begin, int row_end, int n,
+                       const ActivationBlock *x);
 
 float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
@@ -190,6 +194,14 @@ static int have_avx2(void) {
            __builtin_cpu_supports("f16c");
 }
 
+/* The portable fp16_to_fp32 branches and loops over subnormals. Once per 256
+   weights that is noise; once per 32, as the legacy block types need, it costs
+   more than the arithmetic it feeds. */
+__attribute__((target("avx2,fma,f16c"), always_inline)) static inline float
+half_to_float(uint16_t half) {
+    return _cvtsh_ss(half);
+}
+
 __attribute__((target("avx2,fma,f16c"), always_inline)) static inline float
 hsum256(__m256 v) {
     __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
@@ -203,8 +215,8 @@ hsum256(__m256 v) {
    instruction against 8 for float FMA. Q4_K's per-sub-block minimum is a
    constant offset, so it folds into a sum of activations taken from the
    precomputed group sums instead of costing any multiplies. */
-__attribute__((target("avx2,fma,f16c"))) static float
-gemv_q4k_q8_avx2(const void *row, int n, const ActivationBlock *activations) {
+__attribute__((target("avx2,fma,f16c"), always_inline)) static inline float
+q4k_row(const void *row, int n, const ActivationBlock *activations) {
     const block_q4_K *blocks = row;
     const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
     __m256 acc = _mm256_setzero_ps();
@@ -246,17 +258,26 @@ gemv_q4k_q8_avx2(const void *row, int n, const ActivationBlock *activations) {
             is += 2;
         }
         acc = _mm256_fmadd_ps(
-            _mm256_set1_ps(fp16_to_fp32(b->d) * a->scale),
+            _mm256_set1_ps(half_to_float(b->d) * a->scale),
             _mm256_cvtepi32_ps(sumi), acc);
-        offset_acc -= fp16_to_fp32(b->dmin) * a->scale * (float)offsets;
+        offset_acc -= half_to_float(b->dmin) * a->scale * (float)offsets;
     }
     return hsum256(acc) + offset_acc;
 }
 
+__attribute__((target("avx2,fma,f16c"))) static void
+gemv_q4k_q8_avx2(float *out, const void *rows, size_t stride, int row_begin,
+                 int row_end, int n, const ActivationBlock *x) {
+    const unsigned char *row =
+        (const unsigned char *)rows + (size_t)row_begin * stride;
+    for (int r = row_begin; r < row_end; r++, row += stride)
+        out[r] = q4k_row(row, n, x);
+}
+
 /* Q6_K is symmetric around 32 with no stored minimum, so the -32 is recovered
    by multiplying the activations against a constant 32 and subtracting. */
-__attribute__((target("avx2,fma,f16c"))) static float
-gemv_q6k_q8_avx2(const void *row, int n, const ActivationBlock *activations) {
+__attribute__((target("avx2,fma,f16c"), always_inline)) static inline float
+q6k_row(const void *row, int n, const ActivationBlock *activations) {
     const block_q6_K *blocks = row;
     const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
     const __m256i pair_mask = _mm256_set1_epi8(3);
@@ -312,10 +333,19 @@ gemv_q6k_q8_avx2(const void *row, int n, const ActivationBlock *activations) {
             sc += 8;
         }
         acc = _mm256_fmadd_ps(
-            _mm256_set1_ps(fp16_to_fp32(b->d) * a->scale),
+            _mm256_set1_ps(half_to_float(b->d) * a->scale),
             _mm256_cvtepi32_ps(sumi), acc);
     }
     return hsum256(acc);
+}
+
+__attribute__((target("avx2,fma,f16c"))) static void
+gemv_q6k_q8_avx2(float *out, const void *rows, size_t stride, int row_begin,
+                 int row_end, int n, const ActivationBlock *x) {
+    const unsigned char *row =
+        (const unsigned char *)rows + (size_t)row_begin * stride;
+    for (int r = row_begin; r < row_end; r++, row += stride)
+        out[r] = q6k_row(row, n, x);
 }
 
 /* Expands the low 32 bits at `bits` to one byte per bit, 0xFF where set. */
@@ -337,42 +367,87 @@ bytes_from_bits_32(const uint8_t *bits) {
    around 16 with no stored minimum -- so like Q6_K the offset comes off the
    activation sums rather than the quants. Its blocks are 32 wide, so eight of
    them share one activation block and pick up two group sums each. */
-__attribute__((target("avx2,fma,f16c"))) static float
-gemv_q50_q8_avx2(const void *row, int n, const ActivationBlock *activations) {
-    const block_q5_0 *blocks = row;
+__attribute__((target("avx2,fma,f16c"), always_inline)) static inline __m256i
+q50_quants(const block_q5_0 *b) {
     const __m128i nibble_mask = _mm_set1_epi8(0x0F);
-    const __m256i fifth_bit = _mm256_set1_epi8(16);
+    /* Low nibbles are elements 0-15 and high nibbles elements 16-31, which is
+       the order the activation quants already sit in. */
+    __m128i packed = _mm_loadu_si128((const __m128i *)b->qs);
+    __m256i nibbles = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_and_si128(packed, nibble_mask)),
+        _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask), 1);
+    return _mm256_or_si256(
+        nibbles,
+        _mm256_and_si256(bytes_from_bits_32(b->qh), _mm256_set1_epi8(16)));
+}
+
+/* Rows this type carries are short -- 128 elements is four blocks -- so a
+   single row leaves the fma pipeline mostly empty waiting on its own
+   accumulator, and pays a horizontal sum for four blocks of work. Four rows at
+   a time run four independent chains and read each activation block once
+   between them. */
+#define Q50_ROWS 4
+
+__attribute__((target("avx2,fma,f16c"))) static void
+gemv_q50_q8_avx2(float *out, const void *rows, size_t stride, int row_begin,
+                 int row_end, int n, const ActivationBlock *x) {
     const __m256i ones = _mm256_set1_epi16(1);
-    __m256 acc = _mm256_setzero_ps();
-    float offset_acc = 0;
+    const unsigned char *base =
+        (const unsigned char *)rows + (size_t)row_begin * stride;
+    int blocks = n / QUANT_GRANULE;
+    int r = row_begin;
 
-    for (int i = 0; i < n / QUANT_GRANULE; i++) {
-        const block_q5_0 *b = &blocks[i];
-        int sub = i % (QK_K / QUANT_GRANULE);
-        const ActivationBlock *a = &activations[i / (QK_K / QUANT_GRANULE)];
+    for (; r + Q50_ROWS <= row_end; r += Q50_ROWS, base += Q50_ROWS * stride) {
+        __m256 acc[Q50_ROWS];
+        float offset[Q50_ROWS];
+        for (int k = 0; k < Q50_ROWS; k++) {
+            acc[k] = _mm256_setzero_ps();
+            offset[k] = 0;
+        }
+        for (int i = 0; i < blocks; i++) {
+            int sub = i % (QK_K / QUANT_GRANULE);
+            const ActivationBlock *a = &x[i / (QK_K / QUANT_GRANULE)];
+            __m256i xq = _mm256_loadu_si256(
+                (const __m256i *)(a->qs + QUANT_GRANULE * sub));
+            float sums = (float)(a->group_sums[2 * sub] +
+                                 a->group_sums[2 * sub + 1]);
 
-        /* Low nibbles are elements 0-15 and high nibbles elements 16-31,
-           which is the order the activation quants already sit in. */
-        __m128i packed = _mm_loadu_si128((const __m128i *)b->qs);
-        __m256i nibbles = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(_mm_and_si128(packed, nibble_mask)),
-            _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask), 1);
-        __m256i quants = _mm256_or_si256(
-            nibbles, _mm256_and_si256(bytes_from_bits_32(b->qh), fifth_bit));
-
-        __m256i x = _mm256_loadu_si256(
-            (const __m256i *)(a->qs + QUANT_GRANULE * sub));
-        __m256i sumi =
-            _mm256_madd_epi16(_mm256_maddubs_epi16(quants, x), ones);
-
-        float scale = fp16_to_fp32(b->d) * a->scale;
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(scale),
-                              _mm256_cvtepi32_ps(sumi), acc);
-        offset_acc -= scale * 16.0f *
-                      (float)(a->group_sums[2 * sub] +
-                              a->group_sums[2 * sub + 1]);
+            for (int k = 0; k < Q50_ROWS; k++) {
+                const block_q5_0 *b =
+                    &((const block_q5_0 *)(base + (size_t)k * stride))[i];
+                __m256i sumi = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(q50_quants(b), xq), ones);
+                float scale = half_to_float(b->d) * a->scale;
+                acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(scale),
+                                         _mm256_cvtepi32_ps(sumi), acc[k]);
+                offset[k] -= scale * 16.0f * sums;
+            }
+        }
+        for (int k = 0; k < Q50_ROWS; k++)
+            out[r + k] = hsum256(acc[k]) + offset[k];
     }
-    return hsum256(acc) + offset_acc;
+
+    for (; r < row_end; r++, base += stride) {
+        __m256 acc = _mm256_setzero_ps();
+        float offset = 0;
+        for (int i = 0; i < blocks; i++) {
+            int sub = i % (QK_K / QUANT_GRANULE);
+            const ActivationBlock *a = &x[i / (QK_K / QUANT_GRANULE)];
+            const block_q5_0 *b = &((const block_q5_0 *)base)[i];
+            __m256i sumi = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(
+                    q50_quants(b),
+                    _mm256_loadu_si256(
+                        (const __m256i *)(a->qs + QUANT_GRANULE * sub))),
+                ones);
+            float scale = half_to_float(b->d) * a->scale;
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(scale),
+                                  _mm256_cvtepi32_ps(sumi), acc);
+            offset -= scale * 16.0f * (float)(a->group_sums[2 * sub] +
+                                              a->group_sums[2 * sub + 1]);
+        }
+        out[r] = hsum256(acc) + offset;
+    }
 }
 
 __attribute__((target("avx2,fma,f16c"))) static float
@@ -509,8 +584,7 @@ void matvec(float *out, const void *rows, unsigned type, int n_in,
 
     GemvQ8 gemv = x->blocks ? gemv_q8_kernel(type) : NULL;
     if (gemv) {
-        for (int r = row_begin; r < row_end; r++, row += stride)
-            out[r] = gemv(row, n_in, x->blocks);
+        gemv(out, rows, stride, row_begin, row_end, n_in, x->blocks);
         return;
     }
     for (int r = row_begin; r < row_end; r++, row += stride)
