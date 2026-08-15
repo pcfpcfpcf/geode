@@ -215,26 +215,55 @@ hsum256(__m256 v) {
    instruction against 8 for float FMA. Q4_K's per-sub-block minimum is a
    constant offset, so it folds into a sum of activations taken from the
    precomputed group sums instead of costing any multiplies. */
+/* The eight 6-bit scales and eight 6-bit mins of a Q4_K block, unpacked in one
+   go. Decoding them one at a time inside the loop, as the scalar reference
+   does, costs more than the arithmetic they feed. */
+__attribute__((target("avx2,fma,f16c"), always_inline)) static inline void
+q4k_scales_mins(const uint8_t *packed, __m128i *scales, __m128i *mins) {
+    const uint32_t low6 = 0x3f3f3f3fu, low4 = 0x0f0f0f0fu, top2 = 0x03030303u;
+    uint32_t u[4];
+    memcpy(u, packed, 12);
+    u[3] = ((u[2] >> 4) & low4) | (((u[1] >> 6) & top2) << 4);
+    uint32_t mins_low = u[1] & low6;
+    u[1] = (u[2] & low4) | (((u[0] >> 6) & top2) << 4);
+    u[2] = mins_low;
+    u[0] &= low6;
+
+    __m128i both = _mm_set_epi32((int)u[3], (int)u[2], (int)u[1], (int)u[0]);
+    *scales = _mm_cvtepu8_epi16(both);
+    *mins = _mm_cvtepu8_epi16(_mm_srli_si128(both, 8));
+}
+
 __attribute__((target("avx2,fma,f16c"), always_inline)) static inline float
 q4k_row(const void *row, int n, const ActivationBlock *activations) {
     const block_q4_K *blocks = row;
     const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
     __m256 acc = _mm256_setzero_ps();
-    float offset_acc = 0;
+    __m128 offset_acc = _mm_setzero_ps();
 
     for (int i = 0; i < n / QK_K; i++) {
         const block_q4_K *b = &blocks[i];
         const ActivationBlock *a = &activations[i];
         const uint8_t *q = b->qs;
         __m256i sumi = _mm256_setzero_si256();
-        int offsets = 0;
         int is = 0;
 
-        for (int j = 0; j < 256; j += 64) {
-            uint8_t sc1, m1, sc2, m2;
-            get_scale_min_k4(is + 0, b->scales, &sc1, &m1);
-            get_scale_min_k4(is + 1, b->scales, &sc2, &m2);
+        __m128i scales, mins;
+        q4k_scales_mins(b->scales, &scales, &mins);
+        int16_t scale_of[8];
+        _mm_storeu_si128((__m128i *)scale_of, scales);
 
+        /* Each sub-block's minimum is constant across its 32 activations, so
+           all eight collapse into one dot product against the group sums
+           rather than an accumulation inside the loop below. */
+        __m256i sums = _mm256_loadu_si256((const __m256i *)a->group_sums);
+        __m128i pairs = _mm_hadd_epi16(_mm256_castsi256_si128(sums),
+                                       _mm256_extracti128_si256(sums, 1));
+        offset_acc = _mm_fmadd_ps(
+            _mm_set1_ps(half_to_float(b->dmin) * a->scale),
+            _mm_cvtepi32_ps(_mm_madd_epi16(mins, pairs)), offset_acc);
+
+        for (int j = 0; j < 256; j += 64) {
             __m256i packed = _mm256_loadu_si256((const __m256i *)q);
             __m256i low = _mm256_and_si256(packed, nibble_mask);
             __m256i high =
@@ -246,23 +275,23 @@ q4k_row(const void *row, int n, const ActivationBlock *activations) {
 
             sumi = _mm256_add_epi32(
                 sumi, _mm256_madd_epi16(_mm256_maddubs_epi16(low, xlow),
-                                        _mm256_set1_epi16(sc1)));
+                                        _mm256_set1_epi16(scale_of[is + 0])));
             sumi = _mm256_add_epi32(
                 sumi, _mm256_madd_epi16(_mm256_maddubs_epi16(high, xhigh),
-                                        _mm256_set1_epi16(sc2)));
-
-            int g = j / 16;
-            offsets += m1 * (a->group_sums[g + 0] + a->group_sums[g + 1]);
-            offsets += m2 * (a->group_sums[g + 2] + a->group_sums[g + 3]);
+                                        _mm256_set1_epi16(scale_of[is + 1])));
             q += 32;
             is += 2;
         }
         acc = _mm256_fmadd_ps(
             _mm256_set1_ps(half_to_float(b->d) * a->scale),
             _mm256_cvtepi32_ps(sumi), acc);
-        offset_acc -= half_to_float(b->dmin) * a->scale * (float)offsets;
     }
-    return hsum256(acc) + offset_acc;
+    __m128 total = _mm_sub_ps(_mm_add_ps(_mm256_castps256_ps128(acc),
+                                         _mm256_extractf128_ps(acc, 1)),
+                              offset_acc);
+    total = _mm_add_ps(total, _mm_movehl_ps(total, total));
+    total = _mm_add_ss(total, _mm_movehdup_ps(total));
+    return _mm_cvtss_f32(total);
 }
 
 __attribute__((target("avx2,fma,f16c"))) static void
