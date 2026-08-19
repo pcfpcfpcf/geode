@@ -36,4 +36,9 @@ int tokenizer_encode_prompt(const Tokenizer *t, const char *text, int *ids,
 int tokenizer_decode(const Tokenizer *t, const int *ids, int n_ids, char *out,
                      int max_bytes);
 
+/* The id of one whole vocabulary entry, or -1. Control tokens do not survive
+   a round trip through the merges, so anything spelling one has to look it up
+   rather than encode it. */
+int tokenizer_token_id(const Tokenizer *t, const char *text);
+
 #endif

@@ -11,6 +11,12 @@
    that an oversubscribed box gives the cpu back instead of burning it. */
 #define SPINS_BEFORE_YIELD 4096
 
+/* A yield leaves the worker runnable, so a pool waiting on a person rather
+   than on the next region burns every core it owns until they type. Reached
+   only long after the microseconds between two regions of a token, and a
+   parked worker costs one wakeup to bring back. */
+#define YIELDS_BEFORE_PARK 64
+
 #define CACHE_LINE 64
 
 /* Each worker reports done in its own slot, and the padding keeps sizeof over

@@ -1,3 +1,4 @@
+#include "chat.h"
 #include "gguf.h"
 #include "home.h"
 #include "kernels.h"
@@ -141,6 +142,8 @@ typedef struct {
     const Strategy *strategy;
     Model model;
     Tokenizer tokenizer;
+    Chat chat;
+    int has_chat;
 } Session;
 
 static int session_open(Session *session, const GgufFile *g, char *err,
@@ -169,6 +172,7 @@ static int session_open(Session *session, const GgufFile *g, char *err,
         model_free(&session->model);
         return 0;
     }
+    session->has_chat = chat_init(&session->chat, &session->tokenizer);
     return 1;
 }
 
@@ -194,10 +198,11 @@ static int stream_tokens(const Session *session, Runtime *runtime,
     }
     double prefilled = now_seconds();
 
+    int reply_end = session->has_chat ? session->chat.message_sep : -1;
     int generated = 0;
     for (int i = 0; i < n_predict; i++) {
         int token = argmax(logits, session->model.n_vocab);
-        if (token == session->tokenizer.eos_id) break;
+        if (token == session->tokenizer.eos_id || token == reply_end) break;
         char text[512];
         tokenizer_decode(&session->tokenizer, &token, 1, text, sizeof text);
         printf("%s", text);
@@ -368,6 +373,15 @@ int exec_cli(const char *path) {
         gguf_close(&g);
         return 1;
     }
+    if (!session.has_chat) {
+        fprintf(stderr,
+                "model has no role markers in its vocabulary, so it takes no "
+                "conversation; use 'exec-run MODEL.gguf PROMPT' to complete "
+                "text with it instead\n");
+        session_close(&session);
+        gguf_close(&g);
+        return 1;
+    }
 
     Runtime *runtime =
         session.strategy->start(&session.model, &session.plan,
@@ -393,12 +407,8 @@ int exec_cli(const char *path) {
         if (!turn || strcmp(turn, CLI_QUIT) == 0) break;
         if (!turn[0]) continue;
 
-        /* The leading token opens the conversation, not every turn in it. */
-        int n_turn = position == 0
-                         ? tokenizer_encode_prompt(&session.tokenizer, turn,
-                                                   ids, PROMPT_TOKENS_MAX)
-                         : tokenizer_encode(&session.tokenizer, turn, ids,
-                                            PROMPT_TOKENS_MAX);
+        int n_turn = chat_encode_turn(&session.chat, &session.tokenizer, turn,
+                                      position == 0, ids, PROMPT_TOKENS_MAX);
         if (n_turn < 1) {
             fprintf(stderr, "that encoded to no tokens; send some text\n");
             continue;

@@ -560,6 +560,11 @@ int tokenizer_encode(const Tokenizer *t, const char *text, int *ids,
     return out.count;
 }
 
+int tokenizer_token_id(const Tokenizer *t, const char *text) {
+    int id;
+    return map_get(t->vocab, text, (int)strlen(text), &id) ? id : -1;
+}
+
 int tokenizer_encode_prompt(const Tokenizer *t, const char *text, int *ids,
                             int max_ids) {
     int n = 0;
