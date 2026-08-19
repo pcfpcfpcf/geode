@@ -59,8 +59,7 @@ static const char *config_keys[] = {
     "vocab_size",
 };
 
-static void print_config_key(const GgufFile *g, const char *arch,
-                             const char *key) {
+static void print_config_key(const GgufFile *g, const char *arch, const char *key) {
     char full[160];
     unsigned long long integer;
     double real;
@@ -132,15 +131,6 @@ static int argmax(const float *values, int n) {
     return best;
 }
 
-static void print_plan(const Plan *plan) {
-    printf("plan:     %s", plan->strategy);
-    if (plan->n_ctx) printf(" @ %d ctx", plan->n_ctx);
-    for (int i = 0; i < plan->n_placements; i++)
-        printf("%s%s->%s", i ? ", " : " (", plan->placements[i].component,
-               plan->placements[i].tier);
-    printf("%s\n", plan->n_placements ? ")" : "");
-}
-
 /* Prefills the prompt, then samples greedily until the model emits its end
    token or the budget runs out, printing tokens as they arrive. */
 static void stream_tokens(const Strategy *strategy, Runtime *runtime,
@@ -191,7 +181,7 @@ static int generate(const GgufFile *g, const RunArgs *args) {
         return 1;
     }
 
-    if (planned) print_plan(&plan);
+    if (planned) plan_print(&plan);
     else printf("plan:     none (%s)\n", err);
     printf("%s\n", note);
     if (predicted[1] > 0)
@@ -321,4 +311,31 @@ int exec_main(int argc, char **argv) {
     int rc = command->run(&g, &args);
     gguf_close(&g);
     return rc;
+}
+
+int exec_cli(char *path){
+
+    char err[256];
+    GgufFile g;
+    if (!gguf_open(&g, path, err, sizeof err)) {
+        fprintf(stderr, "%s\n", err);
+        return 1;
+    }
+
+    RunArgs args = {"", DEFAULT_PREDICT_TOKENS, 0};
+    
+    int convo = 1;
+    printf("Talk To Your Model On Your Machine\n\n\n\n");
+    while (convo){
+        char msg[PROMPT_TOKENS_MAX];
+        printf("> ");
+        scanf("%s", msg);
+         
+        if (!strcmp(msg, "q")) {
+            printf("\nQuitting...\n");
+            convo=0;
+        }
+    }
+
+    return 0;
 }

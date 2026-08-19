@@ -1,5 +1,7 @@
 #include "json.h"
+#include "manifest.h"
 #include "modules.h"
+#include "plan.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -14,7 +16,6 @@
 #define NVME_MISS_LATENCY_S 100e-6
 #define PREFETCH_HIDDEN_FRACTION 0.90 /* fraction of miss latency the
                                          one-layer-ahead prefetch hides */
-#define POOL_MAX_BYTES (12ULL << 30)
 #define H_ASSUMED 0.50           /* conservative pool hit-rate assumption */
 #define PESSIMISM_LO 0.70        /* predictions are pessimistic by policy:
                                     band low end = 0.70 x point estimate */
@@ -55,22 +56,22 @@ typedef struct {
 } GpuTier;
 
 typedef struct {
-    char model[256];
-    char variant[64];
-    unsigned long long total_params, active_params, n_layer;
-    unsigned long long attention_bytes, base_bytes;
-    unsigned long long expert_count, expert_used, expert_bytes, routed_bytes;
-    unsigned long long kv_bytes_per_ctx_token;
-    int mtp_head;
-} Manifest;
+    DramPlan dram;
+    NvmeTier nvme;
+    GpuTier gpu;
+    double cpu_flops;
+    const char *cpu_flops_kind;
+} HardwareView;
 
 typedef struct {
-    const char *name;
-    int scorable;
-    char reason[160];
-    double point;               /* decode tok/s point estimate */
-    double prefill;             /* prefill tok/s, 0 = unmeasured */
-} Candidate;
+    long context, batch;
+    unsigned long long kv_total, weights_total, weights_kv;
+    unsigned long long kv_per_token, bytes_per_step;
+    unsigned long long hybrid_dram_step, hybrid_gpu_step;
+    double flops_bound, gpu_flops_bound;
+    double cpu_prefill, gpu_prefill;
+    int gpu_estimated;
+} Workload;
 
 static void fmt_size(double bytes, char *out, size_t outsz) {
     static const char *units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -99,9 +100,7 @@ static void jstr(const JVal *obj, const char *key, char *out, size_t outsz) {
         snprintf(out, outsz, "%s", v->str);
 }
 
-static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
-                      GpuTier *gpu, double *cpu_flops,
-                      const char **cpu_flops_kind,
+static int load_probe(const char *path, HardwareView *hw,
                       unsigned long long weights_kv_bytes,
                       char *err, size_t errsz) {
     char *text = json_read_file(path, err, errsz);
@@ -110,23 +109,24 @@ static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
     free(text);
     if (!root) return 0;
 
-    *cpu_flops = 0;
-    *cpu_flops_kind = "unmeasured";
+    hw->cpu_flops = 0;
+    hw->cpu_flops_kind = "unmeasured";
     const JVal *jcpu = json_get(root, "cpu");
     if (jcpu) {
         int ok = 1;
         /* dequant-shaped measurement is the honest bound for quantized
            inference; plain fp32 fma is the fallback */
-        *cpu_flops = jnum(jcpu, "q4k_dequant_flops", &ok);
-        if (ok && *cpu_flops > 0) {
-            *cpu_flops_kind = "q4k dequant";
+        hw->cpu_flops = jnum(jcpu, "q4k_dequant_flops", &ok);
+        if (ok && hw->cpu_flops > 0) {
+            hw->cpu_flops_kind = "q4k dequant";
         } else {
-            *cpu_flops = jnum(jcpu, "fp32_flops", &ok);
-            if (ok && *cpu_flops > 0) *cpu_flops_kind = "fp32 fma";
-            else *cpu_flops = 0; /* old probe: fields absent */
+            hw->cpu_flops = jnum(jcpu, "fp32_flops", &ok);
+            if (ok && hw->cpu_flops > 0) hw->cpu_flops_kind = "fp32 fma";
+            else hw->cpu_flops = 0; /* old probe: fields absent */
         }
     }
 
+    DramPlan *dram = &hw->dram;
     const JVal *jdram = json_get(root, "dram");
     if (!jdram || jdram->kind != JV_ARR || jdram->n_items == 0) {
         snprintf(err, errsz, "%.200s: no dram nodes", path);
@@ -169,6 +169,7 @@ static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
         dram->usable = (unsigned long long)(sum_cap * DRAM_USABLE_FRACTION);
     }
 
+    NvmeTier *nvme = &hw->nvme;
     nvme->read_bw = 0;
     nvme->capacity = 0;
     const JVal *jnvme = json_get(root, "nvme");
@@ -180,6 +181,7 @@ static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
                 (unsigned long long)jnum(jnvme->items[i], "capacity_bytes", &ok);
         }
 
+    GpuTier *gpu = &hw->gpu;
     gpu->present = 0;
     const JVal *jgpu = json_get(root, "gpu");
     if (jgpu && jgpu->kind == JV_ARR && jgpu->n_items > 0) {
@@ -202,48 +204,6 @@ static int load_probe(const char *path, DramPlan *dram, NvmeTier *nvme,
     return 1;
 }
 
-static int load_manifest(const char *path, Manifest *m, char *err,
-                         size_t errsz) {
-    char *text = json_read_file(path, err, errsz);
-    if (!text) return 0;
-    JVal *root = json_parse(text, err, errsz);
-    free(text);
-    if (!root) return 0;
-
-    int ok = 1;
-    jstr(root, "model", m->model, sizeof m->model);
-    jstr(root, "variant", m->variant, sizeof m->variant);
-    m->total_params = (unsigned long long)jnum(root, "total_params", &ok);
-    m->active_params = (unsigned long long)jnum(root, "active_params", &ok);
-    m->n_layer = (unsigned long long)jnum(root, "n_layer", &ok);
-    m->mtp_head = (int)jnum(root, "mtp_head", &ok);
-
-    const JVal *comp = json_get(root, "components");
-    const JVal *att = comp ? json_get(comp, "attention") : NULL;
-    const JVal *base = comp ? json_get(comp, "base") : NULL;
-    const JVal *exp = comp ? json_get(comp, "experts") : NULL;
-    const JVal *kv = json_get(root, "kv_cache");
-    if (!att || !base || !exp || !kv) ok = 0;
-    if (ok) {
-        m->attention_bytes =
-            (unsigned long long)jnum(att, "bytes_per_token", &ok);
-        m->base_bytes = (unsigned long long)jnum(base, "bytes_per_token", &ok);
-        m->expert_count = (unsigned long long)jnum(exp, "count", &ok);
-        m->expert_used = (unsigned long long)jnum(exp, "used_per_token", &ok);
-        m->expert_bytes = (unsigned long long)jnum(exp, "bytes_each", &ok);
-        m->routed_bytes =
-            (unsigned long long)jnum(exp, "bytes_per_token", &ok);
-        m->kv_bytes_per_ctx_token =
-            (unsigned long long)jnum(kv, "bytes_per_context_token", &ok);
-    }
-    json_free(root);
-    if (!ok) {
-        snprintf(err, errsz, "%.200s: missing or bad manifest fields", path);
-        return 0;
-    }
-    return 1;
-}
-
 static double mtp_multiplier(const Manifest *m) {
     return m->mtp_head ? MTP_ACCEPTANCE : 1.0;
 }
@@ -252,7 +212,7 @@ static void score_resident(Candidate *c, const Manifest *m,
                            unsigned long long total_bytes,
                            unsigned long long bytes_per_token,
                            const GpuTier *gpu, double gpu_flops_bound) {
-    c->name = "RESIDENT";
+    snprintf(c->strategy, sizeof c->strategy, "RESIDENT");
     c->scorable = 0;
     if (!gpu->present) {
         snprintf(c->reason, sizeof c->reason, "no gpu");
@@ -271,16 +231,16 @@ static void score_resident(Candidate *c, const Manifest *m,
         return;
     }
     c->scorable = 1;
-    c->point = gpu->hbm_bw / bytes_per_token;
-    if (gpu_flops_bound < c->point) c->point = gpu_flops_bound;
-    c->point *= mtp_multiplier(m);
+    c->decode_tok_s[1] = gpu->hbm_bw / bytes_per_token;
+    if (gpu_flops_bound < c->decode_tok_s[1]) c->decode_tok_s[1] = gpu_flops_bound;
+    c->decode_tok_s[1] *= mtp_multiplier(m);
 }
 
 static void score_cpu_stream(Candidate *c, const Manifest *m,
                              unsigned long long total_bytes,
                              unsigned long long bytes_per_token,
                              const DramPlan *dram, double flops_bound) {
-    c->name = "CPU-STREAM";
+    snprintf(c->strategy, sizeof c->strategy, "CPU-STREAM");
     c->scorable = 0;
     if (total_bytes > dram->usable) {
         char need[32], have[32];
@@ -291,9 +251,9 @@ static void score_cpu_stream(Candidate *c, const Manifest *m,
         return;
     }
     c->scorable = 1;
-    c->point = dram->eff_bw / bytes_per_token;
-    if (flops_bound < c->point) c->point = flops_bound;
-    c->point *= mtp_multiplier(m);
+    c->decode_tok_s[1] = dram->eff_bw / bytes_per_token;
+    if (flops_bound < c->decode_tok_s[1]) c->decode_tok_s[1] = flops_bound;
+    c->decode_tok_s[1] *= mtp_multiplier(m);
 }
 
 static void score_hybrid(Candidate *c, const Manifest *m,
@@ -302,7 +262,7 @@ static void score_hybrid(Candidate *c, const Manifest *m,
                          unsigned long long gpu_bytes_per_step,
                          const DramPlan *dram, const GpuTier *gpu,
                          double flops_bound) {
-    c->name = "HYBRID";
+    snprintf(c->strategy, sizeof c->strategy, "HYBRID");
     c->scorable = 0;
     if (!gpu->present) {
         snprintf(c->reason, sizeof c->reason, "no gpu");
@@ -321,11 +281,11 @@ static void score_hybrid(Candidate *c, const Manifest *m,
     /* Decode is expert-byte-bound: experts stream from DRAM exactly as in
        CPU-STREAM; the gpu only takes attention+kv reads off DRAM. */
     c->scorable = 1;
-    c->point = dram->eff_bw / bytes_per_step;
+    c->decode_tok_s[1] = dram->eff_bw / bytes_per_step;
     double gpu_rate = gpu->hbm_bw / gpu_bytes_per_step;
-    if (gpu_rate < c->point) c->point = gpu_rate;
-    if (flops_bound < c->point) c->point = flops_bound;
-    c->point *= HYBRID_SYNC_FACTOR * mtp_multiplier(m);
+    if (gpu_rate < c->decode_tok_s[1]) c->decode_tok_s[1] = gpu_rate;
+    if (flops_bound < c->decode_tok_s[1]) c->decode_tok_s[1] = flops_bound;
+    c->decode_tok_s[1] *= HYBRID_SYNC_FACTOR * mtp_multiplier(m);
 }
 
 /* The design-doc formula with h folded into bytes: equivalent to
@@ -358,7 +318,7 @@ static void score_flash_stream(Candidate *c, const Manifest *m,
                                unsigned long long kv_per_token, long batch,
                                const DramPlan *dram, const NvmeTier *nvme,
                                double flops_bound) {
-    c->name = "FLASH-STREAM";
+    snprintf(c->strategy, sizeof c->strategy, "FLASH-STREAM");
     c->scorable = 0;
     /* Design doc: FLASH-STREAM is the "else" branch — streaming from disk
        what could be held in dram is never better. */
@@ -377,8 +337,90 @@ static void score_flash_stream(Candidate *c, const Manifest *m,
         return;
     }
     c->scorable = 1;
-    c->point = flash_rate_at_h(m, dram, nvme, att_base, kv_per_token, batch,
-                               H_ASSUMED, flops_bound);
+    c->decode_tok_s[1] = flash_rate_at_h(m, dram, nvme, att_base, kv_per_token,
+                                         batch, H_ASSUMED, flops_bound);
+}
+
+static void print_report(const Manifest *m, const HardwareView *hw,
+                         const Workload *wl, const Plan *plan) {
+    char size[32];
+    if (hw->cpu_flops > 0)
+        printf("probed:  cpu %.0f GFLOPS %s, ", hw->cpu_flops / 1e9,
+               hw->cpu_flops_kind);
+    else
+        printf("probed:  cpu flops unmeasured, ");
+    printf("dram %.0f GB/s eff (%s), usable ", hw->dram.eff_bw / 1e9,
+           hw->dram.policy);
+    fmt_size((double)hw->dram.usable, size, sizeof size);
+    printf("%s, nvme %.1f GB/s", size, hw->nvme.read_bw / 1e9);
+    if (hw->gpu.present)
+        printf(", gpu %s %.1f GB%s", hw->gpu.name, hw->gpu.vram / 1e9,
+               hw->gpu.bw_measured ? "" : " (unmeasured)");
+    printf("\n");
+    printf("model:   %s (%s), %.2fB total / %.2fB active, %llu layers, "
+           "%llu experts (%llu/token)\n",
+           m->model, m->variant, m->total_params / 1e9, m->active_params / 1e9,
+           m->n_layer, m->expert_count, m->expert_used);
+    printf("workload: context %ld, batch %ld; kv cache ", wl->context,
+           wl->batch);
+    fmt_size((double)wl->kv_total, size, sizeof size);
+    printf("%s\n\n", size);
+
+    printf("%-13s %-9s %-14s %s\n", "strategy", "scorable", "decode tok/s",
+           "why");
+    const Candidate *best =
+        plan->strategy[0] ? plan_candidate(plan, plan->strategy) : NULL;
+    for (int i = 0; i < plan->n_candidates; i++) {
+        const Candidate *c = &plan->candidates[i];
+        if (c->scorable)
+            printf("%-13s %-9s %.0f-%-9.0f %s\n", c->strategy, "yes",
+                   c->decode_tok_s[0], c->decode_tok_s[1],
+                   c == best ? "<- best" : "");
+        else
+            printf("%-13s %-9s %-14s %s\n", c->strategy, "no", "-", c->reason);
+    }
+    printf("\n");
+
+    if (!best) {
+        printf("no scorable strategy on this hardware\n");
+        return;
+    }
+
+    if (strcmp(best->strategy, "FLASH-STREAM") == 0) {
+        unsigned long long att_base = m->attention_bytes + m->base_bytes;
+        printf("hit-rate dial (routed %.2f GB/token, nvme %.1f GB/s):\n",
+               m->routed_bytes / 1e9, hw->nvme.read_bw / 1e9);
+        for (int i = 0; i < n_h_sweep; i++)
+            printf("  h=%-4.0f%% -> %.1f tok/s\n", h_sweep[i] * 100,
+                   flash_rate_at_h(m, &hw->dram, &hw->nvme, att_base,
+                                   wl->kv_per_token, wl->batch, h_sweep[i],
+                                   wl->flops_bound));
+        if (strstr(m->variant, "decomposed") == NULL)
+            printf("note: streaming full experts; decomposition cuts routed "
+                   "bytes ~7x\n");
+        printf("\n");
+    }
+
+    printf("plan:    %s, numa %s", plan->strategy, plan->numa_policy);
+    if (plan->numa_replicas > 1) printf(" (%d replicas)", plan->numa_replicas);
+    printf("%s\n", m->mtp_head ? ", mtp on" : "");
+    printf("predict: %.0f-%.0f tok/s decode (calibrating)",
+           plan->predicted_tok_s[0], plan->predicted_tok_s[1]);
+    if (best->prefill_tok_s > 0) {
+        const char *device = "cpu";
+        if (strcmp(best->strategy, "RESIDENT") == 0) device = hw->gpu.name;
+        else if (strcmp(best->strategy, "HYBRID") == 0) device = "gpu+cpu";
+        int estimated = wl->gpu_estimated &&
+                       strcmp(best->strategy, "CPU-STREAM") != 0 &&
+                       strcmp(best->strategy, "FLASH-STREAM") != 0;
+        printf(", prefill ~%.0f tok/s on %s%s, TTFT ~%.0fs @ %ld ctx",
+               best->prefill_tok_s, device,
+               estimated ? " (estimated from fp32 peak)" : "",
+               wl->context / best->prefill_tok_s, wl->context);
+    } else {
+        printf(", prefill unmeasured (probe has no flops measurement)");
+    }
+    printf("\n");
 }
 
 static const char *default_probe_path(void) {
@@ -410,6 +452,14 @@ static void usage(const char *argv0) {
             "usage: %s [probe.json] [manifest.json] [--context N] [--batch N] "
             "[--out plan.json]\n",
             argv0);
+}
+
+static void add_placement(Plan *plan, const char *component, const char *tier,
+                          const char *policy) {
+    Placement *p = &plan->placements[plan->n_placements++];
+    snprintf(p->component, sizeof p->component, "%s", component);
+    snprintf(p->tier, sizeof p->tier, "%s", tier);
+    snprintf(p->policy, sizeof p->policy, "%s", policy);
 }
 
 int planner_main(int argc, char **argv) {
@@ -446,34 +496,31 @@ int planner_main(int argc, char **argv) {
 
     char err[256];
     Manifest m;
-    if (!load_manifest(manifest_path, &m, err, sizeof err)) {
+    if (!manifest_load(manifest_path, &m, err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         return 1;
     }
 
-    unsigned long long kv_total = m.kv_bytes_per_ctx_token *
-                                  (unsigned long long)context *
-                                  (unsigned long long)batch;
-    unsigned long long weights_total =
+    Workload wl = {0};
+    wl.context = context;
+    wl.batch = batch;
+    wl.kv_total = m.kv_bytes_per_ctx_token * (unsigned long long)context *
+                 (unsigned long long)batch;
+    wl.weights_total =
         m.attention_bytes + m.base_bytes + m.expert_bytes * m.expert_count;
-    unsigned long long weights_kv = weights_total + kv_total;
+    wl.weights_kv = wl.weights_total + wl.kv_total;
 
-    DramPlan dram;
-    NvmeTier nvme;
-    GpuTier gpu;
-    double cpu_flops;
-    const char *cpu_flops_kind;
-    if (!load_probe(probe_path, &dram, &nvme, &gpu, &cpu_flops,
-                    &cpu_flops_kind, weights_kv, err, sizeof err)) {
+    HardwareView hw;
+    if (!load_probe(probe_path, &hw, wl.weights_kv, err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         return 1;
     }
 
     /* Experts are dequantized and multiplied on the cpu in every strategy
        except RESIDENT, so the cpu flops bound applies to all of them. */
-    double flops_bound = cpu_flops > 0
-                             ? cpu_flops / (2.0 * m.active_params * batch)
-                             : INFINITY;
+    wl.flops_bound = hw.cpu_flops > 0
+                         ? hw.cpu_flops / (2.0 * m.active_params * batch)
+                         : INFINITY;
     /* Decode-side kernels are fused dequant GEMV/GEMM; prefill on a gpu
        without tensor cores runs dequant + SGEMM, with dequant amortized to
        noise at prefill context lengths. Each phase gets the measurement
@@ -481,25 +528,23 @@ int planner_main(int argc, char **argv) {
        is the fallback for old probes. */
     double gpu_decode_flops = 0;
     double gpu_prefill_flops = 0;
-    int gpu_estimated = 0;
-    if (gpu.dequant_measured && gpu.dequant_flops > 0)
-        gpu_decode_flops = gpu.dequant_flops;
-    if (gpu.sgemm_measured && gpu.sgemm_flops > 0)
-        gpu_prefill_flops = gpu.sgemm_flops;
-    if (gpu.flops_measured &&
-        (!gpu_decode_flops || !gpu_prefill_flops)) {
-        double fallback = gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY;
+    if (hw.gpu.dequant_measured && hw.gpu.dequant_flops > 0)
+        gpu_decode_flops = hw.gpu.dequant_flops;
+    if (hw.gpu.sgemm_measured && hw.gpu.sgemm_flops > 0)
+        gpu_prefill_flops = hw.gpu.sgemm_flops;
+    if (hw.gpu.flops_measured && (!gpu_decode_flops || !gpu_prefill_flops)) {
+        double fallback = hw.gpu.fp32_flops * GPU_DEQUANT_EFFICIENCY;
         if (!gpu_decode_flops) gpu_decode_flops = fallback;
         if (!gpu_prefill_flops) gpu_prefill_flops = fallback;
-        gpu_estimated = 1;
+        wl.gpu_estimated = 1;
     }
-    double gpu_flops_bound =
-        gpu_decode_flops > 0 ? gpu_decode_flops / (2.0 * m.active_params * batch)
+    wl.gpu_flops_bound = gpu_decode_flops > 0
+                             ? gpu_decode_flops / (2.0 * m.active_params * batch)
                              : INFINITY;
 
     /* Prefill is GEMM-shaped, computed wherever each component lives. */
-    double cpu_prefill = cpu_flops > 0 ? cpu_flops / (2.0 * m.active_params) : 0;
-    double gpu_prefill =
+    wl.cpu_prefill = hw.cpu_flops > 0 ? hw.cpu_flops / (2.0 * m.active_params) : 0;
+    wl.gpu_prefill =
         gpu_prefill_flops > 0 ? gpu_prefill_flops / (2.0 * m.active_params) : 0;
 
     /* Per decode step: attention+base are read once and amortize over the
@@ -509,215 +554,85 @@ int planner_main(int argc, char **argv) {
     double experts_hit =
         m.expert_count *
         (1.0 - pow(1.0 - (double)m.expert_used / m.expert_count, batch));
-    unsigned long long kv_per_token =
-        m.kv_bytes_per_ctx_token * (unsigned long long)context;
+    wl.kv_per_token = m.kv_bytes_per_ctx_token * (unsigned long long)context;
     unsigned long long routed_per_step =
         (unsigned long long)(experts_hit * m.expert_bytes);
-    unsigned long long bytes_per_step = m.attention_bytes + m.base_bytes +
-                                        routed_per_step +
-                                        kv_per_token * (unsigned long long)batch;
-    unsigned long long hybrid_dram_step =
-        m.base_bytes + routed_per_step;
-    unsigned long long hybrid_gpu_step =
-        m.attention_bytes + kv_per_token * (unsigned long long)batch;
+    wl.bytes_per_step = m.attention_bytes + m.base_bytes + routed_per_step +
+                        wl.kv_per_token * (unsigned long long)batch;
+    wl.hybrid_dram_step = m.base_bytes + routed_per_step;
+    wl.hybrid_gpu_step = m.attention_bytes + wl.kv_per_token * (unsigned long long)batch;
 
-    Candidate cands[4];
-    score_resident(&cands[0], &m, weights_kv, bytes_per_step, &gpu,
-                   gpu_flops_bound);
-    score_cpu_stream(&cands[1], &m, weights_kv, bytes_per_step, &dram,
-                     flops_bound);
-    score_hybrid(&cands[2], &m, kv_total, hybrid_dram_step, hybrid_gpu_step,
-                 &dram, &gpu, flops_bound);
-    score_flash_stream(&cands[3], &m, kv_total, weights_kv, kv_per_token,
-                       batch, &dram, &nvme, flops_bound);
+    Plan plan = {0};
+    plan.n_ctx = (int)context;
+    plan.batch = (int)batch;
+    plan.n_candidates = 4;
+    Candidate *cands = plan.candidates;
+    score_resident(&cands[0], &m, wl.weights_kv, wl.bytes_per_step, &hw.gpu,
+                   wl.gpu_flops_bound);
+    score_cpu_stream(&cands[1], &m, wl.weights_kv, wl.bytes_per_step, &hw.dram,
+                     wl.flops_bound);
+    score_hybrid(&cands[2], &m, wl.kv_total, wl.hybrid_dram_step,
+                wl.hybrid_gpu_step, &hw.dram, &hw.gpu, wl.flops_bound);
+    score_flash_stream(&cands[3], &m, wl.kv_total, wl.weights_kv,
+                       wl.kv_per_token, batch, &hw.dram, &hw.nvme,
+                       wl.flops_bound);
 
     /* Params split approximated by byte split; the Q4_K/Q6_K mix varies
        little across components. HYBRID prefill serializes: attention on the
        gpu, everything else on the cpu. */
-    double active_bytes =
-        m.attention_bytes + m.base_bytes + m.routed_bytes;
+    double active_bytes = m.attention_bytes + m.base_bytes + m.routed_bytes;
     double att_frac = m.attention_bytes / active_bytes;
-    cands[0].prefill = gpu_prefill;
-    cands[1].prefill = cpu_prefill;
-    cands[2].prefill =
-        (gpu_prefill > 0 && cpu_prefill > 0)
-            ? 1.0 / (att_frac / gpu_prefill + (1.0 - att_frac) / cpu_prefill)
+    cands[0].prefill_tok_s = wl.gpu_prefill;
+    cands[1].prefill_tok_s = wl.cpu_prefill;
+    cands[2].prefill_tok_s =
+        (wl.gpu_prefill > 0 && wl.cpu_prefill > 0)
+            ? 1.0 / (att_frac / wl.gpu_prefill + (1.0 - att_frac) / wl.cpu_prefill)
             : 0;
-    cands[3].prefill = cpu_prefill;
+    cands[3].prefill_tok_s = wl.cpu_prefill;
 
-    Candidate *best = NULL;
-    for (int i = 0; i < 4; i++)
-        if (cands[i].scorable && (!best || cands[i].point > best->point))
-            best = &cands[i];
+    int best_idx = -1;
+    for (int i = 0; i < plan.n_candidates; i++)
+        if (cands[i].scorable &&
+            (best_idx < 0 || cands[i].decode_tok_s[1] > cands[best_idx].decode_tok_s[1]))
+            best_idx = i;
+    for (int i = 0; i < plan.n_candidates; i++)
+        if (cands[i].scorable)
+            cands[i].decode_tok_s[0] = cands[i].decode_tok_s[1] * PESSIMISM_LO;
 
-    char size[32];
-    if (cpu_flops > 0)
-        printf("probed:  cpu %.0f GFLOPS %s, ", cpu_flops / 1e9,
-               cpu_flops_kind);
-    else
-        printf("probed:  cpu flops unmeasured, ");
-    printf("dram %.0f GB/s eff (%s), usable ", dram.eff_bw / 1e9,
-           dram.policy);
-    fmt_size((double)dram.usable, size, sizeof size);
-    printf("%s, nvme %.1f GB/s", size, nvme.read_bw / 1e9);
-    if (gpu.present)
-        printf(", gpu %s %.1f GB%s", gpu.name, gpu.vram / 1e9,
-               gpu.bw_measured ? "" : " (unmeasured)");
-    printf("\n");
-    printf("model:   %s (%s), %.2fB total / %.2fB active, %llu layers, "
-           "%llu experts (%llu/token)\n",
-           m.model, m.variant, m.total_params / 1e9, m.active_params / 1e9,
-           m.n_layer, m.expert_count, m.expert_used);
-    printf("workload: context %ld, batch %ld; kv cache ", context, batch);
-    fmt_size((double)kv_total, size, sizeof size);
-    printf("%s\n\n", size);
+    if (best_idx >= 0) {
+        Candidate *best = &cands[best_idx];
+        snprintf(plan.strategy, sizeof plan.strategy, "%s", best->strategy);
+        plan.predicted_tok_s[0] = best->decode_tok_s[0];
+        plan.predicted_tok_s[1] = best->decode_tok_s[1];
+        plan.predicted_prefill_tok_s = best->prefill_tok_s;
+        snprintf(plan.numa_policy, sizeof plan.numa_policy, "%s", hw.dram.policy);
+        plan.numa_replicas = hw.dram.replicas;
 
-    printf("%-13s %-9s %-14s %s\n", "strategy", "scorable", "decode tok/s",
-           "why");
-    for (int i = 0; i < 4; i++) {
-        Candidate *c = &cands[i];
-        if (c->scorable)
-            printf("%-13s %-9s %.0f-%-9.0f %s\n", c->name, "yes",
-                   c->point * PESSIMISM_LO, c->point,
-                   c == best ? "<- best" : "");
-        else
-            printf("%-13s %-9s %-14s %s\n", c->name, "no", "-", c->reason);
-    }
-    printf("\n");
-
-    if (!best) {
-        printf("no scorable strategy on this hardware\n");
-        return 1;
+        if (best_idx == 0) {
+            add_placement(&plan, "all", "vram", "resident");
+        } else if (best_idx == 3) {
+            add_placement(&plan, "attention", "dram", "resident");
+            add_placement(&plan, "base", "dram", "resident");
+            add_placement(&plan, "experts", "nvme", "pool+prefetch");
+        } else {
+            int hybrid = best_idx == 2;
+            add_placement(&plan, "attention", hybrid ? "vram" : "dram", "resident");
+            add_placement(&plan, "base", "dram", "resident");
+            add_placement(&plan, "experts", "dram", "resident");
+            add_placement(&plan, "kv", hybrid ? "vram" : "dram", "resident");
+        }
     }
 
-    if (best == &cands[3]) {
-        unsigned long long att_base = m.attention_bytes + m.base_bytes;
-        printf("hit-rate dial (routed %.2f GB/token, nvme %.1f GB/s):\n",
-               m.routed_bytes / 1e9, nvme.read_bw / 1e9);
-        for (int i = 0; i < n_h_sweep; i++)
-            printf("  h=%-4.0f%% -> %.1f tok/s\n", h_sweep[i] * 100,
-                   flash_rate_at_h(&m, &dram, &nvme, att_base, kv_per_token,
-                                   batch, h_sweep[i], flops_bound));
-        if (strstr(m.variant, "decomposed") == NULL)
-            printf("note: streaming full experts; decomposition cuts routed "
-                   "bytes ~7x\n");
-        printf("\n");
-    }
+    print_report(&m, &hw, &wl, &plan);
 
-    printf("plan:    %s, numa %s", best->name, dram.policy);
-    if (dram.replicas > 1) printf(" (%d replicas)", dram.replicas);
-    printf("%s\n", m.mtp_head ? ", mtp on" : "");
-    printf("predict: %.0f-%.0f tok/s decode (calibrating)",
-           best->point * PESSIMISM_LO, best->point);
-    if (best->prefill > 0) {
-        const char *device = "cpu";
-        if (best == &cands[0]) device = gpu.name;
-        else if (best == &cands[2]) device = "gpu+cpu";
-        printf(", prefill ~%.0f tok/s on %s%s, TTFT ~%.0fs @ %ld ctx",
-               best->prefill, device,
-               gpu_estimated && best != &cands[1] && best != &cands[3]
-                   ? " (estimated from fp32 peak)"
-                   : "",
-               context / best->prefill, context);
-    } else {
-        printf(", prefill unmeasured (probe has no flops measurement)");
-    }
-    printf("\n");
+    if (best_idx < 0) return 1;
 
     FILE *out = fopen(out_path, "w");
     if (!out) {
         perror(out_path);
         return 1;
     }
-    Json j;
-    json_begin(&j, out);
-    json_u64(&j, "schema", 1);
-    json_string(&j, "strategy", best->name);
-    json_open(&j, "workload", 0);
-    json_u64(&j, "context", (unsigned long long)context);
-    json_u64(&j, "batch", (unsigned long long)batch);
-    json_close(&j);
-    json_open(&j, "placement", 1);
-    if (best == &cands[0]) {
-        json_open(&j, NULL, 0);
-        json_string(&j, "component", "all");
-        json_string(&j, "tier", "vram");
-        json_string(&j, "policy", "resident");
-        json_close(&j);
-    } else if (best == &cands[3]) {
-        unsigned long long resident =
-            m.attention_bytes + m.base_bytes + kv_total;
-        unsigned long long pool = dram.usable - resident;
-        if (pool > POOL_MAX_BYTES) pool = POOL_MAX_BYTES;
-        json_open(&j, NULL, 0);
-        json_string(&j, "component", "attention");
-        json_string(&j, "tier", "dram");
-        json_string(&j, "policy", "resident");
-        json_close(&j);
-        json_open(&j, NULL, 0);
-        json_string(&j, "component", "base");
-        json_string(&j, "tier", "dram");
-        json_string(&j, "policy", "resident");
-        json_close(&j);
-        json_open(&j, NULL, 0);
-        json_string(&j, "component", "experts");
-        json_string(&j, "tier", "nvme");
-        json_string(&j, "policy", "pool+prefetch");
-        json_u64(&j, "pool_bytes", pool);
-        json_string(&j, "spec_width", "confidence-gated");
-        json_string(&j, "pool_partitioning", "per-sequence");
-        json_close(&j);
-    } else {
-        int hybrid = best == &cands[2];
-        json_open(&j, NULL, 0);
-        json_string(&j, "component", "attention");
-        json_string(&j, "tier", hybrid ? "vram" : "dram");
-        json_string(&j, "policy", "resident");
-        json_close(&j);
-        json_open(&j, NULL, 0);
-        json_string(&j, "component", "base");
-        json_string(&j, "tier", "dram");
-        json_string(&j, "policy", "resident");
-        json_close(&j);
-        json_open(&j, NULL, 0);
-        json_string(&j, "component", "experts");
-        json_string(&j, "tier", "dram");
-        json_string(&j, "policy", "resident");
-        json_close(&j);
-        json_open(&j, NULL, 0);
-        json_string(&j, "component", "kv");
-        json_string(&j, "tier", hybrid ? "vram" : "dram");
-        json_string(&j, "policy", "resident");
-        json_close(&j);
-    }
-    json_close(&j);
-    json_open(&j, "numa", 0);
-    json_string(&j, "policy", dram.policy);
-    json_u64(&j, "replicas", (unsigned long long)dram.replicas);
-    json_close(&j);
-    json_open(&j, "predicted_tok_s", 1);
-    json_double(&j, NULL, best->point * PESSIMISM_LO);
-    json_double(&j, NULL, best->point);
-    json_close(&j);
-    if (best->prefill > 0)
-        json_double(&j, "predicted_prefill_tok_s", best->prefill);
-    json_open(&j, "candidates", 1);
-    for (int i = 0; i < 4; i++) {
-        json_open(&j, NULL, 0);
-        json_string(&j, "strategy", cands[i].name);
-        json_u64(&j, "scorable", cands[i].scorable);
-        if (cands[i].scorable) {
-            json_open(&j, "decode_tok_s", 1);
-            json_double(&j, NULL, cands[i].point * PESSIMISM_LO);
-            json_double(&j, NULL, cands[i].point);
-            json_close(&j);
-        } else {
-            json_string(&j, "reason", cands[i].reason);
-        }
-        json_close(&j);
-    }
-    json_close(&j);
-    json_end(&j);
+    plan_write(out, &plan);
     if (fclose(out)) {
         perror(out_path);
         return 1;

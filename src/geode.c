@@ -1,5 +1,6 @@
 #include "home.h"
 #include "modules.h"
+#include "strategy.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,10 +36,31 @@ static int run_end_to_end(const char *model) {
         rc = probe_main(1, probe_argv);
         if (rc) return rc;
     }
-    char *manifest_argv[] = {"geode manifest", (char *)model};
-    rc = manifest_main(2, manifest_argv);
-    if (rc) return rc;
-    return run_cached_planner("geode", 0, NULL);
+    if (!have_cached("manifest.json")){
+        char *manifest_argv[] = {"geode manifest", (char *)model};
+        rc = manifest_main(2, manifest_argv);
+        if (rc) return rc;
+    }
+    if (have_cached("plan.json")) {
+        Plan plan;
+        char err[256];
+        if (plan_load(&plan, geode_home("plan.json"), err, sizeof err)) {
+            double predicted[2];
+            char note[256];
+            if (strategy_choose(&plan, predicted, note, sizeof note)) {
+                printf("%s\n", note);
+                if (predicted[1] > 0)
+                    printf("predict:  %.1f-%.1f tok/s decode\n", predicted[0],
+                           predicted[1]);
+            }
+        }
+    } else {
+        char *planner_argv[1];
+        planner_argv[0] = "geode planner";
+        rc = planner_main(1, planner_argv);
+        if (rc) return rc;
+    }
+    return exec_cli((char *) model);
 }
 
 static void usage(const char *argv0) {
