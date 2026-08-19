@@ -1,4 +1,5 @@
 #include "json.h"
+#include "manifest.h"
 #include "modules.h"
 #include "quant.h"
 
@@ -136,6 +137,117 @@ static TensorClass classify(const char *name) {
     if (strstr(name, "_exps.")) return T_EXPERT;
     if (strstr(name, ".attn_")) return T_ATTENTION;
     return T_BASE;
+}
+
+static void print_manifest(const Manifest *m) {
+    printf("model:   %s (%s), %llu layers, %llu experts (%llu used/token)\n",
+           m->model, m->architecture, m->n_layer, m->expert_count,
+           m->expert_used);
+    printf("params:  %.2fB total, %.2fB active\n", m->total_params / 1e9,
+           m->active_params / 1e9);
+    printf("bytes/token: attention %.1f MB, base %.1f MB, routed %.1f MB "
+           "(%llu experts x %.2f MB)\n",
+           m->attention_bytes / 1e6, m->base_bytes / 1e6,
+           m->routed_bytes / 1e6, m->expert_used, m->expert_bytes / 1e6);
+    printf("weights: %.2f GB on disk, kv cache %.1f KB per context token\n",
+           m->total_bytes / 1e9, m->kv_bytes_per_ctx_token / 1e3);
+}
+
+static void write_manifest_json(FILE *out, const Manifest *m) {
+    Json j;
+    json_begin(&j, out);
+    json_u64(&j, "schema", 1);
+    json_string(&j, "model", m->model);
+    json_string(&j, "source", m->source);
+    json_string(&j, "variant", m->variant);
+    json_string(&j, "architecture", m->architecture);
+    json_u64(&j, "total_params", m->total_params);
+    json_u64(&j, "active_params", m->active_params);
+    json_u64(&j, "n_layer", m->n_layer);
+    json_open(&j, "components", 0);
+    json_open(&j, "attention", 0);
+    json_u64(&j, "bytes_per_token", m->attention_bytes);
+    json_string(&j, "pattern", "deterministic");
+    json_close(&j);
+    json_open(&j, "base", 0);
+    json_u64(&j, "bytes_per_token", m->base_bytes);
+    json_string(&j, "pattern", "deterministic");
+    json_close(&j);
+    json_open(&j, "experts", 0);
+    json_u64(&j, "count", m->expert_count);
+    json_u64(&j, "used_per_token", m->expert_used);
+    json_u64(&j, "bytes_each", m->expert_bytes);
+    json_u64(&j, "bytes_per_token", m->routed_bytes);
+    json_string(&j, "pattern", "stochastic");
+    json_close(&j);
+    json_close(&j);
+    json_open(&j, "kv_cache", 0);
+    json_u64(&j, "bytes_per_context_token", m->kv_bytes_per_ctx_token);
+    json_close(&j);
+    json_open(&j, "hash_routed_layers", 1);
+    json_close(&j);
+    json_u64(&j, "mtp_head", (unsigned long long)m->mtp_head);
+    json_open(&j, "variants", 1);
+    json_string(&j, NULL, "full-weight");
+    json_close(&j);
+    json_end(&j);
+}
+
+static double jnum(const JVal *obj, const char *key, int *ok) {
+    const JVal *v = json_get(obj, key);
+    if (!v || v->kind != JV_NUM) {
+        *ok = 0;
+        return 0;
+    }
+    return v->num;
+}
+
+static void jstr(const JVal *obj, const char *key, char *out, size_t outsz) {
+    const JVal *v = json_get(obj, key);
+    out[0] = '\0';
+    if (v && v->kind == JV_STR) snprintf(out, outsz, "%s", v->str);
+}
+
+int manifest_load(const char *path, Manifest *m, char *err, size_t errsz) {
+    char *text = json_read_file(path, err, errsz);
+    if (!text) return 0;
+    JVal *root = json_parse(text, err, errsz);
+    free(text);
+    if (!root) return 0;
+
+    memset(m, 0, sizeof *m);
+    int ok = 1;
+    jstr(root, "model", m->model, sizeof m->model);
+    jstr(root, "source", m->source, sizeof m->source);
+    jstr(root, "variant", m->variant, sizeof m->variant);
+    jstr(root, "architecture", m->architecture, sizeof m->architecture);
+    m->total_params = (unsigned long long)jnum(root, "total_params", &ok);
+    m->active_params = (unsigned long long)jnum(root, "active_params", &ok);
+    m->n_layer = (unsigned long long)jnum(root, "n_layer", &ok);
+    m->mtp_head = (int)jnum(root, "mtp_head", &ok);
+
+    const JVal *comp = json_get(root, "components");
+    const JVal *att = comp ? json_get(comp, "attention") : NULL;
+    const JVal *base = comp ? json_get(comp, "base") : NULL;
+    const JVal *exp = comp ? json_get(comp, "experts") : NULL;
+    const JVal *kv = json_get(root, "kv_cache");
+    if (!att || !base || !exp || !kv) ok = 0;
+    if (ok) {
+        m->attention_bytes = (unsigned long long)jnum(att, "bytes_per_token", &ok);
+        m->base_bytes = (unsigned long long)jnum(base, "bytes_per_token", &ok);
+        m->expert_count = (unsigned long long)jnum(exp, "count", &ok);
+        m->expert_used = (unsigned long long)jnum(exp, "used_per_token", &ok);
+        m->expert_bytes = (unsigned long long)jnum(exp, "bytes_each", &ok);
+        m->routed_bytes = (unsigned long long)jnum(exp, "bytes_per_token", &ok);
+        m->kv_bytes_per_ctx_token =
+            (unsigned long long)jnum(kv, "bytes_per_context_token", &ok);
+    }
+    json_free(root);
+    if (!ok) {
+        snprintf(err, errsz, "%.200s: missing or bad manifest fields", path);
+        return 0;
+    }
+    return 1;
 }
 
 static const char *default_out_path(void) {
@@ -289,65 +401,35 @@ int manifest_main(int argc, char **argv) {
         return 1;
     }
 
+    Manifest info = {0};
+    snprintf(info.model, sizeof info.model, "%s", model_name);
+    snprintf(info.source, sizeof info.source, "%s", gguf_path);
+    snprintf(info.variant, sizeof info.variant, "full-weight");
+    snprintf(info.architecture, sizeof info.architecture, "%s", arch);
+    info.total_params = total_params;
+    info.active_params = active_params;
+    info.n_layer = n_layer;
+    info.total_bytes = total_bytes;
+    info.attention_bytes = attention_bytes;
+    info.base_bytes = base_bytes;
+    info.expert_count = n_expert;
+    info.expert_used = n_expert_used;
+    info.expert_bytes = expert_bytes_each;
+    info.routed_bytes = routed_per_token;
+    info.kv_bytes_per_ctx_token = kv_bytes_per_ctx_token;
+
     FILE *out = fopen(out_path, "w");
     if (!out) {
         perror(out_path);
         return 1;
     }
-    Json j;
-    json_begin(&j, out);
-    json_u64(&j, "schema", 1);
-    json_string(&j, "model", model_name);
-    json_string(&j, "source", gguf_path);
-    json_string(&j, "variant", "full-weight");
-    json_string(&j, "architecture", arch);
-    json_u64(&j, "total_params", total_params);
-    json_u64(&j, "active_params", active_params);
-    json_u64(&j, "n_layer", n_layer);
-    json_open(&j, "components", 0);
-    {
-        json_open(&j, "attention", 0);
-        json_u64(&j, "bytes_per_token", attention_bytes);
-        json_string(&j, "pattern", "deterministic");
-        json_close(&j);
-        json_open(&j, "base", 0);
-        json_u64(&j, "bytes_per_token", base_bytes);
-        json_string(&j, "pattern", "deterministic");
-        json_close(&j);
-        json_open(&j, "experts", 0);
-        json_u64(&j, "count", n_expert);
-        json_u64(&j, "used_per_token", n_expert_used);
-        json_u64(&j, "bytes_each", expert_bytes_each);
-        json_u64(&j, "bytes_per_token", routed_per_token);
-        json_string(&j, "pattern", "stochastic");
-        json_close(&j);
-    }
-    json_close(&j);
-    json_open(&j, "kv_cache", 0);
-    json_u64(&j, "bytes_per_context_token", kv_bytes_per_ctx_token);
-    json_close(&j);
-    json_open(&j, "hash_routed_layers", 1);
-    json_close(&j);
-    json_u64(&j, "mtp_head", 0);
-    json_open(&j, "variants", 1);
-    json_string(&j, NULL, "full-weight");
-    json_close(&j);
-    json_end(&j);
+    write_manifest_json(out, &info);
     if (fclose(out)) {
         perror(out_path);
         return 1;
     }
 
-    printf("model:   %s (%s), %llu layers, %llu experts (%llu used/token)\n",
-           model_name, arch, n_layer, n_expert, n_expert_used);
-    printf("params:  %.2fB total, %.2fB active\n", total_params / 1e9,
-           active_params / 1e9);
-    printf("bytes/token: attention %.1f MB, base %.1f MB, routed %.1f MB "
-           "(%llu experts x %.2f MB)\n",
-           attention_bytes / 1e6, base_bytes / 1e6, routed_per_token / 1e6,
-           n_expert_used, expert_bytes_each / 1e6);
-    printf("weights: %.2f GB on disk, kv cache %.1f KB per context token\n",
-           total_bytes / 1e9, kv_bytes_per_ctx_token / 1e3);
+    print_manifest(&info);
     printf("wrote %s\n", out_path);
 
     free(tensors);
