@@ -41,6 +41,9 @@ struct ThreadPool {
     void *state;
     _Atomic unsigned epoch;
     _Atomic int stopping;
+
+    pthread_mutex_t park_lock;
+    pthread_cond_t wakeup;
 };
 
 #define CORES_MAX 256
@@ -113,6 +116,39 @@ static void spin(int *spins) {
     *spins = 0;
 }
 
+static int pool_woken(const ThreadPool *pool, unsigned seen) {
+    return atomic_load_explicit(&pool->epoch, memory_order_acquire) != seen ||
+           atomic_load_explicit(&pool->stopping, memory_order_acquire);
+}
+
+/* Blocks until there is an epoch past `seen`, or the pool is stopping. The
+   lock is what makes the sleep safe: a waker bumps the epoch and then takes
+   it, so a worker that re-reads the epoch while holding it either sees the
+   new one or is already waiting to be signalled. */
+static void park(ThreadPool *pool, unsigned seen) {
+    pthread_mutex_lock(&pool->park_lock);
+    while (!pool_woken(pool, seen))
+        pthread_cond_wait(&pool->wakeup, &pool->park_lock);
+    pthread_mutex_unlock(&pool->park_lock);
+}
+
+static void wake_parked(ThreadPool *pool) {
+    pthread_mutex_lock(&pool->park_lock);
+    pthread_cond_broadcast(&pool->wakeup);
+    pthread_mutex_unlock(&pool->park_lock);
+}
+
+static unsigned await_epoch(ThreadPool *pool, unsigned seen) {
+    int spins = 0, yields = 0;
+    while (!pool_woken(pool, seen)) {
+        if (++spins < SPINS_BEFORE_YIELD) continue;
+        spins = 0;
+        if (++yields < YIELDS_BEFORE_PARK) sched_yield();
+        else park(pool, seen);
+    }
+    return atomic_load_explicit(&pool->epoch, memory_order_acquire);
+}
+
 static void *pool_worker(void *arg) {
     Worker *worker = arg;
     ThreadPool *pool = worker->pool;
@@ -120,17 +156,10 @@ static void *pool_worker(void *arg) {
 
     pin_to_cpu(worker->cpu);
     for (;;) {
-        int spins = 0;
-        unsigned epoch;
-        while ((epoch = atomic_load_explicit(&pool->epoch,
-                                             memory_order_acquire)) == seen) {
-            if (atomic_load_explicit(&pool->stopping, memory_order_acquire))
-                return NULL;
-            spin(&spins);
-        }
-        seen = epoch;
+        unsigned epoch = await_epoch(pool, seen);
         if (atomic_load_explicit(&pool->stopping, memory_order_acquire))
             return NULL;
+        seen = epoch;
 
         pool->fn(pool->state, worker->index, pool->n_workers);
         atomic_store_explicit(&worker->finished_epoch, epoch,
@@ -146,6 +175,8 @@ ThreadPool *pool_start(int n_workers) {
     pool->n_workers = n_workers;
     atomic_init(&pool->epoch, 0);
     atomic_init(&pool->stopping, 0);
+    pthread_mutex_init(&pool->park_lock, NULL);
+    pthread_cond_init(&pool->wakeup, NULL);
 
     int cpus[CORES_MAX];
     int n_cores = physical_cores(cpus, CORES_MAX);
@@ -187,6 +218,7 @@ void pool_run(ThreadPool *pool, ParallelFn fn, void *state) {
     pool->state = state;
     unsigned epoch =
         atomic_fetch_add_explicit(&pool->epoch, 1, memory_order_release) + 1;
+    wake_parked(pool);
 
     fn(state, 0, pool->n_workers);
 
@@ -202,9 +234,12 @@ void pool_stop(ThreadPool *pool) {
     if (!pool) return;
     atomic_store_explicit(&pool->stopping, 1, memory_order_release);
     atomic_fetch_add_explicit(&pool->epoch, 1, memory_order_release);
+    wake_parked(pool);
     if (pool->threads)
         for (int i = 0; i < pool->n_workers - 1; i++)
             pthread_join(pool->threads[i], NULL);
+    pthread_cond_destroy(&pool->wakeup);
+    pthread_mutex_destroy(&pool->park_lock);
     free(pool->threads);
     free(pool->workers);
     free(pool);
