@@ -1,6 +1,5 @@
 #include "home.h"
 #include "modules.h"
-#include "strategy.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,32 +40,18 @@ static int run_end_to_end(const char *model) {
         rc = manifest_main(2, manifest_argv);
         if (rc) return rc;
     }
-    if (have_cached("plan.json")) {
-        Plan plan;
-        char err[256];
-        if (plan_load(&plan, geode_home("plan.json"), err, sizeof err)) {
-            double predicted[2];
-            char note[256];
-            if (strategy_choose(&plan, predicted, note, sizeof note)) {
-                printf("%s\n", note);
-                if (predicted[1] > 0)
-                    printf("predict:  %.1f-%.1f tok/s decode\n", predicted[0],
-                           predicted[1]);
-            }
-        }
-    } else {
-        char *planner_argv[1];
-        planner_argv[0] = "geode planner";
+    if (!have_cached("plan.json")) {
+        char *planner_argv[] = {"geode planner"};
         rc = planner_main(1, planner_argv);
         if (rc) return rc;
     }
-    return exec_cli((char *) model);
+    return exec_cli(model);
 }
 
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage:\n"
-            "  %s MODEL.gguf         probe -> manifest -> planner on a model\n"
+            "  %s MODEL.gguf         probe -> manifest -> planner, then chat\n"
             "  %s                    latest plan on the cached model\n"
             "  %s plan [opts]        same, with planner opts\n"
             "                        (--context N --batch N --out plan.json)\n"

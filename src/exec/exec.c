@@ -21,6 +21,11 @@
 /* PROMPT, N_PREDICT, THREADS. */
 #define MAX_OPTIONS 3
 
+#define CLI_CONTEXT_TOKENS 4096
+#define CLI_REPLY_TOKENS 256
+#define CLI_LINE_MAX 4096
+#define CLI_QUIT "q"
+
 typedef struct {
     const char *prompt;
     int n_predict;
@@ -131,30 +136,74 @@ static int argmax(const float *values, int n) {
     return best;
 }
 
-/* Prefills the prompt, then samples greedily until the model emits its end
-   token or the budget runs out, printing tokens as they arrive. */
-static void stream_tokens(const Strategy *strategy, Runtime *runtime,
-                          const Model *model, const Tokenizer *tokenizer,
-                          const int *ids, int n_prompt, int n_predict) {
+typedef struct {
+    Plan plan;
+    const Strategy *strategy;
+    Model model;
+    Tokenizer tokenizer;
+} Session;
+
+static int session_open(Session *session, const GgufFile *g, char *err,
+                        size_t errsz) {
+    char plan_err[256];
+    int planned = plan_load(&session->plan, geode_home("plan.json"), plan_err,
+                            sizeof plan_err);
+
+    double predicted[2];
+    char note[256];
+    session->strategy =
+        strategy_choose(&session->plan, predicted, note, sizeof note);
+    if (!session->strategy) {
+        snprintf(err, errsz, "%s", note);
+        return 0;
+    }
+
+    if (planned) plan_print(&session->plan);
+    else printf("plan:     none (%s)\n", plan_err);
+    printf("%s\n", note);
+    if (predicted[1] > 0)
+        printf("predict:  %.1f-%.1f tok/s decode\n", predicted[0], predicted[1]);
+
+    if (!model_load(&session->model, g, err, errsz)) return 0;
+    if (!tokenizer_init(&session->tokenizer, g, err, errsz)) {
+        model_free(&session->model);
+        return 0;
+    }
+    return 1;
+}
+
+static void session_close(Session *session) {
+    tokenizer_free(&session->tokenizer);
+    model_free(&session->model);
+}
+
+/* Prefills the prompt at `position`, samples greedily until the model emits
+   its end token or the budget runs out, and returns the position past the
+   last token cached -- where the next prompt has to start, since the cache
+   holds no gaps. */
+static int stream_tokens(const Session *session, Runtime *runtime,
+                         const int *ids, int n_prompt, int position,
+                         int n_predict) {
+    const Strategy *strategy = session->strategy;
     double started = now_seconds();
     const float *logits = NULL;
     for (int i = 0; i < n_prompt; i += PREFILL_CHUNK) {
         int n = n_prompt - i;
         if (n > PREFILL_CHUNK) n = PREFILL_CHUNK;
-        logits = strategy->forward(runtime, ids + i, i, n);
+        logits = strategy->forward(runtime, ids + i, position + i, n);
     }
     double prefilled = now_seconds();
 
     int generated = 0;
     for (int i = 0; i < n_predict; i++) {
-        int token = argmax(logits, model->n_vocab);
-        if (token == tokenizer->eos_id) break;
+        int token = argmax(logits, session->model.n_vocab);
+        if (token == session->tokenizer.eos_id) break;
         char text[512];
-        tokenizer_decode(tokenizer, &token, 1, text, sizeof text);
+        tokenizer_decode(&session->tokenizer, &token, 1, text, sizeof text);
         printf("%s", text);
         fflush(stdout);
         generated++;
-        logits = strategy->forward(runtime, &token, n_prompt + i, 1);
+        logits = strategy->forward(runtime, &token, position + n_prompt + i, 1);
     }
     double finished = now_seconds();
 
@@ -164,44 +213,21 @@ static void stream_tokens(const Strategy *strategy, Runtime *runtime,
     if (generated > 0)
         printf("decode:  %d tokens in %.2fs (%.2f tok/s)\n", generated,
                finished - prefilled, generated / (finished - prefilled));
+
+    return position + n_prompt + generated;
 }
 
 static int generate(const GgufFile *g, const RunArgs *args) {
     char err[256];
-    Plan plan;
-    int planned = plan_load(&plan, geode_home("plan.json"), err, sizeof err);
-    if (!planned) plan_default(&plan);
-
-    double predicted[2];
-    char note[256];
-    const Strategy *strategy =
-        strategy_choose(&plan, predicted, note, sizeof note);
-    if (!strategy) {
-        fprintf(stderr, "%s\n", note);
-        return 1;
-    }
-
-    if (planned) plan_print(&plan);
-    else printf("plan:     none (%s)\n", err);
-    printf("%s\n", note);
-    if (predicted[1] > 0)
-        printf("predict:  %.1f-%.1f tok/s decode\n", predicted[0], predicted[1]);
-
-    Model model;
-    if (!model_load(&model, g, err, sizeof err)) {
+    Session session;
+    if (!session_open(&session, g, err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
-        return 1;
-    }
-    Tokenizer tokenizer;
-    if (!tokenizer_init(&tokenizer, g, err, sizeof err)) {
-        fprintf(stderr, "%s\n", err);
-        model_free(&model);
         return 1;
     }
 
     int ids[PROMPT_TOKENS_MAX];
-    int n_prompt = tokenizer_encode_prompt(&tokenizer, args->prompt, ids,
-                                           PROMPT_TOKENS_MAX);
+    int n_prompt = tokenizer_encode_prompt(&session.tokenizer, args->prompt,
+                                           ids, PROMPT_TOKENS_MAX);
     int rc = 1;
     if (n_prompt < 1) {
         fprintf(stderr, "prompt encoded to %d tokens; expected at least 1\n",
@@ -211,23 +237,22 @@ static int generate(const GgufFile *g, const RunArgs *args) {
             fprintf(stderr, "warning: prompt truncated to %d tokens\n",
                     n_prompt);
 
-        Runtime *runtime =
-            strategy->start(&model, &plan, n_prompt + args->n_predict,
-                            args->n_threads, err, sizeof err);
+        Runtime *runtime = session.strategy->start(
+            &session.model, &session.plan, n_prompt + args->n_predict,
+            args->n_threads, err, sizeof err);
         if (!runtime) {
             fprintf(stderr, "%s\n", err);
         } else {
             printf("%s", args->prompt);
             fflush(stdout);
-            stream_tokens(strategy, runtime, &model, &tokenizer, ids, n_prompt,
+            stream_tokens(&session, runtime, ids, n_prompt, 0,
                           args->n_predict);
-            strategy->stop(runtime);
+            session.strategy->stop(runtime);
             rc = 0;
         }
     }
 
-    tokenizer_free(&tokenizer);
-    model_free(&model);
+    session_close(&session);
     return rc;
 }
 
@@ -313,8 +338,23 @@ int exec_main(int argc, char **argv) {
     return rc;
 }
 
-int exec_cli(char *path){
+/* One line of input without its newline, or NULL at end of input. A line
+   wider than the buffer is refused rather than half-read into a turn. */
+static const char *read_turn(char *line, int max) {
+    if (!fgets(line, max, stdin)) return NULL;
+    int n = (int)strcspn(line, "\n");
+    if (line[n] == '\n') {
+        line[n] = '\0';
+        return line;
+    }
+    int c;
+    while ((c = fgetc(stdin)) != '\n' && c != EOF) {}
+    fprintf(stderr, "line over %d bytes; send a shorter one\n", max - 1);
+    line[0] = '\0';
+    return line;
+}
 
+int exec_cli(const char *path) {
     char err[256];
     GgufFile g;
     if (!gguf_open(&g, path, err, sizeof err)) {
@@ -322,20 +362,59 @@ int exec_cli(char *path){
         return 1;
     }
 
-    RunArgs args = {"", DEFAULT_PREDICT_TOKENS, 0};
-    
-    int convo = 1;
-    printf("Talk To Your Model On Your Machine\n\n\n\n");
-    while (convo){
-        char msg[PROMPT_TOKENS_MAX];
-        printf("> ");
-        scanf("%s", msg);
-         
-        if (!strcmp(msg, "q")) {
-            printf("\nQuitting...\n");
-            convo=0;
-        }
+    Session session;
+    if (!session_open(&session, &g, err, sizeof err)) {
+        fprintf(stderr, "%s\n", err);
+        gguf_close(&g);
+        return 1;
     }
 
+    Runtime *runtime =
+        session.strategy->start(&session.model, &session.plan,
+                                CLI_CONTEXT_TOKENS, 0, err, sizeof err);
+    if (!runtime) {
+        fprintf(stderr, "%s\n", err);
+        session_close(&session);
+        gguf_close(&g);
+        return 1;
+    }
+
+    printf("\ntalk to your model on your machine\n"
+           "%d token context, %d token replies, '%s' quits\n",
+           CLI_CONTEXT_TOKENS, CLI_REPLY_TOKENS, CLI_QUIT);
+
+    int ids[PROMPT_TOKENS_MAX];
+    int position = 0;
+    for (;;) {
+        char line[CLI_LINE_MAX];
+        printf("\n> ");
+        fflush(stdout);
+        const char *turn = read_turn(line, sizeof line);
+        if (!turn || strcmp(turn, CLI_QUIT) == 0) break;
+        if (!turn[0]) continue;
+
+        /* The leading token opens the conversation, not every turn in it. */
+        int n_turn = position == 0
+                         ? tokenizer_encode_prompt(&session.tokenizer, turn,
+                                                   ids, PROMPT_TOKENS_MAX)
+                         : tokenizer_encode(&session.tokenizer, turn, ids,
+                                            PROMPT_TOKENS_MAX);
+        if (n_turn < 1) {
+            fprintf(stderr, "that encoded to no tokens; send some text\n");
+            continue;
+        }
+        if (position + n_turn + CLI_REPLY_TOKENS > CLI_CONTEXT_TOKENS) {
+            fprintf(stderr,
+                    "context full at %d of %d tokens; '%s' and start again\n",
+                    position, CLI_CONTEXT_TOKENS, CLI_QUIT);
+            continue;
+        }
+        position = stream_tokens(&session, runtime, ids, n_turn, position,
+                                 CLI_REPLY_TOKENS);
+    }
+
+    session.strategy->stop(runtime);
+    session_close(&session);
+    gguf_close(&g);
     return 0;
 }
