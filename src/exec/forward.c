@@ -41,7 +41,7 @@ struct Runtime {
     int max_tokens;
 
     uint16_t *cache;
-    float *cache_row;
+    float *cache_block;
     float *cos_sin;
 
     float *residual;
@@ -92,6 +92,18 @@ static const void *matrix_at(const GgufTensor *tensor, int index) {
 static uint16_t *cache_slot(Runtime *runtime, int layer, int position) {
     return runtime->cache +
            ((size_t)layer * runtime->n_ctx + position) * runtime->cache_width;
+}
+
+/* Rounded up so a pass over the cache in blocks of CACHE_ROWS never stops
+   short, and never leaves the buffers either -- n_ctx is rounded the same way
+   at startup, so the last block of the last chunk is still allocated. */
+static int cache_rows(int n_cached) {
+    return (n_cached + CACHE_ROWS - 1) / CACHE_ROWS * CACHE_ROWS;
+}
+
+static float *score_row(Runtime *runtime, int head, int token, int n_tokens) {
+    return runtime->scores +
+           ((size_t)head * n_tokens + token) * runtime->n_ctx;
 }
 
 typedef struct {
@@ -159,8 +171,11 @@ typedef struct {
    positions costs more than every weight in the layer; a chunk divides that
    read again by its width.
 
-   A token attends to its own position and no further, so a cache row written
-   by a later token of the same chunk is skipped rather than masked. */
+   Both passes take CACHE_ROWS rows at a time, which is what keeps the cost per
+   cached position from being set by loads rather than by arithmetic. A block
+   runs whole: a token attends to its own position and no further, but rather
+   than stop the block short, softmax leaves the rows past a token's position
+   zeroed so that folding them in adds nothing. */
 static void attention_worker(void *state, int worker, int n_workers) {
     const AttentionJob *job = state;
     Runtime *runtime = job->runtime;
@@ -169,8 +184,9 @@ static void attention_worker(void *state, int worker, int n_workers) {
     int n_tokens = job->n_tokens;
     int query_width = model->n_head * model->head_dim_k;
     int latent_width = model->n_head * rank;
-    float *cache_row =
-        runtime->cache_row + (size_t)worker * runtime->cache_width;
+    int n_rows = cache_rows(job->n_cached);
+    int width = runtime->cache_width;
+    float *block = runtime->cache_block + (size_t)worker * CACHE_ROWS * width;
     void *scratch =
         runtime->head_scratch + (size_t)worker * runtime->head_scratch_bytes;
 
@@ -192,49 +208,52 @@ static void attention_worker(void *state, int worker, int n_workers) {
                job->layer->k_b->type, model->qk_nope_dim, 0, rank, &nope);
     }
 
-    for (int p = 0; p < job->n_cached; p++) {
-        int first = p - job->position > 0 ? p - job->position : 0;
-        expand_fp16(cache_row, cache_slot(runtime, job->layer_index, p),
-                    runtime->cache_width);
+    for (int p = 0; p < n_rows; p += CACHE_ROWS) {
+        for (int r = 0; r < CACHE_ROWS; r++)
+            expand_fp16(block + (size_t)r * width,
+                        cache_slot(runtime, job->layer_index, p + r), width);
         for (int head = head_begin; head < head_end; head++)
-            for (int t = first; t < n_tokens; t++) {
-                float score =
-                    dot_f32(cache_row,
-                            runtime->query_latent + (size_t)t * latent_width +
-                                (size_t)head * rank,
-                            rank) +
-                    dot_f32(cache_row + rank,
-                            runtime->query + (size_t)t * query_width +
-                                (size_t)head * model->head_dim_k +
-                                model->qk_nope_dim,
-                            model->qk_rope_dim);
-                runtime->scores[((size_t)head * n_tokens + t) * runtime->n_ctx +
-                                p] = score * model->kq_scale;
+            for (int t = 0; t < n_tokens; t++) {
+                float latent[CACHE_ROWS], rotary[CACHE_ROWS];
+                dot_f32_rows(latent, block, width,
+                             runtime->query_latent + (size_t)t * latent_width +
+                                 (size_t)head * rank,
+                             rank);
+                dot_f32_rows(rotary, block + rank, width,
+                             runtime->query + (size_t)t * query_width +
+                                 (size_t)head * model->head_dim_k +
+                                 model->qk_nope_dim,
+                             model->qk_rope_dim);
+                float *row = score_row(runtime, head, t, n_tokens) + p;
+                for (int r = 0; r < CACHE_ROWS; r++)
+                    row[r] = (latent[r] + rotary[r]) * model->kq_scale;
             }
     }
 
     for (int head = head_begin; head < head_end; head++)
         for (int t = 0; t < n_tokens; t++) {
-            softmax(runtime->scores +
-                        ((size_t)head * n_tokens + t) * runtime->n_ctx,
-                    job->position + t + 1);
+            float *row = score_row(runtime, head, t, n_tokens);
+            int attended = job->position + t + 1;
+            softmax(row, attended);
+            memset(row + attended, 0,
+                   (size_t)(n_rows - attended) * sizeof *row);
             memset(runtime->attn_latent + (size_t)t * latent_width +
                        (size_t)head * rank,
                    0, (size_t)rank * sizeof *runtime->attn_latent);
         }
 
-    for (int p = 0; p < job->n_cached; p++) {
-        int first = p - job->position > 0 ? p - job->position : 0;
-        expand_fp16(cache_row, cache_slot(runtime, job->layer_index, p), rank);
+    for (int p = 0; p < n_rows; p += CACHE_ROWS) {
+        for (int r = 0; r < CACHE_ROWS; r++)
+            expand_fp16(block + (size_t)r * width,
+                        cache_slot(runtime, job->layer_index, p + r), rank);
         for (int head = head_begin; head < head_end; head++)
-            for (int t = first; t < n_tokens; t++)
-                add_scaled(runtime->attn_latent + (size_t)t * latent_width +
-                               (size_t)head * rank,
-                           cache_row,
-                           runtime->scores[((size_t)head * n_tokens + t) *
-                                               runtime->n_ctx +
-                                           p],
-                           rank);
+            for (int t = 0; t < n_tokens; t++)
+                add_scaled_rows(runtime->attn_latent +
+                                    (size_t)t * latent_width +
+                                    (size_t)head * rank,
+                                block, width,
+                                score_row(runtime, head, t, n_tokens) + p,
+                                rank);
     }
 
     for (int head = head_begin; head < head_end; head++) {
@@ -598,7 +617,9 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
         return NULL;
     }
     runtime->model = model;
-    runtime->n_ctx = n_ctx;
+    /* Every buffer indexed by position is sized to a whole number of blocks, so
+       the cache passes can run the block a chunk ends inside of to its end. */
+    runtime->n_ctx = n_ctx = cache_rows(n_ctx);
     runtime->cache_width = model->kv_lora_rank + model->qk_rope_dim;
     runtime->max_tokens = n_ctx < PREFILL_CHUNK ? n_ctx : PREFILL_CHUNK;
     rope_init(&runtime->rope, model->rope_freq_base, model->rope_freq_scale,
@@ -681,8 +702,8 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     runtime->cache = calloc(cache_elements, sizeof *runtime->cache);
     if (!runtime->cache) ok = 0;
 
-    runtime->cache_row =
-        alloc_floats((size_t)n_workers * runtime->cache_width, &ok);
+    runtime->cache_block = alloc_floats(
+        (size_t)n_workers * CACHE_ROWS * runtime->cache_width, &ok);
     runtime->cos_sin =
         alloc_floats((size_t)max_tokens * model->qk_rope_dim, &ok);
     runtime->residual = alloc_floats((size_t)max_tokens * model->n_embd, &ok);
@@ -723,7 +744,7 @@ void runtime_stop(Runtime *runtime) {
     if (!runtime) return;
     pool_stop(runtime->pool);
     free(runtime->cache);
-    free(runtime->cache_row);
+    free(runtime->cache_block);
     free(runtime->cos_sin);
     free(runtime->residual);
     free(runtime->normed);

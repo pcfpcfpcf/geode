@@ -659,6 +659,75 @@ dot_f32_avx2(const float *a, const float *b, int n) {
     return sum;
 }
 
+/* Two accumulators per row rather than four: eight chains already cover the fma
+   latency, and the rows themselves supply the independence a single dot has to
+   find by splitting its own. */
+__attribute__((target("avx2,fma,f16c"))) static void
+dot_f32_rows_avx2(float *out, const float *rows, size_t stride, const float *b,
+                  int n) {
+    const float *r0 = rows, *r1 = rows + stride, *r2 = rows + 2 * stride,
+                *r3 = rows + 3 * stride;
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    __m256 c0 = a0, c1 = a0, c2 = a0, c3 = a0;
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 x = _mm256_loadu_ps(b + i);
+        __m256 y = _mm256_loadu_ps(b + i + 8);
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + i), x, a0);
+        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + i + 8), y, c0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + i), x, a1);
+        c1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + i + 8), y, c1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + i), x, a2);
+        c2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + i + 8), y, c2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + i), x, a3);
+        c3 = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + i + 8), y, c3);
+    }
+    for (; i + 8 <= n; i += 8) {
+        __m256 x = _mm256_loadu_ps(b + i);
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + i), x, a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + i), x, a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + i), x, a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + i), x, a3);
+    }
+    out[0] = hsum256(_mm256_add_ps(a0, c0));
+    out[1] = hsum256(_mm256_add_ps(a1, c1));
+    out[2] = hsum256(_mm256_add_ps(a2, c2));
+    out[3] = hsum256(_mm256_add_ps(a3, c3));
+    for (; i < n; i++)
+        for (int r = 0; r < CACHE_ROWS; r++)
+            out[r] += rows[(size_t)r * stride + i] * b[i];
+}
+
+/* The four rows fold into two sums that meet at the store, so no chain is
+   longer than two: summing them one after another into dst would serialize all
+   four behind each other. */
+__attribute__((target("avx2,fma,f16c"))) static void
+add_scaled_rows_avx2(float *dst, const float *rows, size_t stride,
+                     const float *scales, int n) {
+    const float *r0 = rows, *r1 = rows + stride, *r2 = rows + 2 * stride,
+                *r3 = rows + 3 * stride;
+    __m256 s0 = _mm256_set1_ps(scales[0]), s1 = _mm256_set1_ps(scales[1]),
+           s2 = _mm256_set1_ps(scales[2]), s3 = _mm256_set1_ps(scales[3]);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 x = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + i), s0,
+                                   _mm256_loadu_ps(dst + i));
+        __m256 y = _mm256_mul_ps(_mm256_loadu_ps(r1 + i), s1);
+        __m256 z = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + i + 8), s0,
+                                   _mm256_loadu_ps(dst + i + 8));
+        __m256 w = _mm256_mul_ps(_mm256_loadu_ps(r1 + i + 8), s1);
+        x = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + i), s2, x);
+        y = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + i), s3, y);
+        z = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + i + 8), s2, z);
+        w = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + i + 8), s3, w);
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(x, y));
+        _mm256_storeu_ps(dst + i + 8, _mm256_add_ps(z, w));
+    }
+    for (; i < n; i++)
+        for (int r = 0; r < CACHE_ROWS; r++)
+            dst[i] += rows[(size_t)r * stride + i] * scales[r];
+}
+
 __attribute__((target("avx2,fma,f16c"))) static void
 add_scaled_avx2(float *dst, const float *src, float scale, int n) {
     __m256 w = _mm256_set1_ps(scale);
@@ -1027,6 +1096,30 @@ float dot_f32(const float *a, const float *b, int n) {
     float acc = 0;
     for (int i = 0; i < n; i++) acc += a[i] * b[i];
     return acc;
+}
+
+void dot_f32_rows(float *out, const float *rows, size_t stride, const float *b,
+                  int n) {
+#ifdef HAVE_AVX2
+    if (have_avx2()) {
+        dot_f32_rows_avx2(out, rows, stride, b, n);
+        return;
+    }
+#endif
+    for (int r = 0; r < CACHE_ROWS; r++)
+        out[r] = dot_f32(rows + (size_t)r * stride, b, n);
+}
+
+void add_scaled_rows(float *dst, const float *rows, size_t stride,
+                     const float *scales, int n) {
+#ifdef HAVE_AVX2
+    if (have_avx2()) {
+        add_scaled_rows_avx2(dst, rows, stride, scales, n);
+        return;
+    }
+#endif
+    for (int r = 0; r < CACHE_ROWS; r++)
+        add_scaled(dst, rows + (size_t)r * stride, scales[r], n);
 }
 
 void expand_fp16(float *dst, const uint16_t *values, int n) {

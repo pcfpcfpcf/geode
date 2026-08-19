@@ -75,4 +75,14 @@ void add_scaled(float *dst, const float *src, float scale, int n);
 void expand_fp16(float *dst, const uint16_t *values, int n);
 float dot_f32(const float *a, const float *b, int n);
 
+/* The same two over CACHE_ROWS rows of a matrix at once, `stride` floats apart.
+   One row at a time loads `b` -- or reloads and rewrites `dst` -- once per
+   multiply, which at these widths costs more than the multiply; a block of rows
+   spends those loads once and reuses them, and needs no extra memory to do it. */
+#define CACHE_ROWS 4
+void dot_f32_rows(float *out, const float *rows, size_t stride, const float *b,
+                  int n);
+void add_scaled_rows(float *dst, const float *rows, size_t stride,
+                     const float *scales, int n);
+
 #endif
