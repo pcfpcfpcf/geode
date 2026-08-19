@@ -9,20 +9,10 @@
 #include <string.h>
 #include <unistd.h>
 
-/* One feed-forward applied to a set of the chunk's tokens, whose output is
-   summed into each of their results: a dense block is a single branch of
-   weight 1 over every token, an expert block is one branch per expert that any
-   token routed to, plus the shared one over every token. They all read the
-   same inputs and none reads another's output, so every branch's gate and up
-   rows are one parallel region and every branch's down rows are a second --
-   three regions per expert block however many experts the chunk touched.
-
-   Regrouping the chunk by expert is what makes a routed layer affordable: a
-   token reads four experts, but four tokens rarely read four *different*
-   experts, so one sweep of the expert stack per chunk beats one per token.
-   `token_begin` is where the branch's tokens start in the concatenated token
-   list, and its rows start at the same place in the gate/up/activated
-   buffers. */
+/* Regrouping the chunk by expert is what makes a routed layer affordable: four
+   tokens rarely read four *different* experts, so one sweep of the stack per
+   chunk beats one per token. `token_begin` indexes both the concatenated token
+   list and the gate/up/activated rows. */
 typedef struct {
     const FeedForward *ffn;
     int matrix_index;
@@ -67,12 +57,8 @@ struct Runtime {
     int *chosen;
     float *chosen_weight;
 
-    /* The normed activations feed the attention and expert matrices, the
-       activated ones feed the down matrices, and the head outputs feed the
-       output projection -- each quantized once for the whole chunk and read by
-       every row of every matrix that wants it. `head_scratch` is per worker
-       instead, because the per-head matrices are run inside a parallel region
-       rather than across one. */
+    /* `head_scratch` is per worker rather than per chunk: the per-head matrices
+       run inside a parallel region rather than across one. */
     ActivationBatch normed_batch;
     ActivationBatch *branch_activations;
     ActivationBatch heads_batch;
@@ -94,9 +80,6 @@ static uint16_t *cache_slot(Runtime *runtime, int layer, int position) {
            ((size_t)layer * runtime->n_ctx + position) * runtime->cache_width;
 }
 
-/* Rounded up so a pass over the cache in blocks of CACHE_ROWS never stops
-   short, and never leaves the buffers either -- n_ctx is rounded the same way
-   at startup, so the last block of the last chunk is still allocated. */
 static int cache_rows(int n_cached) {
     return (n_cached + CACHE_ROWS - 1) / CACHE_ROWS * CACHE_ROWS;
 }
@@ -124,9 +107,8 @@ static void matmul_worker(void *state, int worker, int n_workers) {
            end, job->x);
 }
 
-/* Takes the input already quantized, because the matrices that read the same
-   chunk -- q and kv_a from the attention norm, the router and the expert
-   branches from the feed-forward norm -- would otherwise each pay for it. */
+/* Input arrives quantized: the matrices reading the same chunk would each
+   otherwise pay for it. */
 static void run_matmul(Runtime *runtime, float *out, size_t out_stride,
                        const GgufTensor *tensor, int matrix_index,
                        const ActivationBatch *x) {
@@ -161,21 +143,11 @@ typedef struct {
     int n_cached;
 } AttentionJob;
 
-/* One worker owns whole heads, so scoring, softmax, the weighted sum over the
-   cache and the value projection all run without a barrier between them.
-
-   Under MLA every head reads the same cache rows, so the two passes over the
-   cache are the outer loops and the worker's heads and the chunk's tokens the
-   inner ones. Walking the cache once per head instead multiplies the read --
-   and the fp16 expansion -- by the head count, which at a few thousand
-   positions costs more than every weight in the layer; a chunk divides that
-   read again by its width.
-
-   Both passes take CACHE_ROWS rows at a time, which is what keeps the cost per
-   cached position from being set by loads rather than by arithmetic. A block
-   runs whole: a token attends to its own position and no further, but rather
-   than stop the block short, softmax leaves the rows past a token's position
-   zeroed so that folding them in adds nothing. */
+/* Cache passes outer, heads inner: walking per head would multiply the fp16
+   expansion by the head count. Splitting them by data instead -- scoring by
+   position, folding by latent column -- costs 14% of decode at 900 and at 2300
+   positions, so the read stays repeated per worker. Softmax zeroes the rows
+   past a token's position, which is what lets a block run whole. */
 static void attention_worker(void *state, int worker, int n_workers) {
     const AttentionJob *job = state;
     Runtime *runtime = job->runtime;
@@ -310,17 +282,9 @@ static int branch_width(const Branch *branch) {
     return (int)branch->ffn->gate->dims[1];
 }
 
-/* Lays the branches end to end and returns the work they occupy in total,
-   which is the space the expand region divides between workers. Work is rows
-   times tokens rather than rows alone: the shared expert takes every token of
-   the chunk while a routed expert often takes one, so splitting rows evenly
-   would leave whichever worker landed on the shared branch doing many times
-   what the others do.
-
-   Rows times tokens is also exactly how many floats the branch occupies in the
-   gate/up/activated buffers, so one running total places it in both. Branch
-   widths are not assumed equal -- a model with several shared experts makes
-   that branch wider than the routed ones. */
+/* Work is rows times tokens, not rows: the shared expert takes every token while
+   a routed one often takes one, so splitting rows evenly would overload whoever
+   landed on the shared branch. The product is also the branch's float count. */
 static long long branch_layout(Branch *branches, int n_branches) {
     long long work = 0;
     size_t scratch = 0;
@@ -334,9 +298,8 @@ static long long branch_layout(Branch *branches, int n_branches) {
     return work;
 }
 
-/* The branch's own view of the chunk: the same quantized vectors, indexed by
-   the tokens that routed to it. The input batch covers the whole chunk in
-   order, which is what makes a token list an index into it. */
+/* The input batch covers the chunk in order, which is what makes a token list an
+   index into it. */
 static void branch_input(ActivationBatch *batch, const ActivationBatch *input,
                          const Runtime *runtime, const Branch *branch) {
     *batch = *input;
@@ -351,10 +314,8 @@ typedef struct {
     const ActivationBatch *x;
 } ExpandJob;
 
-/* A worker takes a slice of the concatenated work space and runs whichever
-   branches it lands in, so the last branch is never left to one thread while
-   the rest wait at a barrier. Gate and up share the slice, which lets the
-   swiglu happen here rather than in a pass of its own. */
+/* Slicing the concatenated work space rather than the branches keeps the last
+   branch off one thread while the rest wait. */
 static void expand_worker(void *state, int worker, int n_workers) {
     const ExpandJob *job = state;
     Runtime *runtime = job->runtime;
@@ -394,11 +355,8 @@ typedef struct {
     int n_tokens;
 } ContractJob;
 
-/* Every branch projects back onto the same n_embd output, so here a worker
-   owns output rows instead: it walks all the branches and sums each one into
-   the rows it owns of the tokens that routed to it, and the mixture needs no
-   reduction afterwards. Workers own disjoint columns, so two branches sharing
-   a token never collide. */
+/* Workers own disjoint output columns, so two branches sharing a token never
+   collide and the mixture needs no reduction. */
 static void contract_worker(void *state, int worker, int n_workers) {
     const ContractJob *job = state;
     Runtime *runtime = job->runtime;
@@ -494,9 +452,6 @@ static void add_branch_token(Runtime *runtime, int flat, int token,
     runtime->branch_weights[flat] = weight;
 }
 
-/* Ranks every token's experts, then inverts the mapping so that each expert
-   appears once with the list of tokens that chose it. An expert no token chose
-   gets no branch and its weights are never read. */
 static int select_branches(Runtime *runtime, const Layer *layer, int n_tokens) {
     const Model *model = runtime->model;
     int used = model->n_expert_used;
@@ -582,9 +537,8 @@ const float *forward(Runtime *runtime, const int *tokens, int position,
                        runtime->projected + (size_t)t * n_embd, 1.0f, n_embd);
     }
 
-    /* Only the last token of a chunk is ever sampled, and the output matrix is
-       the widest in the model -- projecting the whole chunk would cost more
-       than the layers that produced it. */
+    /* Only the last token is sampled, and the output matrix is the widest in the
+       model -- projecting the whole chunk would cost more than the layers did. */
     rmsnorm(runtime->normed,
             runtime->residual + (size_t)(n_tokens - 1) * n_embd,
             model->output_norm->data, n_embd, model->rms_eps);
@@ -617,8 +571,8 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
         return NULL;
     }
     runtime->model = model;
-    /* Every buffer indexed by position is sized to a whole number of blocks, so
-       the cache passes can run the block a chunk ends inside of to its end. */
+    /* Every position-indexed buffer holds a whole number of blocks, so a cache
+       pass can run the block a chunk ends inside of to its end. */
     runtime->n_ctx = n_ctx = cache_rows(n_ctx);
     runtime->cache_width = model->kv_lora_rank + model->qk_rope_dim;
     runtime->max_tokens = n_ctx < PREFILL_CHUNK ? n_ctx : PREFILL_CHUNK;
@@ -637,18 +591,15 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     int max_tokens = runtime->max_tokens;
     int n_workers = pool_workers(runtime->pool);
 
-    /* A chunk can touch every expert at once, so the branch array is sized for
-       the whole stack rather than for one token's picks. */
+    /* A chunk can touch every expert at once, not just one token's picks. */
     int n_branches = model->n_expert + model->n_expert_shared;
     if (n_branches < 1) n_branches = 1;
     int per_token = model->n_expert_used + model->n_expert_shared;
     if (per_token < 1) per_token = 1;
     int flat_tokens = max_tokens * per_token;
 
-    /* The gate/up/activated buffers hold every branch of a block at once, so
-       they are sized for whichever block concatenates to the most rows: one
-       chunk through the widest dense block, or one chunk through every expert
-       it can route to. */
+    /* Sized for whichever block concatenates to the most rows: a chunk through
+       the widest dense block, or through every expert it can route to. */
     int inner = model->n_ff;
     if (per_token * model->n_ff_expert > inner)
         inner = per_token * model->n_ff_expert;
@@ -657,9 +608,8 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     int ok = 1;
     runtime->normed_scratch =
         alloc_bytes(activation_bytes(model->n_embd, max_tokens), &ok);
-    /* Every branch quantizes its own rows, so the routed branches together
-       cost one block set per (token, expert) however the tokens split between
-       them, and the shared branch one more per token. */
+    /* Every branch quantizes its own rows: one block set per (token, expert)
+       however the tokens split, plus one per token for the shared branch. */
     runtime->activated_scratch = alloc_bytes(
         larger(activation_bytes(model->n_ff, max_tokens),
                activation_bytes(model->n_ff_expert,

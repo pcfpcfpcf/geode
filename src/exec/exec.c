@@ -6,6 +6,7 @@
 #include "modules.h"
 #include "plan.h"
 #include "quant.h"
+#include "sampler.h"
 #include "selftest.h"
 #include "strategy.h"
 #include "tokenizer.h"
@@ -26,6 +27,12 @@
 #define CLI_REPLY_TOKENS 256
 #define CLI_LINE_MAX 4096
 #define CLI_QUIT "q"
+
+/* Seeded rather than clocked, so a run still reproduces exactly. */
+#define SAMPLER_TEMPERATURE 0.7f
+#define SAMPLER_TOP_P 0.9f
+#define SAMPLER_REPETITION_PENALTY 1.1f
+#define SAMPLER_SEED 0x9E3779B97F4A7C15ull
 
 typedef struct {
     const char *prompt;
@@ -130,19 +137,13 @@ static double now_seconds(void) {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-static int argmax(const float *values, int n) {
-    int best = 0;
-    for (int i = 1; i < n; i++)
-        if (values[i] > values[best]) best = i;
-    return best;
-}
-
 typedef struct {
     Plan plan;
     const Strategy *strategy;
     Model model;
     Tokenizer tokenizer;
     Chat chat;
+    Sampler sampler;
     int has_chat;
 } Session;
 
@@ -173,6 +174,8 @@ static int session_open(Session *session, const GgufFile *g, char *err,
         return 0;
     }
     session->has_chat = chat_init(&session->chat, &session->tokenizer);
+    sampler_init(&session->sampler, SAMPLER_TEMPERATURE, SAMPLER_TOP_P,
+                 SAMPLER_REPETITION_PENALTY, SAMPLER_SEED);
     return 1;
 }
 
@@ -181,16 +184,16 @@ static void session_close(Session *session) {
     model_free(&session->model);
 }
 
-/* Prefills the prompt at `position`, samples greedily until the model emits
-   its end token or the budget runs out, and returns the position past the
-   last token cached -- where the next prompt has to start, since the cache
-   holds no gaps. */
-static int stream_tokens(const Session *session, Runtime *runtime,
-                         const int *ids, int n_prompt, int position,
-                         int n_predict) {
+/* Prefills the prompt at `position`, samples until the model emits its end
+   token or the budget runs out, and returns the position past the last token
+   cached -- where the next prompt has to start, since the cache holds no
+   gaps. */
+static int stream_tokens(Session *session, Runtime *runtime, const int *ids,
+                         int n_prompt, int position, int n_predict) {
     const Strategy *strategy = session->strategy;
     double started = now_seconds();
     const float *logits = NULL;
+    for (int i = 0; i < n_prompt; i++) sampler_note(&session->sampler, ids[i]);
     for (int i = 0; i < n_prompt; i += PREFILL_CHUNK) {
         int n = n_prompt - i;
         if (n > PREFILL_CHUNK) n = PREFILL_CHUNK;
@@ -201,8 +204,10 @@ static int stream_tokens(const Session *session, Runtime *runtime,
     int reply_end = session->has_chat ? session->chat.message_sep : -1;
     int generated = 0;
     for (int i = 0; i < n_predict; i++) {
-        int token = argmax(logits, session->model.n_vocab);
+        int token =
+            sampler_pick(&session->sampler, logits, session->model.n_vocab);
         if (token == session->tokenizer.eos_id || token == reply_end) break;
+        sampler_note(&session->sampler, token);
         char text[512];
         tokenizer_decode(&session->tokenizer, &token, 1, text, sizeof text);
         printf("%s", text);
