@@ -30,9 +30,12 @@ struct Runtime {
     int cache_width;
     int max_tokens;
 
-    uint16_t *cache;
+    uint8_t *cache;
+    float *cache_scale;
     float *cache_block;
     float *cos_sin;
+    int8_t *query_quants;
+    QuantizedQuery *query_scale;
 
     float *residual;
     float *normed;
@@ -75,9 +78,36 @@ static const void *matrix_at(const GgufTensor *tensor, int index) {
     return (const unsigned char *)tensor->data + (size_t)index * matrix_bytes;
 }
 
-static uint16_t *cache_slot(Runtime *runtime, int layer, int position) {
+/* A slot's latent and its rotary key are quantized apart: they are unrelated
+   projections, and one scale over both would cost whichever came out smaller
+   most of its eight bits. Their queries split the same way. */
+enum { SLOT_LATENT, SLOT_ROTARY, SLOT_SEGMENTS };
+
+static uint8_t *cache_slot(Runtime *runtime, int layer, int position) {
     return runtime->cache +
            ((size_t)layer * runtime->n_ctx + position) * runtime->cache_width;
+}
+
+static float *slot_scales(Runtime *runtime, int layer, int position) {
+    return runtime->cache_scale +
+           ((size_t)layer * runtime->n_ctx + position) * SLOT_SEGMENTS;
+}
+
+static int8_t *query_quants(Runtime *runtime, int token, int head) {
+    return runtime->query_quants +
+           ((size_t)token * runtime->model->n_head + head) *
+               runtime->cache_width;
+}
+
+static QuantizedQuery *query_scales(Runtime *runtime, int token, int head) {
+    return runtime->query_scale +
+           ((size_t)token * runtime->model->n_head + head) * SLOT_SEGMENTS;
+}
+
+/* An integer dot arrives with the bias the cache's unsigned quants put into it
+   and with neither operand's scale applied. */
+static float scaled_dot(int32_t dot, const QuantizedQuery *query, float scale) {
+    return ((float)dot - query->bias) * query->scale * scale;
 }
 
 static int cache_rows(int n_cached) {
@@ -143,11 +173,11 @@ typedef struct {
     int n_cached;
 } AttentionJob;
 
-/* Cache passes outer, heads inner: walking per head would multiply the fp16
-   expansion by the head count. Splitting them by data instead -- scoring by
-   position, folding by latent column -- costs 14% of decode at 900 and at 2300
-   positions, so the read stays repeated per worker. Softmax zeroes the rows
-   past a token's position, which is what lets a block run whole. */
+/* Cache passes outer, heads inner: the fold's expansion to floats would
+   otherwise be multiplied by the head count. Splitting them by data instead --
+   scoring by position, folding by latent column -- costs 14% of decode at 900
+   and at 2300 positions, so the read stays repeated per worker. Softmax zeroes
+   the rows past a token's position, which is what lets a block run whole. */
 static void attention_worker(void *state, int worker, int n_workers) {
     const AttentionJob *job = state;
     Runtime *runtime = job->runtime;
@@ -178,27 +208,42 @@ static void attention_worker(void *state, int worker, int n_workers) {
         matmul(runtime->query_latent + (size_t)head * rank,
                (size_t)latent_width, matrix_at(job->layer->k_b, head),
                job->layer->k_b->type, model->qk_nope_dim, 0, rank, &nope);
+
+        /* Once per head, then dotted against every cached position: what the
+           rounding costs is paid here and what it saves scales with context. */
+        for (int t = 0; t < n_tokens; t++) {
+            int8_t *quants = query_quants(runtime, t, head);
+            QuantizedQuery *quantized = query_scales(runtime, t, head);
+            quantize_query(&quantized[SLOT_LATENT], quants,
+                           runtime->query_latent + (size_t)t * latent_width +
+                               (size_t)head * rank,
+                           rank);
+            quantize_query(&quantized[SLOT_ROTARY], quants + rank,
+                           query + (size_t)t * query_width + model->qk_nope_dim,
+                           model->qk_rope_dim);
+        }
     }
 
     for (int p = 0; p < n_rows; p += CACHE_ROWS) {
-        for (int r = 0; r < CACHE_ROWS; r++)
-            expand_fp16(block + (size_t)r * width,
-                        cache_slot(runtime, job->layer_index, p + r), width);
+        const uint8_t *slot = cache_slot(runtime, job->layer_index, p);
+        const float *scales = slot_scales(runtime, job->layer_index, p);
         for (int head = head_begin; head < head_end; head++)
             for (int t = 0; t < n_tokens; t++) {
-                float latent[CACHE_ROWS], rotary[CACHE_ROWS];
-                dot_f32_rows(latent, block, width,
-                             runtime->query_latent + (size_t)t * latent_width +
-                                 (size_t)head * rank,
-                             rank);
-                dot_f32_rows(rotary, block + rank, width,
-                             runtime->query + (size_t)t * query_width +
-                                 (size_t)head * model->head_dim_k +
-                                 model->qk_nope_dim,
-                             model->qk_rope_dim);
+                const int8_t *quants = query_quants(runtime, t, head);
+                const QuantizedQuery *query = query_scales(runtime, t, head);
+                int32_t latent[CACHE_ROWS], rotary[CACHE_ROWS];
+                dot_int8_rows(latent, slot, width, quants, rank);
+                dot_int8_rows(rotary, slot + rank, width, quants + rank,
+                              model->qk_rope_dim);
                 float *row = score_row(runtime, head, t, n_tokens) + p;
-                for (int r = 0; r < CACHE_ROWS; r++)
-                    row[r] = (latent[r] + rotary[r]) * model->kq_scale;
+                for (int r = 0; r < CACHE_ROWS; r++) {
+                    const float *scale = scales + (size_t)r * SLOT_SEGMENTS;
+                    row[r] = (scaled_dot(latent[r], &query[SLOT_LATENT],
+                                         scale[SLOT_LATENT]) +
+                              scaled_dot(rotary[r], &query[SLOT_ROTARY],
+                                         scale[SLOT_ROTARY])) *
+                             model->kq_scale;
+                }
             }
     }
 
@@ -216,8 +261,11 @@ static void attention_worker(void *state, int worker, int n_workers) {
 
     for (int p = 0; p < n_rows; p += CACHE_ROWS) {
         for (int r = 0; r < CACHE_ROWS; r++)
-            expand_fp16(block + (size_t)r * width,
-                        cache_slot(runtime, job->layer_index, p + r), rank);
+            expand_int8(
+                block + (size_t)r * width,
+                cache_slot(runtime, job->layer_index, p + r),
+                slot_scales(runtime, job->layer_index, p + r)[SLOT_LATENT],
+                rank);
         for (int head = head_begin; head < head_end; head++)
             for (int t = 0; t < n_tokens; t++)
                 add_scaled_rows(runtime->attn_latent +
@@ -260,10 +308,11 @@ static void attention(Runtime *runtime, const Layer *layer, int layer_index,
                    runtime->cos_sin + (size_t)t * model->qk_rope_dim,
                    model->qk_rope_dim);
 
-        uint16_t *slot = cache_slot(runtime, layer_index, position + t);
-        for (int i = 0; i < rank; i++) slot[i] = fp32_to_fp16(normed[i]);
-        for (int i = 0; i < model->qk_rope_dim; i++)
-            slot[rank + i] = fp32_to_fp16(projected[rank + i]);
+        uint8_t *slot = cache_slot(runtime, layer_index, position + t);
+        float *scale = slot_scales(runtime, layer_index, position + t);
+        scale[SLOT_LATENT] = quantize_cache(slot, normed, rank);
+        scale[SLOT_ROTARY] = quantize_cache(slot + rank, projected + rank,
+                                            model->qk_rope_dim);
     }
 
     AttentionJob job = {runtime,  layer,    layer_index,
@@ -647,10 +696,19 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
         if (!runtime->chosen || !runtime->chosen_weight) ok = 0;
     }
 
-    size_t cache_elements = (size_t)model->n_layer * n_ctx *
-                            runtime->cache_width;
-    runtime->cache = calloc(cache_elements, sizeof *runtime->cache);
-    if (!runtime->cache) ok = 0;
+    size_t slots = (size_t)model->n_layer * n_ctx;
+    size_t cache_bytes = slots * (runtime->cache_width +
+                                  SLOT_SEGMENTS * sizeof(float));
+    runtime->cache = alloc_bytes(slots * runtime->cache_width, &ok);
+    runtime->cache_scale = alloc_floats(slots * SLOT_SEGMENTS, &ok);
+
+    runtime->query_quants =
+        calloc((size_t)max_tokens * model->n_head * runtime->cache_width,
+               sizeof *runtime->query_quants);
+    runtime->query_scale =
+        calloc((size_t)max_tokens * model->n_head * SLOT_SEGMENTS,
+               sizeof *runtime->query_scale);
+    if (!runtime->query_quants || !runtime->query_scale) ok = 0;
 
     runtime->cache_block = alloc_floats(
         (size_t)n_workers * CACHE_ROWS * runtime->cache_width, &ok);
@@ -683,7 +741,7 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     if (!ok) {
         snprintf(err, errsz,
                  "out of memory for %d-token context (kv cache needs %.2f GB)",
-                 n_ctx, cache_elements * sizeof *runtime->cache / 1e9);
+                 n_ctx, cache_bytes / 1e9);
         runtime_stop(runtime);
         return NULL;
     }
@@ -694,8 +752,11 @@ void runtime_stop(Runtime *runtime) {
     if (!runtime) return;
     pool_stop(runtime->pool);
     free(runtime->cache);
+    free(runtime->cache_scale);
     free(runtime->cache_block);
     free(runtime->cos_sin);
+    free(runtime->query_quants);
+    free(runtime->query_scale);
     free(runtime->residual);
     free(runtime->normed);
     free(runtime->query);

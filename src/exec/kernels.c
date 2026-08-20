@@ -622,13 +622,20 @@ gemv_q50_q8_avx2(float *out, const void *rows, size_t stride, int row_begin,
 }
 
 __attribute__((target("avx2,fma,f16c"))) static void
-expand_fp16_avx2(float *dst, const uint16_t *values, int n) {
+expand_int8_avx2(float *dst, const uint8_t *quants, float scale, int n) {
+    __m256 factor = _mm256_set1_ps(scale);
+    __m256i bias = _mm256_set1_epi32(CACHE_QUANT_BIAS);
     int i = 0;
-    for (; i + 8 <= n; i += 8)
+    for (; i + 8 <= n; i += 8) {
+        __m256i q = _mm256_cvtepu8_epi32(
+            _mm_loadl_epi64((const __m128i *)(quants + i)));
         _mm256_storeu_ps(
             dst + i,
-            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(values + i))));
-    for (; i < n; i++) dst[i] = fp16_to_fp32(values[i]);
+            _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_sub_epi32(q, bias)), factor));
+    }
+    for (; i < n; i++)
+        dst[i] = (float)((int)quants[i] - CACHE_QUANT_BIAS) * scale;
 }
 
 /* Four accumulators rather than one: a single chain retires at fma latency and
@@ -657,45 +664,6 @@ dot_f32_avx2(const float *a, const float *b, int n) {
                                       _mm256_add_ps(acc2, acc3)));
     for (; i < n; i++) sum += a[i] * b[i];
     return sum;
-}
-
-/* Two accumulators per row rather than four: eight chains already cover the fma
-   latency, and the rows themselves supply the independence a single dot has to
-   find by splitting its own. */
-__attribute__((target("avx2,fma,f16c"))) static void
-dot_f32_rows_avx2(float *out, const float *rows, size_t stride, const float *b,
-                  int n) {
-    const float *r0 = rows, *r1 = rows + stride, *r2 = rows + 2 * stride,
-                *r3 = rows + 3 * stride;
-    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
-    __m256 c0 = a0, c1 = a0, c2 = a0, c3 = a0;
-    int i = 0;
-    for (; i + 16 <= n; i += 16) {
-        __m256 x = _mm256_loadu_ps(b + i);
-        __m256 y = _mm256_loadu_ps(b + i + 8);
-        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + i), x, a0);
-        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + i + 8), y, c0);
-        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + i), x, a1);
-        c1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + i + 8), y, c1);
-        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + i), x, a2);
-        c2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + i + 8), y, c2);
-        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + i), x, a3);
-        c3 = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + i + 8), y, c3);
-    }
-    for (; i + 8 <= n; i += 8) {
-        __m256 x = _mm256_loadu_ps(b + i);
-        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + i), x, a0);
-        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + i), x, a1);
-        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + i), x, a2);
-        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + i), x, a3);
-    }
-    out[0] = hsum256(_mm256_add_ps(a0, c0));
-    out[1] = hsum256(_mm256_add_ps(a1, c1));
-    out[2] = hsum256(_mm256_add_ps(a2, c2));
-    out[3] = hsum256(_mm256_add_ps(a3, c3));
-    for (; i < n; i++)
-        for (int r = 0; r < CACHE_ROWS; r++)
-            out[r] += rows[(size_t)r * stride + i] * b[i];
 }
 
 /* The four rows fold into two sums that meet at the store, so no chain is
@@ -747,6 +715,52 @@ hsum256i(__m256i v) {
     lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0x4E));
     lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0xB1));
     return _mm_cvtsi128_si32(lo);
+}
+
+/* One accumulator per row, where the float path needed two: VPMADDUBSW already
+   folds 32 products into 16 before anything is accumulated, so a row's chain
+   is a quarter as long to begin with and the four rows supply the rest of the
+   independence. The bias the unsigned quants carry is left in the result --
+   the caller subtracts it once, against the query's sum, rather than 32 times
+   here. */
+__attribute__((target("avx2,fma,f16c"))) static void
+dot_int8_rows_avx2(int32_t *out, const uint8_t *rows, size_t stride,
+                   const int8_t *query, int n) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    const uint8_t *r0 = rows, *r1 = rows + stride, *r2 = rows + 2 * stride,
+                  *r3 = rows + 3 * stride;
+    __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(query + i));
+        a0 = _mm256_add_epi32(
+            a0, _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(
+                        _mm256_loadu_si256((const __m256i *)(r0 + i)), x),
+                    ones));
+        a1 = _mm256_add_epi32(
+            a1, _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(
+                        _mm256_loadu_si256((const __m256i *)(r1 + i)), x),
+                    ones));
+        a2 = _mm256_add_epi32(
+            a2, _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(
+                        _mm256_loadu_si256((const __m256i *)(r2 + i)), x),
+                    ones));
+        a3 = _mm256_add_epi32(
+            a3, _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(
+                        _mm256_loadu_si256((const __m256i *)(r3 + i)), x),
+                    ones));
+    }
+    out[0] = hsum256i(a0);
+    out[1] = hsum256i(a1);
+    out[2] = hsum256i(a2);
+    out[3] = hsum256i(a3);
+    for (; i < n; i++)
+        for (int r = 0; r < CACHE_ROWS; r++)
+            out[r] += (int32_t)rows[(size_t)r * stride + i] * query[i];
 }
 
 /* Quantizes one block and returns its scale, or 0 when every value was zero
@@ -881,25 +895,47 @@ static RowTileQ8 row_tile_q8_kernel(unsigned type) {
     return NULL;
 }
 
-uint16_t fp32_to_fp16(float value) {
-    uint32_t bits;
-    memcpy(&bits, &value, 4);
-    uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((bits >> 23) & 0xff) - 127 + 15;
-    uint32_t man = bits & 0x7fffffu;
+static float largest_magnitude(const float *values, int n) {
+    float largest = 0;
+    for (int i = 0; i < n; i++)
+        if (fabsf(values[i]) > largest) largest = fabsf(values[i]);
+    return largest;
+}
 
-    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        man |= 0x800000u;
-        uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t sub = man >> shift;
-        if ((man >> (shift - 1)) & 1) sub++;
-        return (uint16_t)(sign | sub);
+/* Symmetric around zero and then biased, so a quant is the signed one shifted
+   rather than a second encoding: dequantizing is one subtract either way, and
+   scoring gets the unsigned operand it needs without a second copy. */
+float quantize_cache(uint8_t *quants, const float *values, int n) {
+    float largest = largest_magnitude(values, n);
+    if (largest == 0) {
+        memset(quants, CACHE_QUANT_BIAS, (size_t)n);
+        return 0;
     }
-    uint16_t half = (uint16_t)(sign | ((uint32_t)exp << 10) | (man >> 13));
-    if (man & 0x1000u) half++;
-    return half;
+    float inverse_scale = 127.0f / largest;
+    for (int i = 0; i < n; i++)
+        quants[i] =
+            (uint8_t)(lrintf(inverse_scale * values[i]) + CACHE_QUANT_BIAS);
+    return 1.0f / inverse_scale;
+}
+
+void quantize_query(QuantizedQuery *query, int8_t *quants, const float *values,
+                    int n) {
+    float largest = largest_magnitude(values, n);
+    if (largest == 0) {
+        memset(quants, 0, (size_t)n);
+        query->scale = 0;
+        query->bias = 0;
+        return;
+    }
+    float inverse_scale = QUERY_QUANT_MAX / largest;
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        int quant = (int)lrintf(inverse_scale * values[i]);
+        quants[i] = (int8_t)quant;
+        sum += quant;
+    }
+    query->scale = 1.0f / inverse_scale;
+    query->bias = (float)(CACHE_QUANT_BIAS * sum);
 }
 
 static int activation_blocks(int n) { return (n + QK_K - 1) / QK_K; }
@@ -1098,16 +1134,20 @@ float dot_f32(const float *a, const float *b, int n) {
     return acc;
 }
 
-void dot_f32_rows(float *out, const float *rows, size_t stride, const float *b,
-                  int n) {
+void dot_int8_rows(int32_t *out, const uint8_t *rows, size_t stride,
+                   const int8_t *query, int n) {
 #ifdef HAVE_AVX2
     if (have_avx2()) {
-        dot_f32_rows_avx2(out, rows, stride, b, n);
+        dot_int8_rows_avx2(out, rows, stride, query, n);
         return;
     }
 #endif
-    for (int r = 0; r < CACHE_ROWS; r++)
-        out[r] = dot_f32(rows + (size_t)r * stride, b, n);
+    for (int r = 0; r < CACHE_ROWS; r++) {
+        const uint8_t *row = rows + (size_t)r * stride;
+        int32_t sum = 0;
+        for (int i = 0; i < n; i++) sum += (int32_t)row[i] * query[i];
+        out[r] = sum;
+    }
 }
 
 void add_scaled_rows(float *dst, const float *rows, size_t stride,
@@ -1122,14 +1162,15 @@ void add_scaled_rows(float *dst, const float *rows, size_t stride,
         add_scaled(dst, rows + (size_t)r * stride, scales[r], n);
 }
 
-void expand_fp16(float *dst, const uint16_t *values, int n) {
+void expand_int8(float *dst, const uint8_t *quants, float scale, int n) {
 #ifdef HAVE_AVX2
     if (have_avx2()) {
-        expand_fp16_avx2(dst, values, n);
+        expand_int8_avx2(dst, quants, scale, n);
         return;
     }
 #endif
-    for (int i = 0; i < n; i++) dst[i] = fp16_to_fp32(values[i]);
+    for (int i = 0; i < n; i++)
+        dst[i] = (float)((int)quants[i] - CACHE_QUANT_BIAS) * scale;
 }
 
 static float corr_dim(int n_dims, int orig_ctx, float n_rot, float base) {

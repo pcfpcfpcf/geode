@@ -27,7 +27,6 @@ void rope_position(float *cos_sin, const RopeConfig *rope, int position);
 void rope_apply(float *vec, const float *cos_sin, int n_dims);
 
 float fp16_to_fp32(uint16_t half);
-uint16_t fp32_to_fp16(float value);
 
 /* A chunk of activation vectors quantized to int8 together, so the cost is
    paid once and every row of the weight matrix reuses all of them. One
@@ -68,20 +67,47 @@ void softmax(float *values, int n);
 void swiglu(float *out, const float *gate, const float *up, int n);
 void add_scaled(float *dst, const float *src, float scale, int n);
 
-/* The latent kv cache is stored as fp16 and every attention head reads the
-   same rows, so a row is expanded to floats once and then scored and folded
-   back in fp32: converting inside each head made the conversion, not the
-   arithmetic, scale with head count. */
-void expand_fp16(float *dst, const uint16_t *values, int n);
 float dot_f32(const float *a, const float *b, int n);
 
-/* The same two over CACHE_ROWS rows of a matrix at once, `stride` floats apart.
-   One row at a time loads `b` -- or reloads and rewrites `dst` -- once per
-   multiply, which at these widths costs more than the multiply; a block of rows
-   spends those loads once and reuses them, and needs no extra memory to do it. */
+/* The latent kv cache is stored quantized: eight bits and a scale per segment
+   of a slot. Its quants are biased to unsigned because that is the operand
+   pairing VPMADDUBSW wants -- 32 multiply-accumulates an instruction against 8
+   for float fma -- and scoring, whose other operand is a query it can quantize
+   too, reads them straight and pays no expansion at all.
+
+   The fold has no such path: it weights rows by the softmax, not by a
+   quantized vector, and the latent it walks is contiguous in rank rather than
+   in position. So it expands a row to floats once per block and reuses it
+   across heads, the way scoring used to. */
+#define CACHE_QUANT_BIAS 128
+
+/* Returns the scale, or 0 when every value was zero. */
+float quantize_cache(uint8_t *quants, const float *values, int n);
+void expand_int8(float *dst, const uint8_t *quants, float scale, int n);
+
+/* A query quantized to dot against those slots. The query is what gives up a
+   bit rather than the cache: VPMADDUBSW sums two products into an int16, and
+   2 * 255 * 63 fits where 2 * 255 * 127 saturates. */
+#define QUERY_QUANT_MAX 63
+
+typedef struct {
+    float scale;
+    /* What the cache's own bias contributes to every dot against this query --
+       CACHE_QUANT_BIAS times the sum of the quants -- taken back off each
+       result before it is scaled. */
+    float bias;
+} QuantizedQuery;
+
+void quantize_query(QuantizedQuery *query, int8_t *quants, const float *values,
+                    int n);
+
+/* CACHE_ROWS rows of a matrix at once, `stride` apart. One row at a time loads
+   the vector -- or reloads and rewrites `dst` -- once per multiply, which at
+   these widths costs more than the multiply; a block of rows spends those
+   loads once and reuses them, and needs no extra memory to do it. */
 #define CACHE_ROWS 4
-void dot_f32_rows(float *out, const float *rows, size_t stride, const float *b,
-                  int n);
+void dot_int8_rows(int32_t *out, const uint8_t *rows, size_t stride,
+                   const int8_t *query, int n);
 void add_scaled_rows(float *dst, const float *rows, size_t stride,
                      const float *scales, int n);
 
