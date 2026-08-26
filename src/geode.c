@@ -11,6 +11,18 @@ static int have_cached(const char *name) {
     return stat(geode_home(name), &st) == 0 && st.st_size > 0;
 }
 
+static void clean_cached(){
+    const char *cache[] = {"probe.json", "manifest.json", "plan.json"};
+    for (int i = 0; i<3; i++){
+        if (!have_cached(cache[i])){
+            printf("%s doesn't exist!\n", cache[i]);
+        } else{
+            remove(geode_home(cache[i]));
+            printf("%s deleted! \n", cache[i]);
+        }
+    }
+}
+
 static int run_cached_planner(const char *argv0, int nargs, char **args) {
     if (!have_cached("probe.json") || !have_cached("manifest.json")) {
         fprintf(stderr,
@@ -76,6 +88,10 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
         usage(argv[0]);
+        return 0;
+    }
+    if (strcmp(argv[1], "clean") == 0){
+        clean_cached();
         return 0;
     }
     if (argc != 2) {
