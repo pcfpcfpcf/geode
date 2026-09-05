@@ -41,21 +41,42 @@ void json_close(Json *j) {
     j->has_item[j->depth] = 1;
 }
 
+int json_escape(const char *text, char *out, int max) {
+    int n = 0;
+    for (const char *p = text; *p && n < max - 1; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') {
+            if (n + 2 >= max) break;
+            out[n++] = '\\';
+            out[n++] = (char)c;
+        } else if (c < 0x20) {
+            if (n + 6 >= max) break;
+            n += snprintf(out + n, max - n, "\\u%04x", c);
+        } else {
+            out[n++] = (char)c;
+        }
+    }
+    out[n] = '\0';
+    return n;
+}
+
 void json_string(Json *j, const char *key, const char *val) {
     json_putsep(j);
     json_key(j, key);
+    int cap = (int)strlen(val) * 6 + 1;
+    char *buf = malloc(cap);
     fputc('"', j->f);
-    for (const char *p = val; *p; p++) {
-        if (*p == '"' || *p == '\\') {
-            fputc('\\', j->f);
-            fputc(*p, j->f);
-        } else if ((unsigned char)*p < 0x20) {
-            fprintf(j->f, "\\u%04x", (unsigned char)*p);
-        } else {
-            fputc(*p, j->f);
-        }
-    }
+    json_escape(val, buf, cap);
+    fputs(buf, j->f);
     fputc('"', j->f);
+    free(buf);
+    j->has_item[j->depth] = 1;
+}
+
+void json_null(Json *j, const char *key) {
+    json_putsep(j);
+    json_key(j, key);
+    fputs("null", j->f);
     j->has_item[j->depth] = 1;
 }
 

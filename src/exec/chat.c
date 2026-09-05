@@ -37,8 +37,9 @@ static void close_message(Turn *turn) {
     put_token(turn, turn->chat->message_sep);
 }
 
-int chat_encode_turn(const Chat *chat, const Tokenizer *tokenizer,
-                     const char *text, int opening, int *ids, int max_ids) {
+int chat_encode_messages(const Chat *chat, const Tokenizer *tokenizer,
+                         const ChatMessage *messages, int n_messages,
+                         int opening, int *ids, int max_ids) {
     Turn turn = {chat, tokenizer, ids, 0, max_ids};
 
     /* Either way one message is left hanging: the empty system message that
@@ -50,9 +51,21 @@ int chat_encode_turn(const Chat *chat, const Tokenizer *tokenizer,
     }
     close_message(&turn);
 
-    open_message(&turn, "user");
-    put_text(&turn, text);
-    close_message(&turn);
+    for (int i = 0; i < n_messages; i++) {
+        open_message(&turn, messages[i].role);
+        put_text(&turn, messages[i].text);
+        close_message(&turn);
+    }
     open_message(&turn, "assistant");
     return turn.n;
+}
+
+int chat_encode_turn(const Chat *chat, const Tokenizer *tokenizer,
+                     const char *text, int opening, int *ids, int max_ids) {
+    ChatMessage messages[2];
+    int n = 0;
+    if (opening) messages[n++] = (ChatMessage){"system", ""};
+    messages[n++] = (ChatMessage){"user", text};
+    return chat_encode_messages(chat, tokenizer, messages, n, opening, ids,
+                                max_ids);
 }

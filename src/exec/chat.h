@@ -18,6 +18,17 @@ typedef struct {
    use the format above and nothing here would render a prompt it understands. */
 int chat_init(Chat *chat, const Tokenizer *tokenizer);
 
+typedef struct {
+    const char *role;
+    const char *text;
+} ChatMessage;
+
+/* The messages plus the opening of the reply, ready to prefill. `opening`
+   starts a fresh conversation rather than continuing the one in the cache. */
+int chat_encode_messages(const Chat *chat, const Tokenizer *tokenizer,
+                         const ChatMessage *messages, int n_messages,
+                         int opening, int *ids, int max_ids);
+
 /* One user message plus the opening of the reply, ready to prefill. `opening`
    starts a fresh conversation rather than continuing the one in the cache. */
 int chat_encode_turn(const Chat *chat, const Tokenizer *tokenizer,

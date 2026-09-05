@@ -12,6 +12,7 @@ GEODE_SRC = src/geode.c \
             src/exec/model.c src/exec/forward.c \
             src/exec/plan.c src/exec/strategy.c src/exec/cpu_stream.c \
             src/exec/chat.c src/exec/sampler.c \
+            src/exec/session.c src/exec/serve.c \
             src/exec/selftest.c src/exec/exec.c \
             src/common/json.c src/common/quant.c src/common/parallel.c
 

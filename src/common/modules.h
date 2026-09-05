@@ -6,6 +6,7 @@ int manifest_main(int argc, char **argv);
 int planner_main(int argc, char **argv);
 int exec_main(int argc, char **argv);
 int exec_cli(const char *path);
+int serve_main(int argc, char **argv);
 
 /* Which subcommands exec_main answers to, so the top-level dispatcher does not
    repeat their names. */

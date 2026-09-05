@@ -14,9 +14,14 @@ void json_begin(Json *j, FILE *f);
 void json_open(Json *j, const char *key, int as_array);
 void json_close(Json *j);
 void json_string(Json *j, const char *key, const char *val);
+void json_null(Json *j, const char *key);
 void json_u64(Json *j, const char *key, unsigned long long val);
 void json_double(Json *j, const char *key, double val);
 void json_end(Json *j);
+
+/* Writes `text` JSON-escaped into `out`, at most max bytes including the
+   terminating NUL, and returns the bytes written before it. */
+int json_escape(const char *text, char *out, int max);
 
 typedef enum { JV_NULL, JV_BOOL, JV_NUM, JV_STR, JV_ARR, JV_OBJ } JValKind;
 

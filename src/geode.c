@@ -70,9 +70,10 @@ static void usage(const char *argv0) {
             "  %s probe|manifest|planner [args...]   run one step\n"
             "  %s exec-run MODEL.gguf [PROMPT] [N]   generate, per the plan\n"
             "  %s exec MODEL.gguf                    exec commands and checks\n"
+            "  %s serve MODEL.gguf [PORT]            OpenAI-compatible API on 127.0.0.1\n"
             "\n"
             "cache: ~/.geode/probe.json, manifest.json, plan.json\n",
-            argv0, argv0, argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 int main(int argc, char **argv) {
@@ -84,6 +85,7 @@ int main(int argc, char **argv) {
         return manifest_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "planner") == 0)
         return planner_main(argc - 1, argv + 1);
+    if (strcmp(argv[1], "serve") == 0) return serve_main(argc - 1, argv + 1);
     if (exec_handles(argv[1])) return exec_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0) {
