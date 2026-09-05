@@ -33,6 +33,7 @@
 static const char *status_text(int status) {
     switch (status) {
     case 200: return "OK";
+    case 204: return "No Content";
     case 400: return "Bad Request";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
@@ -111,6 +112,7 @@ static void respond_json(int fd, int status, const char *body) {
     int n = snprintf(head, sizeof head,
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: application/json\r\n"
+                     "Access-Control-Allow-Origin: *\r\n"
                      "Content-Length: %zu\r\n"
                      "Connection: close\r\n"
                      "\r\n",
@@ -123,7 +125,22 @@ static void respond_sse(int fd) {
     static const char head[] =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
         "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    write_all(fd, head, sizeof head - 1);
+}
+
+/* The preflight a browser sends before a cross-origin POST. */
+static void respond_options(int fd) {
+    static const char head[] =
+        "HTTP/1.1 204 No Content\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Access-Control-Max-Age: 86400\r\n"
+        "Content-Length: 0\r\n"
         "Connection: close\r\n"
         "\r\n";
     write_all(fd, head, sizeof head - 1);
@@ -442,7 +459,10 @@ char headers[HEADERS_MAX];
     if (query) *query = '\0';
 
     int status;
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
+    if (strcmp(method, "OPTIONS") == 0) {
+        respond_options(fd);
+        status = 204;
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
         status = handle_models(fd, model_name, created);
     } else if (strcmp(method, "POST") == 0 &&
                strcmp(path, "/v1/chat/completions") == 0) {
