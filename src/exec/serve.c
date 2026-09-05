@@ -166,11 +166,21 @@ static int respond_error(int fd, int status, const char *type,
     return status;
 }
 
+static void timings(const StreamStats *stats, double *prefill, double *decode) {
+    *prefill = stats->prefill_seconds > 0
+                   ? stats->n_prompt / stats->prefill_seconds
+                   : 0;
+    *decode = stats->decode_seconds > 0
+                  ? stats->n_generated / stats->decode_seconds
+                  : 0;
+}
+
 /* One SSE event: a chat completion chunk, compact enough for the `data:`
-   line. `finish_json` is the quoted reason or NULL for an open chunk. */
+   line. `finish_json` is the quoted reason or NULL for an open chunk; `stats`
+   adds the measured rates to the chunk that closes the reply. */
 static int sse_chunk(char *out, int max, const char *id, long created,
                      const char *model, const char *role, const char *content,
-                     const char *finish_json) {
+                     const char *finish_json, const StreamStats *stats) {
     int n = snprintf(out, max,
                      "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
                      "\"created\":%ld,\"model\":\"",
@@ -187,8 +197,17 @@ static int sse_chunk(char *out, int max, const char *id, long created,
         n += json_escape(content, out + n, max - n);
         n += snprintf(out + n, max - n, "\"");
     }
-    n += snprintf(out + n, max - n, "},\"finish_reason\":%s}]}\n\n",
+    n += snprintf(out + n, max - n, "},\"finish_reason\":%s}]",
                   finish_json ? finish_json : "null");
+    if (stats) {
+        double prefill, decode;
+        timings(stats, &prefill, &decode);
+        n += snprintf(out + n, max - n,
+                      ",\"timings\":{\"prefill_tok_s\":%.1f,"
+                      "\"decode_tok_s\":%.1f}",
+                      prefill, decode);
+    }
+    n += snprintf(out + n, max - n, "}\n\n");
     return n;
 }
 
@@ -230,7 +249,7 @@ static int sse_sink(void *ctx, const char *text, int length) {
     content[length] = '\0';
     char buf[CHUNK_MAX];
     int n = sse_chunk(buf, sizeof buf, c->id, c->created, c->model, NULL,
-                      content, NULL);
+                      content, NULL, NULL);
     if (!write_all(c->fd, buf, n)) {
         c->failed = 1;
         return 1;
@@ -278,6 +297,12 @@ static int plain_reply(Session *session, Runtime *runtime,
     json_u64(&j, "total_tokens",
              (unsigned long long)(stats.n_prompt + stats.n_generated));
     json_close(&j);
+    double prefill, decode;
+    timings(&stats, &prefill, &decode);
+    json_open(&j, "timings", 0);
+    json_double(&j, "prefill_tok_s", prefill);
+    json_double(&j, "decode_tok_s", decode);
+    json_close(&j);
     json_end(&j);
     fclose(f);
 
@@ -296,7 +321,7 @@ static int stream_reply(Session *session, Runtime *runtime,
 
     char buf[CHUNK_MAX];
     int n = sse_chunk(buf, sizeof buf, id, created, model_name, "assistant",
-                      NULL, NULL);
+                      NULL, NULL, NULL);
     if (!write_all(fd, buf, n)) return 200;
 
     SseCtx ctx = {fd, id, created, model_name, 0};
@@ -306,7 +331,8 @@ static int stream_reply(Session *session, Runtime *runtime,
     if (!ctx.failed) {
         n = sse_chunk(buf, sizeof buf, id, created, model_name, NULL, NULL,
                       stats.n_generated == max_tokens ? FINISH_LENGTH
-                                                      : FINISH_STOP);
+                                                      : FINISH_STOP,
+                      &stats);
         if (write_all(fd, buf, n)) write_all(fd, "data: [DONE]\n\n", 15);
     }
     log_tokens(&stats);
