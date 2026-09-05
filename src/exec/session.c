@@ -64,12 +64,18 @@ int session_stream(Session *session, Runtime *runtime, const int *ids,
     }
     double prefilled = now_seconds();
 
+    /* A reply closes with the message separator; a role separator in the
+       middle of it means the model has started echoing the prompt template,
+       and letting it continue only spirals. */
     int reply_end = session->has_chat ? session->chat.message_sep : -1;
+    int role_end = session->has_chat ? session->chat.role_sep : -1;
     int generated = 0;
     for (int i = 0; i < n_predict; i++) {
         int token =
             sampler_pick(&session->sampler, logits, session->model.n_vocab);
-        if (token == session->tokenizer.eos_id || token == reply_end) break;
+        if (token == session->tokenizer.eos_id || token == reply_end ||
+            token == role_end)
+            break;
         sampler_note(&session->sampler, token);
         char text[512];
         tokenizer_decode(&session->tokenizer, &token, 1, text, sizeof text);
