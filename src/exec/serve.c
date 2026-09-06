@@ -4,6 +4,7 @@
 #include "session.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -18,6 +19,7 @@
 #include <unistd.h>
 
 #define DEFAULT_PORT 8080
+#define MAX_MODELS 8
 #define REQUEST_BODY_MAX (1 << 20)
 #define CONTEXT_TOKENS 4096
 #define REPLY_TOKENS_MAX 2048
@@ -241,6 +243,29 @@ typedef struct {
     int failed;
 } SseCtx;
 
+/* One model behind the API: its file, session, runtime and the name clients
+   use to pick it. */
+typedef struct {
+    const char *path;
+    GgufFile gguf;
+    Session session;
+    Runtime *runtime;
+    char name[256];
+    long created;
+} ServedModel;
+
+static ServedModel *find_model(ServedModel *served, int n_models,
+                               const char *wanted) {
+    if (!wanted || !wanted[0]) return n_models == 1 ? &served[0] : NULL;
+    for (int i = 0; i < n_models; i++) {
+        if (strcmp(served[i].name, wanted) == 0) return &served[i];
+        const char *base = strrchr(served[i].path, '/');
+        base = base ? base + 1 : served[i].path;
+        if (strcmp(base, wanted) == 0) return &served[i];
+    }
+    return NULL;
+}
+
 static int sse_sink(void *ctx, const char *text, int length) {
     SseCtx *c = ctx;
     char content[512];
@@ -339,7 +364,7 @@ static int stream_reply(Session *session, Runtime *runtime,
     return 200;
 }
 
-static int handle_models(int fd, const char *model_name, long created) {
+static int handle_models(int fd, ServedModel *served, int n_models) {
     char *body = NULL;
     size_t body_len = 0;
     FILE *f = open_memstream(&body, &body_len);
@@ -347,12 +372,14 @@ static int handle_models(int fd, const char *model_name, long created) {
     json_begin(&j, f);
     json_string(&j, "object", "list");
     json_open(&j, "data", 1);
-    json_open(&j, NULL, 0);
-    json_string(&j, "id", model_name);
-    json_string(&j, "object", "model");
-    json_u64(&j, "created", (unsigned long long)created);
-    json_string(&j, "owned_by", "geode");
-    json_close(&j);
+    for (int i = 0; i < n_models; i++) {
+        json_open(&j, NULL, 0);
+        json_string(&j, "id", served[i].name);
+        json_string(&j, "object", "model");
+        json_u64(&j, "created", (unsigned long long)served[i].created);
+        json_string(&j, "owned_by", "geode");
+        json_close(&j);
+    }
     json_close(&j);
     json_end(&j);
     fclose(f);
@@ -361,12 +388,28 @@ static int handle_models(int fd, const char *model_name, long created) {
     return 200;
 }
 
-static int handle_chat_completions(Session *session, Runtime *runtime,
-                                   const char *model_name, int fd,
-                                   const char *body) {
+static int handle_chat_completions(ServedModel *served, int n_models,
+                                   int fd, const char *body) {
     char err[256];
     JVal *req = json_parse(body, err, sizeof err);
     if (!req) return respond_error(fd, 400, "invalid_request_error", err);
+
+    const JVal *model_val = json_get(req, "model");
+    const char *wanted =
+        model_val && model_val->kind == JV_STR ? model_val->str : NULL;
+    ServedModel *m = find_model(served, n_models, wanted);
+    if (!m) {
+        char msg[512];
+        int n = snprintf(msg, sizeof msg, "unknown model '%s'; available:",
+                         wanted ? wanted : "");
+        for (int i = 0; i < n_models && n < (int)sizeof msg; i++)
+            n += snprintf(msg + n, sizeof msg - n, " %s", served[i].name);
+        json_free(req);
+        return respond_error(fd, 400, "invalid_request_error", msg);
+    }
+    Session *session = &m->session;
+    Runtime *runtime = m->runtime;
+    const char *model_name = m->name;
 
     const JVal *messages = json_get(req, "messages");
     if (!messages || messages->kind != JV_ARR || messages->n_items < 1) {
@@ -463,8 +506,7 @@ static int handle_chat_completions(Session *session, Runtime *runtime,
                        n_prompt, max_tokens);
 }
 
-static void handle_client(Session *session, Runtime *runtime,
-                          const char *model_name, long created, int fd) {
+static void handle_client(ServedModel *served, int n_models, int fd) {
 char headers[HEADERS_MAX];
     char body[REQUEST_BODY_MAX + 1];
     int body_len = 0;
@@ -489,11 +531,10 @@ char headers[HEADERS_MAX];
         respond_options(fd);
         status = 204;
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
-        status = handle_models(fd, model_name, created);
+        status = handle_models(fd, served, n_models);
     } else if (strcmp(method, "POST") == 0 &&
                strcmp(path, "/v1/chat/completions") == 0) {
-        status = handle_chat_completions(session, runtime, model_name, fd,
-                                         body);
+        status = handle_chat_completions(served, n_models, fd, body);
     } else {
         status = respond_error(fd, 404, "invalid_request_error",
                                "no such endpoint");
@@ -501,8 +542,7 @@ char headers[HEADERS_MAX];
     fprintf(stderr, "%s %s -> %d\n", method, path, status);
 }
 
-static int serve_loop(Session *session, Runtime *runtime,
-                      const char *model_name, long created, int port) {
+static int serve_loop(ServedModel *served, int n_models, int port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         fprintf(stderr, "socket: %s\n", strerror(errno));
@@ -529,9 +569,11 @@ static int serve_loop(Session *session, Runtime *runtime,
 
     signal(SIGPIPE, SIG_IGN);
 
-    printf("serving %s on http://127.0.0.1:%d/v1\n", model_name, port);
+    printf("serving %d model(s) on http://127.0.0.1:%d/v1\n", n_models, port);
+    for (int i = 0; i < n_models; i++)
+        printf("  %s\n", served[i].name);
     printf("  GET  /v1/models\n");
-    printf("  POST /v1/chat/completions\n");
+    printf("  POST /v1/chat/completions  (pick one with \"model\")\n");
     fflush(stdout);
 
     for (;;) {
@@ -541,7 +583,7 @@ static int serve_loop(Session *session, Runtime *runtime,
             fprintf(stderr, "accept: %s\n", strerror(errno));
             break;
         }
-        handle_client(session, runtime, model_name, created, client);
+        handle_client(served, n_models, client);
         close(client);
     }
     close(listen_fd);
@@ -550,74 +592,93 @@ static int serve_loop(Session *session, Runtime *runtime,
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s MODEL.gguf [PORT]\n"
-            "  open an OpenAI-compatible API on 127.0.0.1 (default port %d)\n",
+            "usage: %s MODEL.gguf [MODEL.gguf ...] [--port N]\n"
+            "  open an OpenAI-compatible API on 127.0.0.1 (default port %d);\n"
+            "  requests pick a model with the \"model\" field\n",
             argv0, DEFAULT_PORT);
 }
 
 int serve_main(int argc, char **argv) {
-    if (argc < 2 || argc > 3) {
+    int port = DEFAULT_PORT;
+    const char *models[MAX_MODELS];
+    int n_models = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            port = atoi(argv[++i]);
+        } else if (argv[i][0] == '-' && argv[i][1]) {
+            usage(argv[0]);
+            return 2;
+        } else if (n_models > 0 && i == argc - 1 && isdigit((unsigned char)argv[i][0])) {
+            port = atoi(argv[i]);
+        } else if (n_models == MAX_MODELS) {
+            fprintf(stderr, "at most %d models\n", MAX_MODELS);
+            return 2;
+        } else {
+            models[n_models++] = argv[i];
+        }
+    }
+    if (n_models < 1) {
         usage(argv[0]);
         return 2;
     }
-    int port = DEFAULT_PORT;
-    if (argc == 3) {
-        port = atoi(argv[2]);
-        if (port < 1 || port > 65535) {
-            fprintf(stderr, "PORT is %d; expected 1-65535\n", port);
-            return 2;
-        }
+    if (port < 1 || port > 65535) {
+        fprintf(stderr, "PORT is %d; expected 1-65535\n", port);
+        return 2;
     }
 
+    ServedModel served[MAX_MODELS];
+    int opened = 0;
     char err[256];
-    GgufFile g;
-    if (!gguf_open(&g, argv[1], err, sizeof err)) {
-        fprintf(stderr, "%s\n", err);
-        return 1;
+    for (int i = 0; i < n_models; i++) {
+        ServedModel *m = &served[opened];
+        memset(m, 0, sizeof *m);
+        m->path = models[i];
+        if (!gguf_open(&m->gguf, m->path, err, sizeof err)) {
+            fprintf(stderr, "%s\n", err);
+            break;
+        }
+        if (!session_open(&m->session, &m->gguf, m->path, err, sizeof err)) {
+            fprintf(stderr, "%s\n", err);
+            gguf_close(&m->gguf);
+            break;
+        }
+        if (!m->session.has_chat) {
+            fprintf(stderr,
+                    "%s has no role markers in its vocabulary, so it takes no "
+                    "conversation; use 'exec-run MODEL.gguf PROMPT' to "
+                    "complete text with it instead\n",
+                    m->path);
+            session_close(&m->session);
+            gguf_close(&m->gguf);
+            break;
+        }
+        m->runtime = m->session.strategy->start(
+            &m->session.model, &m->session.plan, CONTEXT_TOKENS, 0, err,
+            sizeof err);
+        if (!m->runtime) {
+            fprintf(stderr, "%s\n", err);
+            session_close(&m->session);
+            gguf_close(&m->gguf);
+            break;
+        }
+        gguf_meta_str(&m->gguf, "general.name", m->name, sizeof m->name);
+        if (!m->name[0]) {
+            const char *base = strrchr(m->path, '/');
+            snprintf(m->name, sizeof m->name, "%s", base ? base + 1 : m->path);
+        }
+        struct stat st;
+        if (stat(m->path, &st) == 0) m->created = (long)st.st_mtime;
+        opened++;
     }
+    if (opened < 1) return 1;
 
-    Session session;
-    if (!session_open(&session, &g, argv[1], err, sizeof err)) {
-        fprintf(stderr, "%s\n", err);
-        gguf_close(&g);
-        return 1;
+    int rc = serve_loop(served, opened, port);
+
+    for (int i = 0; i < opened; i++) {
+        served[i].session.strategy->stop(served[i].runtime);
+        session_close(&served[i].session);
+        gguf_close(&served[i].gguf);
     }
-    if (!session.has_chat) {
-        fprintf(stderr,
-                "model has no role markers in its vocabulary, so it takes no "
-                "conversation; use 'exec-run MODEL.gguf PROMPT' to complete "
-                "text with it instead\n");
-        session_close(&session);
-        gguf_close(&g);
-        return 1;
-    }
-
-    Runtime *runtime =
-        session.strategy->start(&session.model, &session.plan, CONTEXT_TOKENS,
-                                0, err, sizeof err);
-    if (!runtime) {
-        fprintf(stderr, "%s\n", err);
-        session_close(&session);
-        gguf_close(&g);
-        return 1;
-    }
-
-    char model_name[256] = "";
-    gguf_meta_str(&g, "general.name", model_name, sizeof model_name);
-    if (!model_name[0]) {
-        const char *base = strrchr(argv[1], '/');
-        snprintf(model_name, sizeof model_name, "%s",
-                 base ? base + 1 : argv[1]);
-    }
-
-    struct stat st;
-    long created = 0;
-    if (stat(argv[1], &st) == 0) created = (long)st.st_mtime;
-
-    int rc = serve_loop(&session, runtime, model_name, created, port);
-
-    session.strategy->stop(runtime);
-    session_close(&session);
-    gguf_close(&g);
     return rc;
 }
