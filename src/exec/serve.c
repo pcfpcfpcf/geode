@@ -244,7 +244,9 @@ typedef struct {
 } SseCtx;
 
 /* One model behind the API: its file, session, runtime and the name clients
-   use to pick it. */
+   use to pick it. The cache holds the token ids whose keys and values the
+   runtime is still carrying: the conversation so far, plus whatever the last
+   reply added to it. */
 typedef struct {
     const char *path;
     GgufFile gguf;
@@ -252,6 +254,8 @@ typedef struct {
     Runtime *runtime;
     char name[256];
     long created;
+    int cache[CONTEXT_TOKENS];
+    int n_cache;
 } ServedModel;
 
 static ServedModel *find_model(ServedModel *served, int n_models,
@@ -287,15 +291,14 @@ static void log_tokens(const StreamStats *stats) {
             stats->n_generated);
 }
 
-static int plain_reply(Session *session, Runtime *runtime,
-                       const char *model_name, int fd, const char *id,
-                       long created, const int *ids, int n_prompt,
-                       int max_tokens) {
-    Buffer content = {0};
-    StreamStats stats;
-    session_stream(session, runtime, ids, n_prompt, 0, max_tokens,
-                   collect_sink, &content, &stats);
-
+/* The non-streaming reply: one chat.completion object with the whole content,
+   the usage counts and the measured rates. `prompt_tokens` is the whole
+   conversation the request carried; the timings cover only what was actually
+   prefilled for it. */
+static int respond_completion(int fd, const char *model_name, const char *id,
+                              long created, const Buffer *content,
+                              const StreamStats *stats, int prompt_tokens,
+                              int max_tokens) {
     char *body = NULL;
     size_t body_len = 0;
     FILE *f = open_memstream(&body, &body_len);
@@ -310,20 +313,20 @@ static int plain_reply(Session *session, Runtime *runtime,
     json_u64(&j, "index", 0);
     json_open(&j, "message", 0);
     json_string(&j, "role", "assistant");
-    json_string(&j, "content", content.data ? content.data : "");
+    json_string(&j, "content", content->data ? content->data : "");
     json_close(&j);
     json_string(&j, "finish_reason",
-                stats.n_generated == max_tokens ? "length" : "stop");
+                stats->n_generated == max_tokens ? "length" : "stop");
     json_close(&j);
     json_close(&j);
     json_open(&j, "usage", 0);
-    json_u64(&j, "prompt_tokens", (unsigned long long)stats.n_prompt);
-    json_u64(&j, "completion_tokens", (unsigned long long)stats.n_generated);
+    json_u64(&j, "prompt_tokens", (unsigned long long)prompt_tokens);
+    json_u64(&j, "completion_tokens", (unsigned long long)stats->n_generated);
     json_u64(&j, "total_tokens",
-             (unsigned long long)(stats.n_prompt + stats.n_generated));
+             (unsigned long long)(prompt_tokens + stats->n_generated));
     json_close(&j);
     double prefill, decode;
-    timings(&stats, &prefill, &decode);
+    timings(stats, &prefill, &decode);
     json_open(&j, "timings", 0);
     json_double(&j, "prefill_tok_s", prefill);
     json_double(&j, "decode_tok_s", decode);
@@ -332,36 +335,31 @@ static int plain_reply(Session *session, Runtime *runtime,
     fclose(f);
 
     respond_json(fd, 200, body);
-    log_tokens(&stats);
     free(body);
-    free(content.data);
     return 200;
 }
 
-static int stream_reply(Session *session, Runtime *runtime,
-                        const char *model_name, int fd, const char *id,
-                        long created, const int *ids, int n_prompt,
-                        int max_tokens) {
+/* Opens the stream and sends the role-only first chunk; false when the client
+   is already gone. */
+static int stream_begin(int fd, const char *id, long created,
+                        const char *model_name) {
     respond_sse(fd);
-
     char buf[CHUNK_MAX];
     int n = sse_chunk(buf, sizeof buf, id, created, model_name, "assistant",
                       NULL, NULL, NULL);
-    if (!write_all(fd, buf, n)) return 200;
+    return write_all(fd, buf, n);
+}
 
-    SseCtx ctx = {fd, id, created, model_name, 0};
-    StreamStats stats;
-    session_stream(session, runtime, ids, n_prompt, 0, max_tokens, sse_sink,
-                   &ctx, &stats);
-    if (!ctx.failed) {
-        n = sse_chunk(buf, sizeof buf, id, created, model_name, NULL, NULL,
-                      stats.n_generated == max_tokens ? FINISH_LENGTH
-                                                      : FINISH_STOP,
-                      &stats);
-        if (write_all(fd, buf, n)) write_all(fd, "data: [DONE]\n\n", 15);
-    }
-    log_tokens(&stats);
-    return 200;
+/* Closes the stream with the finish chunk, which carries the rates. */
+static void stream_end(int fd, const char *id, long created,
+                       const char *model_name, int max_tokens,
+                       const StreamStats *stats) {
+    char buf[CHUNK_MAX];
+    int n = sse_chunk(buf, sizeof buf, id, created, model_name, NULL, NULL,
+                      stats->n_generated == max_tokens ? FINISH_LENGTH
+                                                       : FINISH_STOP,
+                      stats);
+    if (write_all(fd, buf, n)) write_all(fd, "data: [DONE]\n\n", 15);
 }
 
 static int handle_models(int fd, ServedModel *served, int n_models) {
@@ -494,16 +492,55 @@ static int handle_chat_completions(ServedModel *served, int n_models,
     sampler_init(&session->sampler, temperature, SAMPLER_TOP_P,
                  SAMPLER_REPETITION_PENALTY, SAMPLER_SEED);
 
+    /* A request restates the whole conversation, so whatever it still shares
+       with the cache is prefilled for free: run the forward pass only over
+       the tail that differs. The penalty has to see the whole conversation
+       even though only the tail is forwarded again, so the shared prefix is
+       noted here. */
+    int common = 0;
+    int limit = n_prompt < m->n_cache ? n_prompt : m->n_cache;
+    while (common < limit && ids[common] == m->cache[common]) common++;
+    /* Sampling needs the last prompt token's logits, and an identical retry
+       would otherwise leave nothing to forward. */
+    if (common == n_prompt) common--;
+    for (int i = 0; i < common; i++)
+        sampler_note(&session->sampler, m->cache[i]);
+
     char id[32];
     static int next_id = 0;
     snprintf(id, sizeof id, "chatcmpl-%d", ++next_id);
     long created = time(NULL);
 
-    if (stream)
-        return stream_reply(session, runtime, model_name, fd, id, created,
-                            ids, n_prompt, max_tokens);
-    return plain_reply(session, runtime, model_name, fd, id, created, ids,
-                       n_prompt, max_tokens);
+    int generated[REPLY_TOKENS_MAX];
+    StreamStats stats = {0};
+    int status;
+    if (stream) {
+        SseCtx ctx = {fd, id, created, model_name, 0};
+        if (!stream_begin(fd, id, created, model_name)) return 200;
+        session_stream(session, runtime, ids + common, n_prompt - common,
+                       common, max_tokens, sse_sink, &ctx, generated, &stats);
+        if (!ctx.failed)
+            stream_end(fd, id, created, model_name, max_tokens, &stats);
+        status = 200;
+    } else {
+        Buffer content = {0};
+        session_stream(session, runtime, ids + common, n_prompt - common,
+                       common, max_tokens, collect_sink, &content, generated,
+                       &stats);
+        status = respond_completion(fd, model_name, id, created, &content,
+                                    &stats, n_prompt, max_tokens);
+        free(content.data);
+    }
+    log_tokens(&stats);
+
+    /* What the cache now holds, for the next request to compare against: the
+       prompt it just carried, plus the reply as generated -- minus whichever
+       token stopped it, which never reached the model. */
+    memcpy(m->cache, ids, (size_t)n_prompt * sizeof *m->cache);
+    memcpy(m->cache + n_prompt, generated,
+           (size_t)stats.n_generated * sizeof *m->cache);
+    m->n_cache = n_prompt + stats.n_generated;
+    return status;
 }
 
 static void handle_client(ServedModel *served, int n_models, int fd) {

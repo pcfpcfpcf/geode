@@ -52,7 +52,7 @@ void session_close(Session *session) {
 
 int session_stream(Session *session, Runtime *runtime, const int *ids,
                    int n_prompt, int position, int n_predict, TokenSink sink,
-                   void *sink_ctx, StreamStats *stats) {
+                   void *sink_ctx, int *generated_ids, StreamStats *stats) {
     const Strategy *strategy = session->strategy;
     double started = now_seconds();
     const float *logits = NULL;
@@ -81,6 +81,7 @@ int session_stream(Session *session, Runtime *runtime, const int *ids,
         tokenizer_decode(&session->tokenizer, &token, 1, text, sizeof text);
         if (sink && sink(sink_ctx, text, (int)strlen(text))) break;
         generated++;
+        if (generated_ids) generated_ids[generated - 1] = token;
         logits = strategy->forward(runtime, &token, position + n_prompt + i, 1);
     }
     double finished = now_seconds();

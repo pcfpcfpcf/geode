@@ -131,7 +131,7 @@ static int stream_tokens(Session *session, Runtime *runtime, const int *ids,
                          int n_prompt, int position, int n_predict) {
     StreamStats stats;
     int end = session_stream(session, runtime, ids, n_prompt, position,
-                             n_predict, print_token, NULL, &stats);
+                             n_predict, print_token, NULL, NULL, &stats);
     printf("\n\nprefill: %d tokens in %.2fs (%.1f tok/s)\n", stats.n_prompt,
            stats.prefill_seconds, stats.n_prompt / stats.prefill_seconds);
     if (stats.n_generated > 0)

@@ -44,9 +44,11 @@ typedef int (*TokenSink)(void *ctx, const char *text, int length);
 /* Prefills the prompt at `position`, samples until the model emits its end
    token or the budget runs out, and returns the position past the last token
    cached -- where the next prompt has to start, since the cache holds no
-   gaps. */
+   gaps. `generated_ids`, when not NULL, receives the id of every token fed
+   back to the model, so a caller keeping its own history can extend it by
+   exactly what the cache came to hold. */
 int session_stream(Session *session, Runtime *runtime, const int *ids,
                    int n_prompt, int position, int n_predict, TokenSink sink,
-                   void *sink_ctx, StreamStats *stats);
+                   void *sink_ctx, int *generated_ids, StreamStats *stats);
 
 #endif
