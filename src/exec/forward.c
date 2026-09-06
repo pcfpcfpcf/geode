@@ -9,73 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 
-/* Regrouping the chunk by expert is what makes a routed layer affordable: four
-   tokens rarely read four *different* experts, so one sweep of the stack per
-   chunk beats one per token. `token_begin` indexes both the concatenated token
-   list and the gate/up/activated rows. */
-typedef struct {
-    const FeedForward *ffn;
-    int matrix_index;
-    int token_begin;
-    int n_tokens;
-    long long work_begin;
-    size_t scratch_begin;
-} Branch;
-
-struct Runtime {
-    const Model *model;
-    ThreadPool *pool;
-    RopeConfig rope;
-    int n_ctx;
-    int cache_width;
-    int n_segments;
-    int query_quant_width;
-    int query_segments;
-    int max_tokens;
-
-    uint8_t *cache;
-    float *cache_scale;
-    float *cache_block;
-    float *cos_sin;
-    int8_t *query_quants;
-    QuantizedQuery *query_scale;
-
-    float *residual;
-    float *normed;
-    float *query;
-    float *query_latent;
-    float *kv_projected;
-    float *kv_normed;
-    float *scores;
-    float *attn_latent;
-    float *attn_out;
-    float *projected;
-    float *gate;
-    float *up;
-    float *activated;
-    float *router_probs;
-    float *branch_out;
-    float *logits;
-
-    Branch *branches;
-    int *branch_tokens;
-    float *branch_weights;
-    int *chosen;
-    float *chosen_weight;
-
-    /* `head_scratch` is per worker rather than per chunk: the per-head matrices
-       run inside a parallel region rather than across one. */
-    ActivationBatch normed_batch;
-    ActivationBatch *branch_activations;
-    ActivationBatch heads_batch;
-    unsigned char *normed_scratch;
-    unsigned char *activated_scratch;
-    unsigned char *heads_scratch;
-    unsigned char *head_scratch;
-    size_t head_scratch_bytes;
-};
-
-static const void *matrix_at(const GgufTensor *tensor, int index) {
+const void *matrix_at(const GgufTensor *tensor, int index) {
     size_t matrix_bytes = (size_t)tensor->dims[1] *
                           row_bytes(tensor->type, (int)tensor->dims[0]);
     return (const unsigned char *)tensor->data + (size_t)index * matrix_bytes;
@@ -465,8 +399,10 @@ static void attention_gqa(Runtime *runtime, const Layer *layer, int layer_index,
     pool_run(runtime->pool, attention_gqa_worker, &job);
 }
 
-static void attention(Runtime *runtime, const Layer *layer, int layer_index,
-                      int position, int n_tokens) {
+/* The cpu tier of the attention split, exported for tests that need to run
+   one layer of it against a strategy's replacement. */
+void forward_attention_cpu(Runtime *runtime, const Layer *layer,
+                           int layer_index, int position, int n_tokens) {
     const Model *model = runtime->model;
     run_matmul(runtime, runtime->query,
                (size_t)model->n_head * model->head_dim_k, layer->attn_q, 0,
@@ -725,9 +661,8 @@ static void feed_forward(Runtime *runtime, const Layer *layer, int n_tokens) {
     run_branches(runtime, select_branches(runtime, layer, n_tokens), n_tokens,
                  &runtime->normed_batch);
 }
-
-const float *forward(Runtime *runtime, const int *tokens, int position,
-                     int n_tokens) {
+const float *forward_with(Runtime *runtime, const int *tokens, int position,
+                          int n_tokens, AttentionFn attention) {
     const Model *model = runtime->model;
     int n_embd = model->n_embd;
 
@@ -757,8 +692,9 @@ const float *forward(Runtime *runtime, const int *tokens, int position,
                        runtime->projected + (size_t)t * n_embd, 1.0f, n_embd);
     }
 
-    /* Only the last token is sampled, and the output matrix is the widest in the
-       model -- projecting the whole chunk would cost more than the layers did. */
+    /* Only the last token is sampled, and the output matrix is the widest in
+       the model -- projecting the whole chunk would cost more than the layers
+       did. */
     rmsnorm(runtime->normed,
             runtime->residual + (size_t)(n_tokens - 1) * n_embd,
             model->output_norm->data, n_embd, model->rms_eps);
@@ -767,6 +703,12 @@ const float *forward(Runtime *runtime, const int *tokens, int position,
     run_matmul(runtime, runtime->logits, (size_t)model->n_vocab, model->output,
                0, &runtime->normed_batch);
     return runtime->logits;
+}
+
+const float *forward(Runtime *runtime, const int *tokens, int position,
+                      int n_tokens) {
+    return forward_with(runtime, tokens, position, n_tokens,
+                      forward_attention_cpu);
 }
 
 static float *alloc_floats(size_t n, int *ok) {

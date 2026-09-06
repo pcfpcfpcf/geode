@@ -4,7 +4,12 @@
 #include "kernels.h"
 #include "model.h"
 #include "quant.h"
+#include "strategy.h"
 #include "tokenizer.h"
+
+extern const Strategy hybrid;
+void gpu_attention(Runtime *runtime, const Layer *layer,
+                  int layer_index, int position, int n_tokens);
 
 #include <math.h>
 #include <stdio.h>
@@ -234,4 +239,172 @@ int selftest_prefill(const GgufFile *g) {
     tokenizer_free(&t);
     model_free(&model);
     return report("prefill", ok);
+}
+
+/* The gpu attention recomputes what the cpu's does: same cache (the kv prep
+   is literally the same code), same weights, different arithmetic. The cpu
+   quantizes its queries to int8 before scoring; the gpu dots them in f32
+   against the same cache, so the gap is the cpu's own quantization error
+   compounding through every layer: measured ~5% of logit scale at 26-48
+   layers. A broken kernel lands far outside that; the argmax has to survive
+   regardless. */
+#define HYBRID_TOLERANCE 0.06f
+
+/* Records the first layer's attention input and output so the gpu path can
+   be checked against a scalar reference of the same step. */
+static float *trace_normed;
+static float *trace_projected;
+static int trace_saved;
+
+static void tracing_attention_cpu(Runtime *runtime, const Layer *layer,
+                                  int layer_index, int position,
+                                  int n_tokens) {
+    forward_attention_cpu(runtime, layer, layer_index, position, n_tokens);
+    if (!trace_saved) {
+        int n_embd = runtime->model->n_embd;
+        memcpy(trace_normed, runtime->normed, (size_t)n_tokens * n_embd * 4);
+        memcpy(trace_projected, runtime->projected,
+               (size_t)n_tokens * n_embd * 4);
+        trace_saved = 1;
+    }
+}
+
+static void tracing_attention(Runtime *runtime, const Layer *layer,
+                              int layer_index, int position, int n_tokens) {
+    gpu_attention(runtime, layer, layer_index, position, n_tokens);
+    if (!trace_saved) {
+        int n_embd = runtime->model->n_embd;
+        memcpy(trace_normed, runtime->normed, (size_t)n_tokens * n_embd * 4);
+        memcpy(trace_projected, runtime->projected,
+               (size_t)n_tokens * n_embd * 4);
+        trace_saved = 1;
+    }
+}
+
+int selftest_hybrid(const GgufFile *g) {
+    char err[256];
+    Model model;
+    if (!model_load(&model, g, err, sizeof err)) {
+        printf("hybrid: %s\n", err);
+        return 1;
+    }
+    Tokenizer t;
+    if (!tokenizer_init(&t, g, err, sizeof err)) {
+        printf("hybrid: %s\n", err);
+        model_free(&model);
+        return 1;
+    }
+
+    int ids[PROMPT_TOKENS_MAX];
+    int n_prompt = tokenizer_encode_prompt(&t, PREFILL_TEST_PROMPT, ids,
+                                           PROMPT_TOKENS_MAX);
+
+    float *cpu = malloc((size_t)model.n_vocab * sizeof *cpu);
+    float *gpu = malloc((size_t)model.n_vocab * sizeof *gpu);
+    if (!cpu || !gpu) {
+        printf("hybrid: out of memory\n");
+        free(cpu);
+        free(gpu);
+        tokenizer_free(&t);
+        model_free(&model);
+        return 1;
+    }
+
+    if (!prefill_logits(&model, ids, n_prompt, PREFILL_CHUNK, cpu, err,
+                        sizeof err)) {
+        printf("hybrid: %s\n", err);
+        free(cpu);
+        free(gpu);
+        tokenizer_free(&t);
+        model_free(&model);
+        return 1;
+    }
+
+    const Strategy *strategy = &hybrid;
+
+    Plan plan;
+    plan_default(&plan);
+    Runtime *runtime = strategy->start(&model, &plan, n_prompt, 0, err,
+                                       sizeof err);
+    int ok = runtime != NULL;
+    if (!ok) {
+        printf("hybrid: %s\n", err);
+    } else {
+        /* One full chunk through layer 0 on both tiers: the gpu attention
+           against the cpu's, same inputs -- a per-layer verdict instead of a
+           26-layer one. */
+        {
+            int n = n_prompt < PREFILL_CHUNK ? n_prompt : PREFILL_CHUNK;
+            size_t bytes = (size_t)n * model.n_embd * 4;
+            float *cpu_in = malloc(bytes), *cpu_out = malloc(bytes);
+            float *gpu_in = malloc(bytes), *gpu_out = malloc(bytes);
+            if (cpu_in && cpu_out && gpu_in && gpu_out) {
+                Runtime *cpu_runtime =
+                    runtime_start(&model, n_prompt, 0, err, sizeof err);
+                if (cpu_runtime) {
+                    trace_normed = cpu_in;
+                    trace_projected = cpu_out;
+                    trace_saved = 0;
+                    forward_with(cpu_runtime, ids, 0, n,
+                                  tracing_attention_cpu);
+                    runtime_stop(cpu_runtime);
+                    if (trace_saved) {
+                        trace_normed = gpu_in;
+                        trace_projected = gpu_out;
+                        trace_saved = 0;
+                        forward_with(runtime, ids, 0, n, tracing_attention);
+                        float worst_in = 0, worst_out = 0;
+                        int worst_i = 0, off = 0;
+                        for (size_t i = 0; i < (size_t)n * model.n_embd;
+                             i++) {
+                            float d = fabsf(gpu_in[i] - cpu_in[i]);
+                            if (d > worst_in) worst_in = d;
+                            d = fabsf(gpu_out[i] - cpu_out[i]);
+                            if (d > worst_out) {
+                                worst_out = d;
+                                worst_i = (int)i;
+                            }
+                            if (d > 1e-3f) off++;
+                        }
+                        printf("  layer-0 over %d tokens: input worst %.6f, "
+                               "output %d off, worst %.6f at %d\n",
+                               n, worst_in, off, worst_out, worst_i);
+                    }
+                }
+            }
+            free(cpu_in); free(cpu_out); free(gpu_in); free(gpu_out);
+        }
+
+        const float *logits = NULL;
+        for (int i = 0; i < n_prompt; i += PREFILL_CHUNK) {
+            int n = n_prompt - i;
+            if (n > PREFILL_CHUNK) n = PREFILL_CHUNK;
+            logits = strategy->forward(runtime, ids + i, i, n);
+        }
+        memcpy(gpu, logits, (size_t)model.n_vocab * sizeof *gpu);
+        strategy->stop(runtime);
+
+        float worst = 0, largest = 0;
+        for (int i = 0; i < model.n_vocab; i++) {
+            float diff = fabsf(cpu[i] - gpu[i]);
+            if (diff > worst) worst = diff;
+            if (fabsf(cpu[i]) > largest) largest = fabsf(cpu[i]);
+        }
+        float tolerance = HYBRID_TOLERANCE * (1.0f + largest);
+        int token = argmax(gpu, model.n_vocab);
+        int wanted = argmax(cpu, model.n_vocab);
+
+        printf("hybrid: %d tokens, gpu vs cpu over %d layers\n", n_prompt,
+               model.n_layer);
+        printf("  logits differ by at most %.6f of %.3f (tolerance %.6f)\n",
+               worst, largest, tolerance);
+        printf("  argmax %d vs %d\n", wanted, token);
+        if (worst > tolerance || token != wanted) ok = 0;
+    }
+
+    free(cpu);
+    free(gpu);
+    tokenizer_free(&t);
+    model_free(&model);
+    return report("hybrid", ok);
 }

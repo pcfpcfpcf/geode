@@ -8,5 +8,6 @@
 int selftest_kernels(const GgufFile *g);
 int selftest_tokenizer(const GgufFile *g);
 int selftest_prefill(const GgufFile *g);
+int selftest_hybrid(const GgufFile *g);
 
 #endif

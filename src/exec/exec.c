@@ -195,6 +195,11 @@ static int run_prefill(const GgufFile *g, const RunArgs *a) {
     return selftest_prefill(g);
 }
 
+static int run_hybrid(const GgufFile *g, const RunArgs *a) {
+    (void)a;
+    return selftest_hybrid(g);
+}
+
 typedef struct {
     const char *name;
     const char *options; /* NULL for a command taking only a model */
@@ -213,6 +218,8 @@ static const Command commands[] = {
      run_tokenizer},
     {"exec-prefill", NULL, "check chunked prefill against one token at a time",
      run_prefill},
+    {"exec-hybrid", NULL, "check the gpu attention against the cpu's logits",
+     run_hybrid},
 };
 
 static const Command *find_command(const char *name) {

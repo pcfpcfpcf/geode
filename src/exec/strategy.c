@@ -4,13 +4,15 @@
 #include <string.h>
 
 extern const Strategy cpu_stream;
+extern const Strategy hybrid;
 
 /* Adding an executor is a file and a row here; nothing else in exec learns its
-   name. RESIDENT, HYBRID and FLASH-STREAM are candidates the planner scores
-   but this build does not implement, so a plan naming one falls through to the
-   fastest that is implemented. */
+   name. RESIDENT and FLASH-STREAM are candidates the planner scores but this
+   build does not implement, so a plan naming one falls through to the fastest
+   that is implemented. */
 static const Strategy *const strategies[] = {
     &cpu_stream,
+    &hybrid,
 };
 
 /* What runs when the plan says nothing about any strategy this build has. */

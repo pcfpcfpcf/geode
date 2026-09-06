@@ -1,9 +1,92 @@
 #ifndef GEODE_FORWARD_H
 #define GEODE_FORWARD_H
 
+#include "kernels.h"
 #include "model.h"
+#include "parallel.h"
 
 typedef struct Runtime Runtime;
+
+/* The tier a strategy places attention on. The contract is the CPU one's:
+   reads `normed` (and `normed_batch`'s token count is n_tokens) and leaves
+   the result in `projected`, for every token of the chunk. */
+typedef void (*AttentionFn)(Runtime *runtime, const Layer *layer,
+                            int layer_index, int position, int n_tokens);
+
+/* Whatever a strategy attached to this runtime beyond the cpu state -- the
+   hybrid's device handle. Opaque: forward knows nothing about the layer
+   above it. */
+
+/* Regrouping the chunk by expert is what makes a routed layer affordable: four
+   tokens rarely read four *different* experts, so one sweep of the stack per
+   chunk beats one per token. `token_begin` indexes both the concatenated token
+   list and the gate/up/activated rows. */
+typedef struct {
+    const FeedForward *ffn;
+    int matrix_index;
+    int token_begin;
+    int n_tokens;
+    long long work_begin;
+    size_t scratch_begin;
+} Branch;
+
+struct Runtime {
+    const Model *model;
+    void *device;
+    ThreadPool *pool;
+    RopeConfig rope;
+    int n_ctx;
+    int cache_width;
+    int n_segments;
+    int query_quant_width;
+    int query_segments;
+    int max_tokens;
+
+    uint8_t *cache;
+    float *cache_scale;
+    float *cache_block;
+    float *cos_sin;
+    int8_t *query_quants;
+    QuantizedQuery *query_scale;
+
+    float *residual;
+    float *normed;
+    float *query;
+    float *query_latent;
+    float *kv_projected;
+    float *kv_normed;
+    float *scores;
+    float *attn_latent;
+    float *attn_out;
+    float *projected;
+    float *gate;
+    float *up;
+    float *activated;
+    float *router_probs;
+    float *branch_out;
+    float *logits;
+
+    Branch *branches;
+    int *branch_tokens;
+    float *branch_weights;
+    int *chosen;
+    float *chosen_weight;
+
+    /* `head_scratch` is per worker rather than per chunk: the per-head matrices
+       run inside a parallel region rather than across one. */
+    ActivationBatch normed_batch;
+    ActivationBatch *branch_activations;
+    ActivationBatch heads_batch;
+    unsigned char *normed_scratch;
+    unsigned char *activated_scratch;
+    unsigned char *heads_scratch;
+    unsigned char *head_scratch;
+    size_t head_scratch_bytes;
+};
+
+/* One matrix of a stacked tensor: gate/up/down per expert, k_b/v_b per head.
+   Matrices are dims[1] rows of dims[0] elements, stacked along dims[2]. */
+const void *matrix_at(const GgufTensor *tensor, int index);
 
 Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
                        size_t errsz);
@@ -31,5 +114,16 @@ void runtime_stop(Runtime *runtime);
    the model. Positions must be fed in order from 0: the cache holds no gaps. */
 const float *forward(Runtime *runtime, const int *tokens, int position,
                      int n_tokens);
+
+/* The cpu's own attention, for tests that compare a strategy's tier split
+   against the reference one layer at a time. */
+void forward_attention_cpu(Runtime *runtime, const Layer *layer,
+                           int layer_index, int position, int n_tokens);
+
+/* The same pass with the attention tier swapped: a strategy splits the layer
+   loop here and nowhere else -- everything around attention (embedding, rope
+   tables, norms, the expert stack, the output projection) is tier-agnostic. */
+const float *forward_with(Runtime *runtime, const int *tokens, int position,
+                         int n_tokens, AttentionFn attention);
 
 #endif
