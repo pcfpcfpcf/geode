@@ -25,6 +25,7 @@ void rope_init(RopeConfig *rope, float freq_base, float freq_scale, int n_dims,
    rotation itself. cos_sin holds a cosine and a sine per rotary pair. */
 void rope_position(float *cos_sin, const RopeConfig *rope, int position);
 void rope_apply(float *vec, const float *cos_sin, int n_dims);
+void rope_apply_neox(float *vec, const float *cos_sin, int n_dims);
 
 float fp16_to_fp32(uint16_t half);
 

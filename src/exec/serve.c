@@ -577,7 +577,7 @@ int serve_main(int argc, char **argv) {
     }
 
     Session session;
-    if (!session_open(&session, &g, err, sizeof err)) {
+    if (!session_open(&session, &g, argv[1], err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         gguf_close(&g);
         return 1;

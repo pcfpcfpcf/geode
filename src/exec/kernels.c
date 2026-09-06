@@ -1183,8 +1183,14 @@ void rope_init(RopeConfig *rope, float freq_base, float freq_scale, int n_dims,
     rope->freq_scale = freq_scale;
     rope->theta_step = powf(freq_base, -2.0f / (float)n_dims);
     rope->n_dims = n_dims;
-    rope->corr_low = floorf(corr_dim(n_dims, orig_ctx, beta_fast, freq_base));
-    rope->corr_high = ceilf(corr_dim(n_dims, orig_ctx, beta_slow, freq_base));
+    if (orig_ctx <= 0) {
+        /* No scaling: the correction band is empty, and with freq_scale 1 the
+           ramp never matters anyway. */
+        rope->corr_low = rope->corr_high = 0;
+    } else {
+        rope->corr_low = floorf(corr_dim(n_dims, orig_ctx, beta_fast, freq_base));
+        rope->corr_high = ceilf(corr_dim(n_dims, orig_ctx, beta_slow, freq_base));
+    }
 }
 
 void rope_position(float *cos_sin, const RopeConfig *rope, int position) {
@@ -1216,6 +1222,19 @@ void rope_apply(float *vec, const float *cos_sin, int n_dims) {
         float low = vec[2 * i], high = vec[2 * i + 1];
         vec[2 * i] = low * cos_theta - high * sin_theta;
         vec[2 * i + 1] = low * sin_theta + high * cos_theta;
+    }
+}
+
+/* Split-half pairing: dimension i rotates against i + n_dims/2. Qwen3 emits
+   its rotary dimensions in that order, so the interleaved pairing above would
+   pair the wrong dimensions. */
+void rope_apply_neox(float *vec, const float *cos_sin, int n_dims) {
+    int half = n_dims / 2;
+    for (int i = 0; i < half; i++) {
+        float cos_theta = cos_sin[2 * i], sin_theta = cos_sin[2 * i + 1];
+        float low = vec[i], high = vec[i + half];
+        vec[i] = low * cos_theta - high * sin_theta;
+        vec[i + half] = low * sin_theta + high * cos_theta;
     }
 }
 

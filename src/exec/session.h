@@ -25,9 +25,10 @@ typedef struct {
     int has_chat;
 } Session;
 
-/* Loads the cached plan, picks the strategy, and opens the model, tokenizer
-   and chat. Prints what it chose. */
-int session_open(Session *session, const GgufFile *g, char *err, size_t errsz);
+/* Loads the cached plan for `model`, picks the strategy, and opens the
+   model, tokenizer and chat. Prints what it chose. */
+int session_open(Session *session, const GgufFile *g, const char *model,
+                 char *err, size_t errsz);
 void session_close(Session *session);
 
 typedef struct {

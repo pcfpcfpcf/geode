@@ -1,3 +1,4 @@
+#include "home.h"
 #include "json.h"
 #include "manifest.h"
 #include "modules.h"
@@ -431,26 +432,9 @@ static const char *default_probe_path(void) {
     return buf;
 }
 
-static const char *default_manifest_path(void) {
-    static char buf[1024];
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-    snprintf(buf, sizeof buf, "%s/.geode/manifest.json", home);
-    return buf;
-}
-
-static const char *default_out_path(void) {
-    static char buf[1024];
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-    snprintf(buf, sizeof buf, "%s/.geode/plan.json", home);
-    return buf;
-}
-
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [probe.json] [manifest.json] [--context N] [--batch N] "
-            "[--out plan.json]\n",
+            "usage: %s MODEL.gguf [--context N] [--batch N] [--out plan.json]\n",
             argv0);
 }
 
@@ -464,10 +448,9 @@ static void add_placement(Plan *plan, const char *component, const char *tier,
 
 int planner_main(int argc, char **argv) {
     const char *probe_path = default_probe_path();
-    const char *manifest_path = default_manifest_path();
-    const char *out_path = default_out_path();
+    const char *manifest_path = NULL;
+    const char *out_path = NULL;
     long context = 4096, batch = 1;
-    int positional = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--context") == 0 && i + 1 < argc) {
@@ -477,17 +460,27 @@ int planner_main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
             out_path = argv[++i];
         } else if (argv[i][0] != '-') {
-            if (positional == 0) probe_path = argv[i];
-            else if (positional == 1) manifest_path = argv[i];
-            else {
+            if (manifest_path) {
                 usage(argv[0]);
                 return 2;
             }
-            positional++;
+            /* geode_model_home shares one buffer; copy before the next call
+               overwrites it. */
+            static char manifest_buf[1024], out_buf[1024];
+            snprintf(manifest_buf, sizeof manifest_buf, "%s",
+                     geode_model_home(argv[i], "manifest"));
+            snprintf(out_buf, sizeof out_buf, "%s",
+                     geode_model_home(argv[i], "plan"));
+            manifest_path = manifest_buf;
+            if (!out_path) out_path = out_buf;
         } else {
             usage(argv[0]);
             return 2;
         }
+    }
+    if (!manifest_path) {
+        usage(argv[0]);
+        return 2;
     }
     if (context <= 0 || batch <= 0) {
         fprintf(stderr, "context and batch must be positive\n");

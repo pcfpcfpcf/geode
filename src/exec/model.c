@@ -6,9 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ggml's expert gating enum; only sigmoid routing is implemented here. */
-#define GATING_SIGMOID 2
-
 /* Fixed inside ggml's rotation, independent of the model's own multiplier. */
 #define YARN_ROTATION_LOG_MULTIPLIER 0.1
 
@@ -71,6 +68,24 @@ static const GgufTensor *vector(Loader *loader, unsigned long long n,
     return tensor;
 }
 
+/* Like vector, but a tensor some architectures simply do not have -- a router
+   bias, say -- is not an error. */
+static const GgufTensor *optional_vector(Loader *loader, unsigned long long n,
+                                         const char *fmt, ...) {
+    char name[GGUF_NAME_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(name, sizeof name, fmt, ap);
+    va_end(ap);
+
+    const GgufTensor *tensor = gguf_find(loader->gguf, name);
+    if (!tensor) return NULL;
+    if (tensor->dims[0] != n)
+        fail(loader, "%s: expected %llu elements, got %llu", name, n,
+             tensor->dims[0]);
+    return tensor;
+}
+
 /* GGUF stores dims[0] as the contracted (input) dimension, dims[1] as the
    output dimension and dims[2] as a stack of independent matrices. */
 static const GgufTensor *matrix(Loader *loader, unsigned long long n_in,
@@ -102,32 +117,49 @@ static void load_hparams(Loader *loader, Model *model) {
     model->n_embd = meta_int(loader, "embedding_length");
     model->n_head = meta_int(loader, "attention.head_count");
     model->n_ff = meta_int(loader, "feed_forward_length");
-    model->n_vocab = meta_int(loader, "vocab_size");
     model->n_dense_layer = meta_int_or(loader, "leading_dense_block_count", 0);
 
-    model->kv_lora_rank = meta_int(loader, "attention.kv_lora_rank");
-    model->qk_rope_dim = meta_int(loader, "rope.dimension_count");
-    model->head_dim_k = meta_int_or(loader, "attention.key_length_mla",
-                                    meta_int(loader, "attention.key_length"));
-    model->head_dim_v =
-        meta_int_or(loader, "attention.value_length_mla",
-                    meta_int(loader, "attention.value_length"));
-    model->qk_nope_dim = model->head_dim_k - model->qk_rope_dim;
+    GgufArray tokens;
+    if (gguf_meta_arr(loader->gguf, "tokenizer.ggml.tokens", &tokens))
+        model->n_vocab = (int)tokens.remaining;
+    else
+        model->n_vocab = meta_int(loader, "vocab_size");
+
+    if (model->attention == ATTN_MLA) {
+        model->kv_lora_rank = meta_int(loader, "attention.kv_lora_rank");
+        model->head_dim_k = meta_int_or(loader, "attention.key_length_mla",
+                                        meta_int(loader, "attention.key_length"));
+        model->head_dim_v = meta_int_or(loader, "attention.value_length_mla",
+                                        meta_int(loader, "attention.value_length"));
+        model->qk_rope_dim = meta_int(loader, "rope.dimension_count");
+        model->qk_nope_dim = model->head_dim_k - model->qk_rope_dim;
+    } else {
+        model->n_head_kv = meta_int(loader, "attention.head_count_kv");
+        model->head_dim_k = meta_int(loader, "attention.key_length");
+        model->head_dim_v = meta_int(loader, "attention.value_length");
+        /* Qwen3 rotates the whole head; llama.cpp defaults the same way when
+           the metadata omits rope.dimension_count. */
+        model->qk_rope_dim =
+            meta_int_or(loader, "rope.dimension_count", model->head_dim_k);
+    }
 
     model->n_expert = meta_int_or(loader, "expert_count", 0);
     model->n_expert_used = meta_int_or(loader, "expert_used_count", 0);
     model->n_expert_shared = meta_int_or(loader, "expert_shared_count", 0);
     model->n_ff_expert = meta_int_or(loader, "expert_feed_forward_length", 0);
-    model->expert_weights_norm = meta_int_or(loader, "expert_weights_norm", 0);
+    model->gating = meta_int_or(loader, "expert_gating_func",
+                                model->attention == ATTN_MLA ? GATING_SIGMOID
+                                                             : GATING_SOFTMAX);
+    model->expert_weights_norm = meta_int_or(loader, "expert_weights_norm",
+                                             model->attention == ATTN_MLA ? 0 : 1);
     model->expert_weights_scale =
         (float)meta_float_or(loader, "expert_weights_scale", 1.0);
 
-    int gating = meta_int_or(loader, "expert_gating_func", GATING_SIGMOID);
-    if (gating != GATING_SIGMOID)
+    if (model->gating != GATING_SOFTMAX && model->gating != GATING_SIGMOID)
         fail(loader,
              "expert_gating_func %d is not supported; this executor routes "
-             "with sigmoid (%d)",
-             gating, GATING_SIGMOID);
+             "with softmax (%d) or sigmoid (%d)",
+             model->gating, GATING_SOFTMAX, GATING_SIGMOID);
 
     model->rms_eps =
         (float)meta_float_or(loader, "attention.layer_norm_rms_epsilon", 1e-6);
@@ -165,15 +197,28 @@ static void load_layer(Loader *loader, Model *model, Layer *layer, int index) {
     layer->attn_norm = vector(loader, n_embd, "blk.%d.attn_norm.weight", index);
     layer->attn_q = matrix(loader, n_embd, model->n_head * model->head_dim_k, 1,
                            "blk.%d.attn_q.weight", index);
-    layer->kv_a_mqa =
-        matrix(loader, n_embd, model->kv_lora_rank + model->qk_rope_dim, 1,
-               "blk.%d.attn_kv_a_mqa.weight", index);
-    layer->kv_a_norm = vector(loader, model->kv_lora_rank,
-                              "blk.%d.attn_kv_a_norm.weight", index);
-    layer->k_b = matrix(loader, model->qk_nope_dim, model->kv_lora_rank,
-                        model->n_head, "blk.%d.attn_k_b.weight", index);
-    layer->v_b = matrix(loader, model->kv_lora_rank, model->head_dim_v,
-                        model->n_head, "blk.%d.attn_v_b.weight", index);
+    if (model->attention == ATTN_MLA) {
+        layer->kv_a_mqa =
+            matrix(loader, n_embd, model->kv_lora_rank + model->qk_rope_dim, 1,
+                   "blk.%d.attn_kv_a_mqa.weight", index);
+        layer->kv_a_norm = vector(loader, model->kv_lora_rank,
+                                  "blk.%d.attn_kv_a_norm.weight", index);
+        layer->k_b = matrix(loader, model->qk_nope_dim, model->kv_lora_rank,
+                            model->n_head, "blk.%d.attn_k_b.weight", index);
+        layer->v_b = matrix(loader, model->kv_lora_rank, model->head_dim_v,
+                            model->n_head, "blk.%d.attn_v_b.weight", index);
+    } else {
+        layer->attn_q_norm = vector(loader, model->head_dim_k,
+                                    "blk.%d.attn_q_norm.weight", index);
+        layer->attn_k = matrix(loader, n_embd,
+                               model->n_head_kv * model->head_dim_k, 1,
+                               "blk.%d.attn_k.weight", index);
+        layer->attn_k_norm = vector(loader, model->head_dim_k,
+                                    "blk.%d.attn_k_norm.weight", index);
+        layer->attn_v = matrix(loader, n_embd,
+                               model->n_head_kv * model->head_dim_v, 1,
+                               "blk.%d.attn_v.weight", index);
+    }
     layer->attn_output = matrix(loader, model->n_head * model->head_dim_v,
                                 n_embd, 1, "blk.%d.attn_output.weight", index);
     layer->ffn_norm = vector(loader, n_embd, "blk.%d.ffn_norm.weight", index);
@@ -189,23 +234,25 @@ static void load_layer(Loader *loader, Model *model, Layer *layer, int index) {
         return;
     }
 
-    int n_shared = model->n_ff_expert * model->n_expert_shared;
     layer->router = matrix(loader, n_embd, n_expert, 1,
                            "blk.%d.ffn_gate_inp.weight", index);
     layer->router_bias =
-        vector(loader, n_expert, "blk.%d.exp_probs_b.bias", index);
+        optional_vector(loader, n_expert, "blk.%d.exp_probs_b.bias", index);
     layer->experts.gate = matrix(loader, n_embd, model->n_ff_expert, n_expert,
                                  "blk.%d.ffn_gate_exps.weight", index);
     layer->experts.up = matrix(loader, n_embd, model->n_ff_expert, n_expert,
                                "blk.%d.ffn_up_exps.weight", index);
     layer->experts.down = matrix(loader, model->n_ff_expert, n_embd, n_expert,
                                  "blk.%d.ffn_down_exps.weight", index);
-    layer->shared_expert.gate = matrix(loader, n_embd, n_shared, 1,
-                                       "blk.%d.ffn_gate_shexp.weight", index);
-    layer->shared_expert.up = matrix(loader, n_embd, n_shared, 1,
-                                     "blk.%d.ffn_up_shexp.weight", index);
-    layer->shared_expert.down = matrix(loader, n_shared, n_embd, 1,
-                                       "blk.%d.ffn_down_shexp.weight", index);
+    if (model->n_expert_shared > 0) {
+        int n_shared = model->n_ff_expert * model->n_expert_shared;
+        layer->shared_expert.gate = matrix(loader, n_embd, n_shared, 1,
+                                           "blk.%d.ffn_gate_shexp.weight", index);
+        layer->shared_expert.up = matrix(loader, n_embd, n_shared, 1,
+                                         "blk.%d.ffn_up_shexp.weight", index);
+        layer->shared_expert.down = matrix(loader, n_shared, n_embd, 1,
+                                           "blk.%d.ffn_down_shexp.weight", index);
+    }
 }
 
 int model_load(Model *model, const GgufFile *gguf, char *err, size_t errsz) {
@@ -219,10 +266,15 @@ int model_load(Model *model, const GgufFile *gguf, char *err, size_t errsz) {
         snprintf(err, errsz, "no general.architecture in model");
         return 0;
     }
-    if (strcmp(loader.arch, "deepseek2") != 0) {
+    if (strcmp(loader.arch, "deepseek2") == 0)
+        model->attention = ATTN_MLA;
+    else if (strcmp(loader.arch, "qwen3moe") == 0)
+        model->attention = ATTN_GQA;
+    else {
         snprintf(err, errsz,
                  "architecture %s is not supported; this executor runs "
-                 "deepseek2 (multi-head latent attention) only",
+                 "deepseek2 (multi-head latent attention) and qwen3moe "
+                 "(grouped-query attention)",
                  loader.arch);
         return 0;
     }

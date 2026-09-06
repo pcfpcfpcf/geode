@@ -13,11 +13,11 @@ static double now_seconds(void) {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-int session_open(Session *session, const GgufFile *g, char *err,
-                 size_t errsz) {
+int session_open(Session *session, const GgufFile *g, const char *model,
+                 char *err, size_t errsz) {
     char plan_err[256];
-    int planned = plan_load(&session->plan, geode_home("plan.json"), plan_err,
-                            sizeof plan_err);
+    int planned = plan_load(&session->plan, geode_model_home(model, "plan"),
+                            plan_err, sizeof plan_err);
 
     double predicted[2];
     char note[256];
@@ -67,8 +67,8 @@ int session_stream(Session *session, Runtime *runtime, const int *ids,
     /* A reply closes with the message separator; a role separator in the
        middle of it means the model has started echoing the prompt template,
        and letting it continue only spirals. */
-    int reply_end = session->has_chat ? session->chat.message_sep : -1;
-    int role_end = session->has_chat ? session->chat.role_sep : -1;
+    int reply_end = session->has_chat ? session->chat.end : -1;
+    int role_end = session->has_chat ? session->chat.start : -1;
     int generated = 0;
     for (int i = 0; i < n_predict; i++) {
         int token =

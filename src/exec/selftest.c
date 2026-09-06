@@ -95,9 +95,16 @@ static int check_tensor(const GgufFile *g, const char *name) {
 int selftest_kernels(const GgufFile *g) {
     int ok = 1;
     ok &= check_tensor(g, "blk.0.attn_q.weight");    /* Q4_K */
-    ok &= check_tensor(g, "blk.0.ffn_down.weight");  /* Q6_K */
-    ok &= check_tensor(g, "blk.0.attn_k_b.weight");  /* Q5_0 */
     ok &= check_tensor(g, "blk.0.attn_norm.weight"); /* F32 */
+    /* Q6_K lives in the dense down-projection for MLA and in the value
+       projection for GQA. */
+    const GgufTensor *q6 = gguf_find(g, "blk.0.ffn_down.weight");
+    if (!q6) q6 = gguf_find(g, "blk.0.attn_v.weight");
+    if (q6) ok &= check_tensor(g, q6->name);
+    else ok = 0;
+    /* Q5_0 only appears in MLA's k_b; GQA models have none. */
+    if (gguf_find(g, "blk.0.attn_k_b.weight"))
+        ok &= check_tensor(g, "blk.0.attn_k_b.weight");
     return report("kernels", ok);
 }
 

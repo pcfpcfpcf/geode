@@ -26,6 +26,7 @@ typedef struct {
     const char *prompt;
     int n_predict;
     int n_threads;
+    const char *model;
 } RunArgs;
 
 static const char *config_keys[] = {
@@ -143,7 +144,7 @@ static int stream_tokens(Session *session, Runtime *runtime, const int *ids,
 static int generate(const GgufFile *g, const RunArgs *args) {
     char err[256];
     Session session;
-    if (!session_open(&session, g, err, sizeof err)) {
+    if (!session_open(&session, g, args->model, err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         return 1;
     }
@@ -240,7 +241,7 @@ int exec_main(int argc, char **argv) {
         return 2;
     }
 
-    RunArgs args = {DEFAULT_PROMPT, DEFAULT_PREDICT_TOKENS, 0};
+    RunArgs args = {DEFAULT_PROMPT, DEFAULT_PREDICT_TOKENS, 0, argv[1]};
     if (n_options > 0) args.prompt = argv[2];
     if (n_options > 1) args.n_predict = atoi(argv[3]);
     if (n_options > 2) args.n_threads = atoi(argv[4]);
@@ -286,7 +287,7 @@ int exec_cli(const char *path) {
     }
 
     Session session;
-    if (!session_open(&session, &g, err, sizeof err)) {
+    if (!session_open(&session, &g, path, err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         gguf_close(&g);
         return 1;

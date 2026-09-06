@@ -28,6 +28,9 @@ struct Runtime {
     RopeConfig rope;
     int n_ctx;
     int cache_width;
+    int n_segments;
+    int query_quant_width;
+    int query_segments;
     int max_tokens;
 
     uint8_t *cache;
@@ -90,18 +93,19 @@ static uint8_t *cache_slot(Runtime *runtime, int layer, int position) {
 
 static float *slot_scales(Runtime *runtime, int layer, int position) {
     return runtime->cache_scale +
-           ((size_t)layer * runtime->n_ctx + position) * SLOT_SEGMENTS;
+           ((size_t)layer * runtime->n_ctx + position) * runtime->n_segments;
 }
 
 static int8_t *query_quants(Runtime *runtime, int token, int head) {
     return runtime->query_quants +
            ((size_t)token * runtime->model->n_head + head) *
-               runtime->cache_width;
+               runtime->query_quant_width;
 }
 
 static QuantizedQuery *query_scales(Runtime *runtime, int token, int head) {
     return runtime->query_scale +
-           ((size_t)token * runtime->model->n_head + head) * SLOT_SEGMENTS;
+           ((size_t)token * runtime->model->n_head + head) *
+               runtime->query_segments;
 }
 
 /* An integer dot arrives with the bias the cache's unsigned quants put into it
@@ -178,7 +182,7 @@ typedef struct {
    scoring by position, folding by latent column -- costs 14% of decode at 900
    and at 2300 positions, so the read stays repeated per worker. Softmax zeroes
    the rows past a token's position, which is what lets a block run whole. */
-static void attention_worker(void *state, int worker, int n_workers) {
+static void attention_mla_worker(void *state, int worker, int n_workers) {
     const AttentionJob *job = state;
     Runtime *runtime = job->runtime;
     const Model *model = runtime->model;
@@ -237,7 +241,8 @@ static void attention_worker(void *state, int worker, int n_workers) {
                               model->qk_rope_dim);
                 float *row = score_row(runtime, head, t, n_tokens) + p;
                 for (int r = 0; r < CACHE_ROWS; r++) {
-                    const float *scale = scales + (size_t)r * SLOT_SEGMENTS;
+                    const float *scale =
+                        scales + (size_t)r * runtime->n_segments;
                     row[r] = (scaled_dot(latent[r], &query[SLOT_LATENT],
                                          scale[SLOT_LATENT]) +
                               scaled_dot(rotary[r], &query[SLOT_ROTARY],
@@ -288,14 +293,11 @@ static void attention_worker(void *state, int worker, int n_workers) {
     }
 }
 
-static void attention(Runtime *runtime, const Layer *layer, int layer_index,
-                      int position, int n_tokens) {
+static void attention_mla(Runtime *runtime, const Layer *layer,
+                          int layer_index, int position, int n_tokens) {
     const Model *model = runtime->model;
     int rank = model->kv_lora_rank;
 
-    run_matmul(runtime, runtime->query,
-               (size_t)model->n_head * model->head_dim_k, layer->attn_q, 0,
-               &runtime->normed_batch);
     run_matmul(runtime, runtime->kv_projected, (size_t)runtime->cache_width,
                layer->kv_a_mqa, 0, &runtime->normed_batch);
 
@@ -317,8 +319,162 @@ static void attention(Runtime *runtime, const Layer *layer, int layer_index,
 
     AttentionJob job = {runtime,  layer,    layer_index,
                         position, n_tokens, position + n_tokens};
-    pool_run(runtime->pool, attention_worker, &job);
+    pool_run(runtime->pool, attention_mla_worker, &job);
+}
 
+/* GQA scores each query head against its own key head and folds the same
+   head's values, so the cache holds every key and value in full rather than a
+   shared latent. The slot is n_head_kv keys then n_head_kv values, each
+   quantized with its own scale. */
+static void attention_gqa_worker(void *state, int worker, int n_workers) {
+    const AttentionJob *job = state;
+    Runtime *runtime = job->runtime;
+    const Model *model = runtime->model;
+    int head_dim_k = model->head_dim_k;
+    int head_dim_v = model->head_dim_v;
+    int n_head_kv = model->n_head_kv;
+    int n_rot = model->qk_rope_dim;
+    int n_tokens = job->n_tokens;
+    int query_width = model->n_head * head_dim_k;
+    int out_width = model->n_head * head_dim_v;
+    int kv_width = n_head_kv * head_dim_k;
+    int n_rows = cache_rows(job->n_cached);
+    int width = runtime->cache_width;
+    float *block = runtime->cache_block + (size_t)worker * CACHE_ROWS * width;
+
+    int head_begin = model->n_head * worker / n_workers;
+    int head_end = model->n_head * (worker + 1) / n_workers;
+
+    for (int head = head_begin; head < head_end; head++) {
+        float *query = runtime->query + (size_t)head * head_dim_k;
+        for (int t = 0; t < n_tokens; t++)
+            rope_apply_neox(query + (size_t)t * query_width,
+                            runtime->cos_sin + (size_t)t * n_rot, n_rot);
+        for (int t = 0; t < n_tokens; t++) {
+            int8_t *quants = query_quants(runtime, t, head);
+            QuantizedQuery *quantized = query_scales(runtime, t, head);
+            quantize_query(quantized, quants, query + (size_t)t * query_width,
+                           head_dim_k);
+        }
+    }
+
+    for (int p = 0; p < n_rows; p += CACHE_ROWS) {
+        const uint8_t *slot = cache_slot(runtime, job->layer_index, p);
+        const float *scales = slot_scales(runtime, job->layer_index, p);
+        for (int head = head_begin; head < head_end; head++) {
+            int kv = head * n_head_kv / model->n_head;
+            const uint8_t *k = slot + (size_t)kv * head_dim_k;
+            for (int t = 0; t < n_tokens; t++) {
+                const int8_t *quants = query_quants(runtime, t, head);
+                const QuantizedQuery *query = query_scales(runtime, t, head);
+                int32_t dots[CACHE_ROWS];
+                dot_int8_rows(dots, k, width, quants, head_dim_k);
+                float *row = score_row(runtime, head, t, n_tokens) + p;
+                for (int r = 0; r < CACHE_ROWS; r++)
+                    row[r] = scaled_dot(dots[r], query,
+                                        scales[(size_t)r * runtime->n_segments + kv]) *
+                             model->kq_scale;
+            }
+        }
+    }
+
+    for (int head = head_begin; head < head_end; head++)
+        for (int t = 0; t < n_tokens; t++) {
+            float *row = score_row(runtime, head, t, n_tokens);
+            int attended = job->position + t + 1;
+            softmax(row, attended);
+            memset(row + attended, 0,
+                   (size_t)(n_rows - attended) * sizeof *row);
+            memset(runtime->attn_out + (size_t)t * out_width +
+                       (size_t)head * head_dim_v,
+                   0, (size_t)head_dim_v * sizeof *runtime->attn_out);
+        }
+
+    int kv_begin = head_begin * n_head_kv / model->n_head;
+    int kv_end = (head_end - 1) * n_head_kv / model->n_head + 1;
+    for (int kv = kv_begin; kv < kv_end; kv++) {
+        int head_lo = kv * model->n_head / n_head_kv;
+        int head_hi = (kv + 1) * model->n_head / n_head_kv;
+        if (head_lo < head_begin) head_lo = head_begin;
+        if (head_hi > head_end) head_hi = head_end;
+        for (int p = 0; p < n_rows; p += CACHE_ROWS) {
+            for (int r = 0; r < CACHE_ROWS; r++)
+                expand_int8(block + (size_t)r * width,
+                            cache_slot(runtime, job->layer_index, p + r) +
+                                kv_width + (size_t)kv * head_dim_v,
+                            slot_scales(runtime, job->layer_index, p + r)
+                                [n_head_kv + kv],
+                            head_dim_v);
+            for (int head = head_lo; head < head_hi; head++)
+                for (int t = 0; t < n_tokens; t++)
+                    add_scaled_rows(runtime->attn_out + (size_t)t * out_width +
+                                        (size_t)head * head_dim_v,
+                                    block, width,
+                                    score_row(runtime, head, t, n_tokens) + p,
+                                    head_dim_v);
+        }
+    }
+}
+
+static void attention_gqa(Runtime *runtime, const Layer *layer, int layer_index,
+                          int position, int n_tokens) {
+    const Model *model = runtime->model;
+    int head_dim_k = model->head_dim_k;
+    int head_dim_v = model->head_dim_v;
+    int n_head_kv = model->n_head_kv;
+    int kv_width = n_head_kv * head_dim_k;
+
+    for (int t = 0; t < n_tokens; t++)
+        for (int head = 0; head < model->n_head; head++)
+            rmsnorm(runtime->query + (size_t)t * model->n_head * head_dim_k +
+                        (size_t)head * head_dim_k,
+                    runtime->query + (size_t)t * model->n_head * head_dim_k +
+                        (size_t)head * head_dim_k,
+                    layer->attn_q_norm->data, head_dim_k, model->rms_eps);
+
+    run_matmul(runtime, runtime->kv_projected, (size_t)runtime->cache_width,
+               layer->attn_k, 0, &runtime->normed_batch);
+    run_matmul(runtime, runtime->kv_projected + kv_width,
+               (size_t)runtime->cache_width, layer->attn_v, 0,
+               &runtime->normed_batch);
+
+    for (int t = 0; t < n_tokens; t++) {
+        float *k = runtime->kv_projected + (size_t)t * runtime->cache_width;
+        for (int kv = 0; kv < n_head_kv; kv++) {
+            float *head_k = k + (size_t)kv * head_dim_k;
+            rmsnorm(head_k, head_k, layer->attn_k_norm->data, head_dim_k,
+                    model->rms_eps);
+            rope_apply_neox(head_k,
+                            runtime->cos_sin + (size_t)t * model->qk_rope_dim,
+                            model->qk_rope_dim);
+        }
+        uint8_t *slot = cache_slot(runtime, layer_index, position + t);
+        float *scale = slot_scales(runtime, layer_index, position + t);
+        for (int kv = 0; kv < n_head_kv; kv++) {
+            scale[kv] = quantize_cache(slot + (size_t)kv * head_dim_k,
+                                       k + (size_t)kv * head_dim_k, head_dim_k);
+            scale[n_head_kv + kv] =
+                quantize_cache(slot + kv_width + (size_t)kv * head_dim_v,
+                               k + kv_width + (size_t)kv * head_dim_v,
+                               head_dim_v);
+        }
+    }
+
+    AttentionJob job = {runtime,  layer,    layer_index,
+                        position, n_tokens, position + n_tokens};
+    pool_run(runtime->pool, attention_gqa_worker, &job);
+}
+
+static void attention(Runtime *runtime, const Layer *layer, int layer_index,
+                      int position, int n_tokens) {
+    const Model *model = runtime->model;
+    run_matmul(runtime, runtime->query,
+               (size_t)model->n_head * model->head_dim_k, layer->attn_q, 0,
+               &runtime->normed_batch);
+    if (model->attention == ATTN_MLA)
+        attention_mla(runtime, layer, layer_index, position, n_tokens);
+    else
+        attention_gqa(runtime, layer, layer_index, position, n_tokens);
     activation_set(&runtime->heads_batch, runtime->heads_scratch,
                    runtime->attn_out,
                    (size_t)model->n_head * model->head_dim_v,
@@ -459,14 +615,26 @@ static void run_branches(Runtime *runtime, int n_branches, int n_tokens,
    probability alone -- the bias steers load balancing, not the mixture. */
 static void rank_experts(Runtime *runtime, const Layer *layer, int token) {
     const Model *model = runtime->model;
-    const float *bias = layer->router_bias->data;
+    const float *bias = layer->router_bias ? layer->router_bias->data : NULL;
     int used = model->n_expert_used;
     float *probs = runtime->router_probs + (size_t)token * model->n_expert;
     int *chosen = runtime->chosen + (size_t)token * used;
     float *weights = runtime->chosen_weight + (size_t)token * used;
 
-    for (int e = 0; e < model->n_expert; e++)
-        probs[e] = 1.0f / (1.0f + expf(-probs[e]));
+    if (model->gating == GATING_SOFTMAX) {
+        float max = probs[0];
+        for (int e = 1; e < model->n_expert; e++)
+            if (probs[e] > max) max = probs[e];
+        float sum = 0;
+        for (int e = 0; e < model->n_expert; e++) {
+            probs[e] = expf(probs[e] - max);
+            sum += probs[e];
+        }
+        for (int e = 0; e < model->n_expert; e++) probs[e] /= sum;
+    } else {
+        for (int e = 0; e < model->n_expert; e++)
+            probs[e] = 1.0f / (1.0f + expf(-probs[e]));
+    }
 
     for (int slot = 0; slot < used; slot++) {
         int best = -1;
@@ -476,7 +644,7 @@ static void rank_experts(Runtime *runtime, const Layer *layer, int token) {
             for (int s = 0; s < slot; s++)
                 if (chosen[s] == e) taken = 1;
             if (taken) continue;
-            float score = probs[e] + bias[e];
+            float score = probs[e] + (bias ? bias[e] : 0.0f);
             if (best < 0 || score > best_score) {
                 best = e;
                 best_score = score;
@@ -526,12 +694,15 @@ static int select_branches(Runtime *runtime, const Layer *layer, int n_tokens) {
         branch->n_tokens = flat - begin;
     }
 
-    Branch *shared = &runtime->branches[n_branches++];
-    shared->ffn = &layer->shared_expert;
-    shared->matrix_index = 0;
-    shared->token_begin = flat;
-    shared->n_tokens = n_tokens;
-    for (int t = 0; t < n_tokens; t++) add_branch_token(runtime, flat++, t, 1.0f);
+    if (model->n_expert_shared > 0) {
+        Branch *shared = &runtime->branches[n_branches++];
+        shared->ffn = &layer->shared_expert;
+        shared->matrix_index = 0;
+        shared->token_begin = flat;
+        shared->n_tokens = n_tokens;
+        for (int t = 0; t < n_tokens; t++)
+            add_branch_token(runtime, flat++, t, 1.0f);
+    }
     return n_branches;
 }
 
@@ -623,7 +794,18 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     /* Every position-indexed buffer holds a whole number of blocks, so a cache
        pass can run the block a chunk ends inside of to its end. */
     runtime->n_ctx = n_ctx = cache_rows(n_ctx);
-    runtime->cache_width = model->kv_lora_rank + model->qk_rope_dim;
+    if (model->attention == ATTN_MLA) {
+        runtime->cache_width = model->kv_lora_rank + model->qk_rope_dim;
+        runtime->n_segments = SLOT_SEGMENTS;
+        runtime->query_quant_width = runtime->cache_width;
+        runtime->query_segments = SLOT_SEGMENTS;
+    } else {
+        runtime->cache_width =
+            model->n_head_kv * (model->head_dim_k + model->head_dim_v);
+        runtime->n_segments = 2 * model->n_head_kv;
+        runtime->query_quant_width = model->head_dim_k;
+        runtime->query_segments = 1;
+    }
     runtime->max_tokens = n_ctx < PREFILL_CHUNK ? n_ctx : PREFILL_CHUNK;
     rope_init(&runtime->rope, model->rope_freq_base, model->rope_freq_scale,
               model->qk_rope_dim, model->rope_orig_ctx, model->rope_beta_fast,
@@ -669,11 +851,13 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
         &ok);
     runtime->heads_scratch = alloc_bytes(
         activation_bytes(model->n_head * model->head_dim_v, max_tokens), &ok);
-    runtime->head_scratch_bytes =
-        larger(activation_bytes(model->qk_nope_dim, max_tokens),
-               activation_bytes(model->kv_lora_rank, max_tokens));
-    runtime->head_scratch =
-        alloc_bytes((size_t)n_workers * runtime->head_scratch_bytes, &ok);
+    if (model->attention == ATTN_MLA) {
+        runtime->head_scratch_bytes =
+            larger(activation_bytes(model->qk_nope_dim, max_tokens),
+                   activation_bytes(model->kv_lora_rank, max_tokens));
+        runtime->head_scratch =
+            alloc_bytes((size_t)n_workers * runtime->head_scratch_bytes, &ok);
+    }
 
     runtime->branches = calloc((size_t)n_branches, sizeof *runtime->branches);
     runtime->branch_activations =
@@ -698,15 +882,15 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
 
     size_t slots = (size_t)model->n_layer * n_ctx;
     size_t cache_bytes = slots * (runtime->cache_width +
-                                  SLOT_SEGMENTS * sizeof(float));
+                                  runtime->n_segments * sizeof(float));
     runtime->cache = alloc_bytes(slots * runtime->cache_width, &ok);
-    runtime->cache_scale = alloc_floats(slots * SLOT_SEGMENTS, &ok);
+    runtime->cache_scale = alloc_floats(slots * runtime->n_segments, &ok);
 
     runtime->query_quants =
-        calloc((size_t)max_tokens * model->n_head * runtime->cache_width,
+        calloc((size_t)max_tokens * model->n_head * runtime->query_quant_width,
                sizeof *runtime->query_quants);
     runtime->query_scale =
-        calloc((size_t)max_tokens * model->n_head * SLOT_SEGMENTS,
+        calloc((size_t)max_tokens * model->n_head * runtime->query_segments,
                sizeof *runtime->query_scale);
     if (!runtime->query_quants || !runtime->query_scale) ok = 0;
 
@@ -718,18 +902,20 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     runtime->normed = alloc_floats((size_t)max_tokens * model->n_embd, &ok);
     runtime->query = alloc_floats(
         (size_t)max_tokens * model->n_head * model->head_dim_k, &ok);
-    runtime->query_latent = alloc_floats(
-        (size_t)max_tokens * model->n_head * model->kv_lora_rank, &ok);
     runtime->kv_projected =
         alloc_floats((size_t)max_tokens * runtime->cache_width, &ok);
-    runtime->kv_normed =
-        alloc_floats((size_t)max_tokens * model->kv_lora_rank, &ok);
     runtime->scores =
         alloc_floats((size_t)model->n_head * max_tokens * n_ctx, &ok);
-    runtime->attn_latent = alloc_floats(
-        (size_t)max_tokens * model->n_head * model->kv_lora_rank, &ok);
     runtime->attn_out = alloc_floats(
         (size_t)max_tokens * model->n_head * model->head_dim_v, &ok);
+    if (model->attention == ATTN_MLA) {
+        runtime->query_latent = alloc_floats(
+            (size_t)max_tokens * model->n_head * model->kv_lora_rank, &ok);
+        runtime->kv_normed =
+            alloc_floats((size_t)max_tokens * model->kv_lora_rank, &ok);
+        runtime->attn_latent = alloc_floats(
+            (size_t)max_tokens * model->n_head * model->kv_lora_rank, &ok);
+    }
     runtime->projected = alloc_floats((size_t)max_tokens * model->n_embd, &ok);
     runtime->gate = alloc_floats(ff_capacity, &ok);
     runtime->up = alloc_floats(ff_capacity, &ok);

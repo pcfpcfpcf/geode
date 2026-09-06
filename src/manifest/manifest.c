@@ -1,3 +1,4 @@
+#include "home.h"
 #include "json.h"
 #include "manifest.h"
 #include "modules.h"
@@ -250,12 +251,8 @@ int manifest_load(const char *path, Manifest *m, char *err, size_t errsz) {
     return 1;
 }
 
-static const char *default_out_path(void) {
-    static char buf[1024];
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-    snprintf(buf, sizeof buf, "%s/.geode/manifest.json", home);
-    return buf;
+static const char *default_out_path(const char *gguf_path) {
+    return geode_model_home(gguf_path, "manifest");
 }
 
 int manifest_main(int argc, char **argv) {
@@ -264,7 +261,7 @@ int manifest_main(int argc, char **argv) {
         return 2;
     }
     const char *gguf_path = argv[1];
-    const char *out_path = argc == 3 ? argv[2] : default_out_path();
+    const char *out_path = argc == 3 ? argv[2] : default_out_path(gguf_path);
 
     Reader r = {NULL, {0}};
     r.f = fopen(gguf_path, "rb");
