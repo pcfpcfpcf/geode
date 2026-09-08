@@ -33,9 +33,11 @@ void cuda_host_unpin(CudaDevice *dev, void *ptr);
 /* Drains the queue; a deferred kernel fault surfaces here. */
 int cuda_sync(CudaDevice *dev);
 
-/* Weight row encodings cuda_gemm reads. Anything else is uploaded by the
-   caller as CUDA_W_F32 rows dequantized on the host. */
-enum { CUDA_W_F32, CUDA_W_Q4K };
+/* Weight row encodings cuda_gemm reads. Q4_K streams at quant size; F16 is
+   what every other encoding is uploaded as, dequantized once on the host --
+   half the bytes of f32, which matters on every token of decode. F32 stays
+   for callers that need exact host values. */
+enum { CUDA_W_F32, CUDA_W_Q4K, CUDA_W_F16 };
 
 /* out[tokens][rows] = rows · x[tokens], where rows is a stack of n_head
    matrices of head_out rows each and x holds one n_in-wide segment per head
@@ -73,7 +75,27 @@ typedef struct {
     int fold_width;  /* MLA: rank; GQA: head_dim_v */
     float kq_scale;
     int n_ctx;
+    float rms_eps; /* rmsnorm epsilon for the prep kernels; the PTX reads
+                      fields by offset, so this one goes last */
 } CudaGeometry;
+
+/* The two halves of the attention pipeline the old design round-tripped
+   through the cpu: query norm+rope, and kv norm+rope+quantize straight into
+   the layer's cache slot at (position, position+n_tokens). One thread per
+   head (q) or per cache segment (kv) per token; n_head and n_segments must
+   fit a warp, which check_geometry already guarantees. The query is roped
+   in place -- GQA norms each head first against `weight`, MLA leaves the
+   nope slice alone and rotates only the tail. The kv kernel reads the kv
+   projection, applies the same normalization and rotation the cpu tier
+   does, and writes the slot's bytes and scales so the cache never crosses
+   the bus. Geometry (including rms_eps) comes from the device block. */
+void cuda_q_prep(CudaDevice *dev, unsigned long long query,
+                 unsigned long long cos_sin, unsigned long long weight,
+                 unsigned long long geometry_on_device, int n_tokens);
+void cuda_kv_prep(CudaDevice *dev, unsigned long long kv_projected,
+                  unsigned long long cos_sin, unsigned long long norm,
+                  unsigned long long slot_base,
+                  unsigned long long geometry_on_device, int n_tokens);
 
 /* Scores every cached position of one layer for every head and token,
    softmaxes each row, and folds the weighted cache into the attention output:

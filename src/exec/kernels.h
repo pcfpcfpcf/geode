@@ -28,6 +28,7 @@ void rope_apply(float *vec, const float *cos_sin, int n_dims);
 void rope_apply_neox(float *vec, const float *cos_sin, int n_dims);
 
 float fp16_to_fp32(uint16_t half);
+uint16_t fp32_to_fp16(float value);
 
 /* A chunk of activation vectors quantized to int8 together, so the cost is
    paid once and every row of the weight matrix reuses all of them. One

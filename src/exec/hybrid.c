@@ -25,13 +25,15 @@ typedef struct {
 
 typedef struct {
     DeviceTensor attn_q;
-    DeviceTensor kv_a;      /* MLA: compressed keys+values */
     DeviceTensor attn_k;    /* GQA */
     DeviceTensor attn_v;    /* GQA */
+    DeviceTensor kv_a;      /* MLA: compressed keys+values */
     DeviceTensor k_b;       /* MLA */
     DeviceTensor v_b;       /* MLA */
     DeviceTensor attn_output;
-    unsigned long long q_norm; /* GQA: per-layer, f32 */
+    unsigned long long q_norm;  /* GQA: per-layer, f32 */
+    unsigned long long kv_norm; /* f32: MLA kv_a_norm, GQA attn_k_norm */
+    int kv_merged;              /* GQA: attn_k/attn_v share one allocation */
 } HybridLayer;
 
 typedef struct {
@@ -40,23 +42,26 @@ typedef struct {
     CudaGeometry geometry;
     unsigned long long geom_on_device;
     unsigned long long normed, query, kv_projected, query_latent, attn_latent,
-        attn_out, projected, scores, cache;
-    uint8_t *slot_stage; /* packed slot+scales, staged for upload */
+        attn_out, projected, scores, cache, cos_sin;
+    /* The rope table is per-forward, not per-layer: it rides up once and
+       the other 47 layers of the same chunk skip their copy. */
+    int cos_sin_position, cos_sin_tokens;
 } Hybrid;
 
 /* -------------------------------------------------------------- */
 /* Weight upload. Q4_K rows whose length is whole 256-blocks stream
    straight into vram and dequantize inside the gemm; every other encoding
-   is dequantized here once, because the gpu would pay the unpack on every
-   token for a type the fused kernel does not know. */
+   is dequantized here once, to f16 -- half the f32 bytes, which the gemm
+   re-reads on every token of decode, and against the encoding's own
+   quantization error the half-ulp of f16 is noise. */
 
 static int tensor_rows(const GgufTensor *t) {
     unsigned long long stacked = t->dims[2] ? t->dims[2] : 1;
     return (int)(t->dims[1] * stacked);
 }
 
-static size_t f32_upload_bytes(const GgufTensor *t) {
-    return (size_t)tensor_rows(t) * (size_t)t->dims[0] * 4;
+static size_t f16_upload_bytes(const GgufTensor *t) {
+    return (size_t)tensor_rows(t) * (size_t)t->dims[0] * 2;
 }
 
 static int upload_tensor(CudaDevice *dev, const GgufTensor *t, DeviceTensor *out,
@@ -64,7 +69,7 @@ static int upload_tensor(CudaDevice *dev, const GgufTensor *t, DeviceTensor *out
     int n_in = (int)t->dims[0];
     int usable = t->type == GGML_TYPE_Q4_K && n_in % QK_K == 0;
 
-    size_t bytes = usable ? (size_t)t->n_bytes : f32_upload_bytes(t);
+    size_t bytes = usable ? (size_t)t->n_bytes : f16_upload_bytes(t);
     unsigned long long ptr = cuda_alloc(dev, bytes, err, errsz);
     if (!ptr) return 0;
 
@@ -79,9 +84,9 @@ static int upload_tensor(CudaDevice *dev, const GgufTensor *t, DeviceTensor *out
     }
 
     /* Dequantized rows keep the stack layout the gemm walks: matrix, row,
-       element. The source stride is the quantized row's, not the f32
-       destination's. */
-    float *rows = malloc(bytes);
+    element. The source stride is the quantized row's, not the f16
+    destination's. */
+    uint16_t *rows = malloc(bytes);
     if (!rows) {
         snprintf(err, errsz, "out of memory dequantizing %s", t->name);
         return 0;
@@ -89,25 +94,33 @@ static int upload_tensor(CudaDevice *dev, const GgufTensor *t, DeviceTensor *out
     size_t src_stride = row_bytes(t->type, n_in);
     const unsigned char *src = t->data;
     int stacked = (int)(t->dims[2] ? t->dims[2] : 1);
+    float *values = malloc((size_t)n_in * sizeof *values);
+    if (!values) {
+        snprintf(err, errsz, "out of memory dequantizing %s", t->name);
+        free(rows);
+        return 0;
+    }
     for (int m = 0; m < stacked; m++)
         for (int r = 0; r < (int)t->dims[1]; r++) {
-            dequant_row(src, t->type, n_in,
-                        rows + ((size_t)m * t->dims[1] + r) * n_in);
+            dequant_row(src, t->type, n_in, values);
+            uint16_t *dst = rows + ((size_t)m * t->dims[1] + r) * n_in;
+            for (int c = 0; c < n_in; c++) dst[c] = fp32_to_fp16(values[c]);
             src += src_stride;
         }
+    free(values);
     int ok = cuda_copy_to(dev, ptr, rows, bytes);
     free(rows);
     if (!ok) {
         snprintf(err, errsz, "%s", cuda_fault(dev));
         return 0;
     }
-    out->type = CUDA_W_F32;
+    out->type = CUDA_W_F16;
     out->ptr = ptr;
     return 1;
 }
 
 /* Every weight byte the strategy uploads, for the vram budget check.
-   Q4_K tensors stream at quant size; everything else grows to f32 on the
+   Q4_K tensors stream at quant size; everything else grows to f16 on the
    way up. */
 static size_t attention_upload_bytes(const Model *model) {
     size_t total = 0;
@@ -130,7 +143,7 @@ static size_t attention_upload_bytes(const Model *model) {
             const GgufTensor *t = tensors[k];
             int usable = t->type == GGML_TYPE_Q4_K &&
                          (int)t->dims[0] % QK_K == 0;
-            total += usable ? (size_t)t->n_bytes : f32_upload_bytes(t);
+            total += usable ? (size_t)t->n_bytes : f16_upload_bytes(t);
         }
     }
     return total;
@@ -138,75 +151,18 @@ static size_t attention_upload_bytes(const Model *model) {
 
 /* -------------------------------------------------------------- */
 /* The attention hook. Same contract as the cpu's: normed in, projected
-   out, kv appended to the cache at (layer, position). */
+   out, kv appended to the cache at (layer, position).
 
-static void prepare_query(Runtime *runtime, const Layer *layer, int n_tokens) {
-    const Model *model = runtime->model;
-    int head_dim = model->head_dim_k;
-    int q_stride = model->n_head * head_dim;
-    int rope = model->qk_rope_dim;
-
-    for (int t = 0; t < n_tokens; t++) {
-        const float *cos_sin = runtime->cos_sin + (size_t)t * rope;
-        for (int head = 0; head < model->n_head; head++) {
-            float *q = runtime->query + (size_t)t * q_stride +
-                       (size_t)head * head_dim;
-            if (model->attention == ATTN_GQA)
-                rmsnorm(q, q, layer->attn_q_norm->data, head_dim,
-                        model->rms_eps);
-            if (model->attention == ATTN_GQA)
-                rope_apply_neox(q, cos_sin, rope);
-            else
-                rope_apply(q + (head_dim - rope), cos_sin, rope);
-        }
-    }
-}
-
-static void prepare_kv(Runtime *runtime, const Layer *layer, int n_tokens,
-                       uint8_t *slot_stage) {
-    const Model *model = runtime->model;
-    const CudaGeometry *g = &((Hybrid *)runtime->device)->geometry;
-    int width = g->cache_width;
-    int slot_bytes = g->slot_bytes;
-
-    for (int t = 0; t < n_tokens; t++) {
-        float *projected =
-            runtime->kv_projected + (size_t)t * g->cache_width;
-        uint8_t *slot = slot_stage + (size_t)t * slot_bytes;
-        float *scales = (float *)(slot + width);
-        const float *cos_sin = runtime->cos_sin + (size_t)t * g->rope_dim;
-
-        if (model->attention == ATTN_MLA) {
-            float normed[512];
-            rmsnorm(normed, projected, layer->kv_a_norm->data, g->rank,
-                    model->rms_eps);
-            rope_apply(projected + g->rank, cos_sin, g->rope_dim);
-            scales[0] = quantize_cache(slot, normed, g->rank);
-            scales[1] =
-                quantize_cache(slot + g->rank, projected + g->rank,
-                               g->rope_dim);
-        } else {
-            int head_dim = model->head_dim_k;
-            int kv_width = model->n_head_kv * head_dim;
-            for (int kv = 0; kv < model->n_head_kv; kv++) {
-                float *k = projected + (size_t)kv * head_dim;
-                rmsnorm(k, k, layer->attn_k_norm->data, head_dim,
-                        model->rms_eps);
-                rope_apply_neox(k, cos_sin, model->qk_rope_dim);
-                scales[kv] = quantize_cache(slot + (size_t)kv * head_dim, k,
-                                            head_dim);
-                scales[model->n_head_kv + kv] =
-                    quantize_cache(slot + kv_width + (size_t)kv *
-                                                        model->head_dim_v,
-                                   projected + kv_width +
-                                       (size_t)kv * model->head_dim_v,
-                                   model->head_dim_v);
-            }
-        }
-    }
-}
+   One blocking call per layer: the copy-from at the end drains the kernel
+   queue, lands the output the ffn needs, and surfaces any deferred fault.
+   The uploads at the top never wait on a kernel -- the previous layer's
+   copy-from left the queue empty -- and everything between them is async
+   launches. The query and kv prepares run on the gpu (cuda_q_prep /
+   cuda_kv_prep), so no intermediate activation crosses the bus and the
+   cache slot is written in vram directly. */
 void gpu_attention(Runtime *runtime, const Layer *layer,
-                           int layer_index, int position, int n_tokens) {
+                          int layer_index, int position, int n_tokens) {
+    (void)layer; /* the layer's weights are already on the device */
     const Model *model = runtime->model;
     Hybrid *hy = runtime->device;
     HybridLayer *hl = &hy->layers[layer_index];
@@ -218,24 +174,28 @@ void gpu_attention(Runtime *runtime, const Layer *layer,
     int q_stride = model->n_head * head_dim;
 
     cuda_copy_to(dev, hy->normed, runtime->normed,
-                  (size_t)n_tokens * n_embd * 4);
+                 (size_t)n_tokens * n_embd * 4);
+    if (position != hy->cos_sin_position || n_tokens != hy->cos_sin_tokens) {
+        cuda_copy_to(dev, hy->cos_sin, runtime->cos_sin,
+                     (size_t)n_tokens * g->rope_dim * 4);
+        hy->cos_sin_position = position;
+        hy->cos_sin_tokens = n_tokens;
+    }
 
-    /* The query needs its norms and rotation before scoring, and the cpu
-       kernels already do both exactly -- so the query round-trips once. */
     cuda_gemm(dev, hl->attn_q.ptr, hy->normed, hy->query, n_embd,
               model->n_head * head_dim, 1, n_embd, 0, q_stride, n_tokens,
               hl->attn_q.type);
-    if (!cuda_copy_from(dev, runtime->query, hy->query,
-                        (size_t)n_tokens * q_stride * 4))
-        return;
-    prepare_query(runtime, layer, n_tokens);
-    cuda_copy_to(dev, hy->query, runtime->query,
-                  (size_t)n_tokens * q_stride * 4);
+    cuda_q_prep(dev, hy->query, hy->cos_sin, hl->q_norm, hy->geom_on_device,
+               n_tokens);
 
     if (mla) {
         cuda_gemm(dev, hl->kv_a.ptr, hy->normed, hy->kv_projected, n_embd,
                   g->cache_width, 1, n_embd, 0, g->cache_width, n_tokens,
                   hl->kv_a.type);
+    } else if (hl->kv_merged) {
+        cuda_gemm(dev, hl->attn_k.ptr, hy->normed, hy->kv_projected, n_embd,
+                  g->cache_width, 1, n_embd, 0, g->cache_width, n_tokens,
+                  hl->attn_k.type);
     } else {
         int kv_width = model->n_head_kv * model->head_dim_k;
         cuda_gemm(dev, hl->attn_k.ptr, hy->normed, hy->kv_projected, n_embd,
@@ -244,59 +204,47 @@ void gpu_attention(Runtime *runtime, const Layer *layer,
         cuda_gemm(dev, hl->attn_v.ptr, hy->normed,
                   hy->kv_projected + (size_t)kv_width * 4, n_embd,
                   model->n_head_kv * model->head_dim_v, 1, n_embd, 0,
-                  g->cache_width, n_tokens,
-                  hl->attn_v.type);
+                  g->cache_width, n_tokens, hl->attn_v.type);
     }
 
-    if (!cuda_copy_from(dev, runtime->kv_projected, hy->kv_projected,
-                        (size_t)n_tokens * g->cache_width * 4))
-        return;
-    prepare_kv(runtime, layer, n_tokens, hy->slot_stage);
-    cuda_copy_to(dev,
-                  hy->cache + (size_t)layer_index * g->n_ctx * g->slot_bytes +
-                      (size_t)position * g->slot_bytes,
-                  hy->slot_stage, (size_t)n_tokens * g->slot_bytes);
+    cuda_kv_prep(dev, hy->kv_projected, hy->cos_sin, hl->kv_norm,
+                 hy->cache + (size_t)layer_index * g->n_ctx * g->slot_bytes +
+                     (size_t)position * g->slot_bytes,
+                 hy->geom_on_device, n_tokens);
 
     if (mla) {
         cuda_gemm(dev, hl->k_b.ptr, hy->query, hy->query_latent,
                   model->qk_nope_dim, model->kv_lora_rank, model->n_head,
                   q_stride, head_dim, g->latent_stride, n_tokens,
                   hl->k_b.type);
-        cuda_attention(dev, hy->cache + (size_t)layer_index * g->n_ctx *
-                                            g->slot_bytes,
-                       hy->query, hy->query_latent, hy->scores,
-                       hy->attn_latent, position, n_tokens, g,
-                       hy->geom_on_device);
+    }
+    cuda_attention(dev, hy->cache + (size_t)layer_index * g->n_ctx *
+                                        g->slot_bytes,
+                   hy->query, mla ? hy->query_latent : hy->query, hy->scores,
+                   mla ? hy->attn_latent : hy->attn_out, position, n_tokens, g,
+                   hy->geom_on_device);
+    if (mla) {
         cuda_gemm(dev, hl->v_b.ptr, hy->attn_latent, hy->attn_out,
                   g->rank, model->head_dim_v, model->n_head, g->latent_stride,
                   g->rank, model->n_head * model->head_dim_v, n_tokens,
                   hl->v_b.type);
-    } else {
-        cuda_attention(dev, hy->cache + (size_t)layer_index * g->n_ctx *
-                                            g->slot_bytes,
-                       hy->query, hy->query, hy->scores, hy->attn_out,
-                       position, n_tokens, g, hy->geom_on_device);
     }
 
     cuda_gemm(dev, hl->attn_output.ptr, hy->attn_out, hy->projected,
               model->n_head * model->head_dim_v, n_embd, 1,
               model->n_head * model->head_dim_v, 0, n_embd, n_tokens,
               hl->attn_output.type);
+
     cuda_copy_from(dev, runtime->projected, hy->projected,
                    (size_t)n_tokens * n_embd * 4);
+    if (cuda_fault(dev)) {
+        fprintf(stderr, "gpu fault, cannot continue: %s\n", cuda_fault(dev));
+        exit(1);
+    }
 }
 
 static const float *hybrid_forward(Runtime *runtime, const int *tokens,
                                    int position, int n_tokens) {
-    Hybrid *hy = runtime->device;
-    /* cuda_start ran every kernel shape against checked results, so a fault
-       from here on means the driver is failing; continuing would emit
-       garbage as if it were logits. */
-    if (cuda_fault(hy->dev)) {
-        fprintf(stderr, "gpu fault, cannot continue: %s\n",
-                cuda_fault(hy->dev));
-        exit(1);
-    }
     return forward_with(runtime, tokens, position, n_tokens, gpu_attention);
 }
 
@@ -314,21 +262,21 @@ static void hybrid_teardown(Runtime *runtime) {
     CudaDevice *dev = hy->dev;
     if (dev) {
         cuda_host_unpin(dev, runtime->normed);
-        cuda_host_unpin(dev, runtime->query);
-        cuda_host_unpin(dev, runtime->kv_projected);
         cuda_host_unpin(dev, runtime->projected);
-        cuda_host_unpin(dev, hy->slot_stage);
+        cuda_host_unpin(dev, runtime->cos_sin);
         for (int i = 0; i < runtime->model->n_layer; i++) {
             HybridLayer *hl = &hy->layers ? &hy->layers[i] : NULL;
             if (!hl) break;
             cuda_free(dev, hl->attn_q.ptr);
             cuda_free(dev, hl->attn_output.ptr);
             cuda_free(dev, hl->kv_a.ptr);
+            /* Merged, attn_v points inside attn_k's allocation. */
             cuda_free(dev, hl->attn_k.ptr);
-            cuda_free(dev, hl->attn_v.ptr);
+            if (!hl->kv_merged) cuda_free(dev, hl->attn_v.ptr);
             cuda_free(dev, hl->k_b.ptr);
             cuda_free(dev, hl->v_b.ptr);
             cuda_free(dev, hl->q_norm);
+            cuda_free(dev, hl->kv_norm);
         }
         cuda_free(dev, hy->normed);
         cuda_free(dev, hy->query);
@@ -339,11 +287,11 @@ static void hybrid_teardown(Runtime *runtime) {
         cuda_free(dev, hy->projected);
         cuda_free(dev, hy->scores);
         cuda_free(dev, hy->cache);
+        cuda_free(dev, hy->cos_sin);
         cuda_free(dev, hy->geom_on_device);
         cuda_stop(dev);
     }
     free(hy->layers);
-    free(hy->slot_stage);
     free(hy);
     runtime->device = NULL;
     runtime_stop(runtime);
@@ -417,8 +365,53 @@ static int check_geometry(const Model *model, int n_ctx, char *err,
     return 1;
 }
 
+/* A small f32 vector -- a norm weight -- up as its own allocation. */
+static unsigned long long upload_f32(CudaDevice *dev, const float *values,
+                                      int n, char *err, size_t errsz) {
+    unsigned long long ptr = cuda_alloc(dev, (size_t)n * 4, err, errsz);
+    if (!ptr) return 0;
+    if (!cuda_copy_to(dev, ptr, values, (size_t)n * 4)) {
+        snprintf(err, errsz, "%s", cuda_fault(dev));
+        cuda_free(dev, ptr);
+        return 0;
+    }
+    return ptr;
+}
+
+static int q4k_streamable(const GgufTensor *t) {
+    return t->type == GGML_TYPE_Q4_K && (int)t->dims[0] % QK_K == 0;
+}
+
+/* GQA's key and value projections share one gemm when both stream as
+   Q4_K: stacked in one allocation, they are one matrix of cache_width
+   rows, which is exactly the kv projection's layout. */
+static int upload_gqa_kv(CudaDevice *dev, const Layer *layer, HybridLayer *hl,
+                         char *err, size_t errsz) {
+    const GgufTensor *k = layer->attn_k;
+    const GgufTensor *v = layer->attn_v;
+    hl->kv_merged = 0;
+    if (q4k_streamable(k) && q4k_streamable(v)) {
+        size_t k_bytes = k->n_bytes;
+        unsigned long long ptr = cuda_alloc(dev, k_bytes + v->n_bytes, err,
+                                            errsz);
+        if (!ptr) return 0;
+        if (!cuda_copy_to(dev, ptr, k->data, k_bytes) ||
+            !cuda_copy_to(dev, ptr + k_bytes, v->data, v->n_bytes)) {
+            snprintf(err, errsz, "%s", cuda_fault(dev));
+            cuda_free(dev, ptr);
+            return 0;
+        }
+        hl->attn_k = (DeviceTensor){ptr, CUDA_W_Q4K};
+        hl->attn_v = (DeviceTensor){ptr + k_bytes, CUDA_W_Q4K};
+        hl->kv_merged = 1;
+        return 1;
+    }
+    return upload_tensor(dev, k, &hl->attn_k, err, errsz) &&
+           upload_tensor(dev, v, &hl->attn_v, err, errsz);
+}
+
 static int upload_layer(CudaDevice *dev, const Model *model, int index,
-                       HybridLayer *hl, char *err, size_t errsz) {
+                        HybridLayer *hl, char *err, size_t errsz) {
     const Layer *layer = &model->layers[index];
     if (!upload_tensor(dev, layer->attn_q, &hl->attn_q, err, errsz))
         return 0;
@@ -439,21 +432,17 @@ static int upload_layer(CudaDevice *dev, const Model *model, int index,
                      GEMM_HEAD_ALIGN);
             return 0;
         }
-    } else {
-        if (!upload_tensor(dev, layer->attn_k, &hl->attn_k, err, errsz))
-            return 0;
-        if (!upload_tensor(dev, layer->attn_v, &hl->attn_v, err, errsz))
-            return 0;
-        hl->q_norm = cuda_alloc(dev, (size_t)model->head_dim_k * 4, err,
-                                errsz);
-        if (!hl->q_norm) return 0;
-        if (!cuda_copy_to(dev, hl->q_norm, layer->attn_q_norm->data,
-                          (size_t)model->head_dim_k * 4)) {
-            snprintf(err, errsz, "%s", cuda_fault(dev));
-            return 0;
-        }
+        hl->kv_norm = upload_f32(dev, layer->kv_a_norm->data,
+                                 model->kv_lora_rank, err, errsz);
+        return hl->kv_norm != 0;
     }
-    return 1;
+    if (!upload_gqa_kv(dev, layer, hl, err, errsz)) return 0;
+    hl->q_norm = upload_f32(dev, layer->attn_q_norm->data, model->head_dim_k,
+                            err, errsz);
+    if (!hl->q_norm) return 0;
+    hl->kv_norm = upload_f32(dev, layer->attn_k_norm->data, model->head_dim_k,
+                             err, errsz);
+    return hl->kv_norm != 0;
 }
 
 static Runtime *hybrid_start(const Model *model, const Plan *plan, int n_ctx,
@@ -503,6 +492,7 @@ static Runtime *hybrid_start(const Model *model, const Plan *plan, int n_ctx,
                                              : m->head_dim_v;
     g->kq_scale = m->kq_scale;
     g->n_ctx = runtime->n_ctx;
+    g->rms_eps = m->rms_eps;
 
     int max_tokens = runtime->max_tokens;
     size_t activations = (size_t)max_tokens *
@@ -526,12 +516,12 @@ static Runtime *hybrid_start(const Model *model, const Plan *plan, int n_ctx,
     }
 
     hy->layers = calloc((size_t)m->n_layer, sizeof *hy->layers);
-    hy->slot_stage = malloc((size_t)max_tokens * g->slot_bytes);
-    if (!hy->layers || !hy->slot_stage) {
+    if (!hy->layers) {
         snprintf(err, errsz, "out of memory");
         hybrid_teardown(runtime);
         return NULL;
     }
+    hy->cos_sin_position = -1;
 
     int ok = 1;
     for (int i = 0; i < m->n_layer && ok; i++)
@@ -555,9 +545,11 @@ static Runtime *hybrid_start(const Model *model, const Plan *plan, int n_ctx,
     ok &= (hy->scores = cuda_alloc(
                dev, (size_t)m->n_head * max_tokens * g->n_ctx * 4, err,
                errsz)) != 0;
-    ok &= (hy->cache = cuda_alloc(dev, (size_t)m->n_layer * g->n_ctx *
-                                             g->slot_bytes,
-                                  err, errsz)) != 0;
+ok &= (hy->cache = cuda_alloc(dev, (size_t)m->n_layer * g->n_ctx *
+                                              g->slot_bytes,
+                                   err, errsz)) != 0;
+    ok &= (hy->cos_sin = cuda_alloc(dev, (size_t)max_tokens * g->rope_dim * 4,
+                                    err, errsz)) != 0;
     ok &= (hy->geom_on_device = cuda_alloc(dev, sizeof *g, err, errsz)) != 0;
     if (m->attention == ATTN_MLA) {
         ok &= (hy->query_latent =
@@ -567,21 +559,29 @@ static Runtime *hybrid_start(const Model *model, const Plan *plan, int n_ctx,
                    cuda_alloc(dev, (size_t)max_tokens * g->latent_stride * 4,
                               err, errsz)) != 0;
     }
-if (ok) ok = cuda_copy_to(dev, hy->geom_on_device, g, sizeof *g);
+    if (ok) ok = cuda_copy_to(dev, hy->geom_on_device, g, sizeof *g);
     if (!ok) {
         if (!err[0]) snprintf(err, errsz, "%s", cuda_fault(dev));
         hybrid_teardown(runtime);
         return NULL;
     }
 
-    /* The per-layer transfers are small and frequent; pinning the buffers
-       they touch keeps each copy off the driver's pageable staging path. */
-    cuda_host_pin(dev, runtime->normed, (size_t)max_tokens * m->n_embd * 4);
-    cuda_host_pin(dev, runtime->query, (size_t)max_tokens * g->q_stride * 4);
-    cuda_host_pin(dev, runtime->kv_projected,
-                  (size_t)max_tokens * g->cache_width * 4);
-    cuda_host_pin(dev, runtime->projected, (size_t)max_tokens * m->n_embd * 4);
-    cuda_host_pin(dev, hy->slot_stage, (size_t)max_tokens * g->slot_bytes);
+    /* The per-layer transfers are small and frequent; a pin that silently
+       fell back to pageable staging costs ~1 ms a copy on this driver,
+       which is a whole decode rate -- so it is required, not best effort. */
+    if (!cuda_host_pin(dev, runtime->normed,
+                       (size_t)max_tokens * m->n_embd * 4) ||
+        !cuda_host_pin(dev, runtime->projected,
+                       (size_t)max_tokens * m->n_embd * 4) ||
+        !cuda_host_pin(dev, runtime->cos_sin,
+                       (size_t)max_tokens * g->rope_dim * 4)) {
+        snprintf(err, errsz,
+                 "could not pin the per-layer transfer buffers (another "
+                 "process may hold the gpu, or the driver refuses to pin "
+                 "this much host memory)");
+        hybrid_teardown(runtime);
+        return NULL;
+    }
     return runtime;
 }
 

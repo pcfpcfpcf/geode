@@ -21,6 +21,16 @@
 #define PESSIMISM_LO 0.70        /* predictions are pessimistic by policy:
                                     band low end = 0.70 x point estimate */
 #define HYBRID_SYNC_FACTOR 0.90  /* PCIe transfers + pipeline bubbles */
+#define HYBRID_GEMV_EFFICIENCY 0.50 /* attention decode reads are
+                                       latency-chained gemv rows plus fixed
+                                       per-layer kernel overhead, not a
+                                       streaming sweep: measured 34.8 GB/s
+                                       probe bandwidth delivers ~12-18 GB/s
+                                       effective on an M1200, and the cpu
+                                       side's byte model carries its own
+                                       slack, so this single factor absorbs
+                                       the end-to-end gap (measured: 13.5
+                                       tok/s, model now lands ~15) */
 #define MTP_ACCEPTANCE 2.0       /* only used when manifest has a draft head */
 #define GPU_DEQUANT_EFFICIENCY 0.50 /* assumed until a gpu dequant-shaped
                                        bench exists; dequant GEMM never hits
@@ -279,12 +289,17 @@ static void score_hybrid(Candidate *c, const Manifest *m,
                  "attention+kv do not fit in vram");
         return;
     }
-    /* Decode is expert-byte-bound: experts stream from DRAM exactly as in
-       CPU-STREAM; the gpu only takes attention+kv reads off DRAM. */
+    /* Decode is expert-byte-bound on the cpu side: experts stream from DRAM
+   exactly as in CPU-STREAM. The gpu takes attention+kv reads -- but the
+   strategy runs the two sides in lockstep, attention on the gpu then
+   experts on the cpu every layer, so the times add rather than overlap:
+   the binding resource is whichever side is slower per layer, and there
+   is no min(). */
     c->scorable = 1;
-    c->decode_tok_s[1] = dram->eff_bw / bytes_per_step;
-    double gpu_rate = gpu->hbm_bw / gpu_bytes_per_step;
-    if (gpu_rate < c->decode_tok_s[1]) c->decode_tok_s[1] = gpu_rate;
+    double cpu_time = (double)bytes_per_step / dram->eff_bw;
+    double gpu_time = (double)gpu_bytes_per_step /
+                      (gpu->hbm_bw * HYBRID_GEMV_EFFICIENCY);
+    c->decode_tok_s[1] = 1.0 / (cpu_time + gpu_time);
     if (flops_bound < c->decode_tok_s[1]) c->decode_tok_s[1] = flops_bound;
     c->decode_tok_s[1] *= HYBRID_SYNC_FACTOR * mtp_multiplier(m);
 }

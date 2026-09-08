@@ -100,6 +100,39 @@ float fp16_to_fp32(uint16_t h) {
     return f;
 }
 
+/* Round-to-nearest-even, the pairing of fp16_to_fp32. The values converted
+   are dequantized weights on their way to the gpu's f16 weight path: at most
+   half an f16 ulp of change, against quantization error of a full low bit. */
+uint16_t fp32_to_fp16(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int exp = (int)((bits >> 23) & 0xffu) - 127;
+    uint32_t man = bits & 0x7fffffu;
+    if (exp == 128) return sign | 0x7c00u | (man ? 0x200u : 0);
+    if (exp >= 16) return sign | 0x7c00u;
+    if (exp >= -14) {
+        uint32_t m10 = man >> 13;
+        uint32_t dropped = man & 0x1fffu;
+        if (dropped > 0x1000u || (dropped == 0x1000u && (m10 & 1))) {
+            if (++m10 == 0x400u) {
+                m10 = 0;
+                if (++exp >= 16) return sign | 0x7c00u;
+            }
+        }
+        return sign | (uint16_t)(((exp + 15) << 10) | m10);
+    }
+    if (exp < -25) return sign;
+    uint32_t all = 0x800000u | man;
+    int shift = -exp - 1;
+    uint32_t k = all >> shift;
+    uint32_t dropped = all & ((1u << shift) - 1);
+    uint32_t halfway = 1u << (shift - 1);
+    if (dropped > halfway || (dropped == halfway && (k & 1))) k++;
+    if (k >= 0x400u) return sign | 0x0400u;
+    return sign | (uint16_t)k;
+}
+
 static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d,
                                     uint8_t *m) {
     if (j < 4) {
