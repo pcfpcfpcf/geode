@@ -119,28 +119,85 @@ a tier that starts 40% behind the tier it replaces.
   lever. Both local models fit in RAM, so the planner marks it
   `not scorable`. It needs a model larger than 32 GB to exercise at all.
 
-## 6. Open, in order of expected value
+## 6. GigaChat's routed experts, resolved
 
-1. **GigaChat's routed experts run at 7.2 GB/s.** Traced on HYBRID: 356.1
-   MB of routed expert reads in 49.15 ms, against Qwen's 22.8 GB/s for the
-   same kind of work — and GigaChat does *fewer, larger* per-branch reads
-   (3.42 MB over 104 branches, against 2.86 MB over 384). Three times off
-   roofline on the README's actual target model is the only unexplained
-   CPU-side gap in the trace, and the only place a large decode win is
-   still plausibly sitting. Next measurement: the same model on CPU-STREAM,
-   traced, to see whether the gap is the expert path itself or something
-   the hybrid split introduces.
+The first draft of open item 1 below flagged GigaChat's routed experts at 7.2
+GB/s (356.1 MB in 49.15 ms, traced on HYBRID) as a 3× gap against Qwen's 22.8
+GB/s and the only unexplained CPU-side number in the trace. It does not
+reproduce. Two things were wrong with the original number.
+
+**The bucket was never routed-only.** `forward_feed_forward_cpu`'s
+`TRACE_EXPERTS` mark covers three things for GigaChat, not one: the routed
+experts (356.1 MB), the shared expert that runs on every MoE layer
+(`expert_shared_count=1`, 3.83 MB × 25 layers = 95.6 MB), and layer 0's dense
+FFN (`leading_dense_block_count=1`, no router at all, 26.8 MB) — because
+`select_branches` folds the shared expert into the same branch list
+`run_branches` streams, and layer 0 takes the `!has_experts` early return
+through the same mark. Qwen has neither a shared expert
+(`expert_shared_count` is absent) nor a dense leading layer, so its bucket
+really is 1097.1 MB of routed reads and nothing else. Dividing 356.1 MB into
+a bucket that actually moved 478.5 MB understates GigaChat's rate before
+anything else is considered.
+
+**The run was short.** 49.15 ms was one HYBRID pass from a 9-token decode on
+a loaded box. Re-run at 256 tokens, same prompt, interleaved between
+strategies, at `pool_default_workers()` (4, one per physical core — this
+part is 4c/8t):
+
+| run | strategy | experts ms/pass | bytes moved | GB/s |
+|---|---|---|---|---|
+| GigaChat 1 | CPU-STREAM | 29.79 | 478.5 MB | 16.06 |
+| GigaChat 2 | CPU-STREAM | 27.85\* | 478.5 MB | ~17.2 |
+| GigaChat 1 | HYBRID | 25.06 | 478.5 MB | 19.1 |
+| GigaChat 2 | HYBRID | 15.55 | 478.5 MB | 30.8 |
+| Qwen | CPU-STREAM | 68.25 | 1097.1 MB | 16.08 |
+
+\*second CPU-STREAM run's ffn/experts split wasn't captured, this is the
+attention-stage figure from the same run as a lower bound; the wall-clock
+tok/s (14.98) matches run 1's (14.52) closely enough to trust the rate.
+
+GigaChat's corrected rate (16–31 GB/s across four runs) brackets Qwen's
+(16.08 GB/s) instead of trailing it by 3×. The two models read the same DRAM
+through the same code path at the same rate; there was no
+architecture-specific bottleneck to find. Stage 3/4 (the expert cache pool)
+gains nothing here that the rest of Stage 1.5 didn't already rule out.
+
+One apparent finding from this re-run didn't survive a repeat: a single 1-
+against-8-thread comparison showed GigaChat's experts stage flatly failing
+to scale (102.69 ms/pass at 1 thread against 104.07 ms/pass at 8) against
+Qwen's clean 3.16× (247.93 → 78.51 ms/pass) over the same range. Re-run
+four times, interleaved, it didn't reproduce — 1 thread sat at 81–83 ms/pass
+and 8 sat at 40–43 ms/pass every time, a normal ~2× speedup. The first pair
+was noise, not a shape-specific threading bug; nothing here changes with
+core count, physical or logical, on hardware this box's size.
+
+Off to the side, across the four 256-token
+runs above, CPU-STREAM decoded GigaChat at 14.52 and 14.98 tok/s; HYBRID at
+11.27 and 13.64. That's CPU-STREAM ahead on 2 of 2 pairs, not the "1.2× on
+deepseek2, measured at batch 1" SYSTEM_DESIGN.md's strategy table currently
+claims. The attention `drain` (46 ms/pass, GPU) against CPU-STREAM's
+`attention` (28–35 ms/pass) was consistent across all three HYBRID runs here,
+which points at the same GPU-slower-than-DRAM story Qwen already told rather
+than at anything expert-specific — but four runs is short of the controlled
+A/B open item 1 below asks for, and the table's claim was made on runs at
+least as short as the one that produced the 7.2 GB/s number this section just
+retracted. Filed as open item 1 below.
+
+## 7. Open, in order of expected value
+
+1. **Re-run the deepseek2 HYBRID-vs-CPU-STREAM decode claim.** ≥256 tokens,
+   ≥3 interleaved pairs, idle box — the protocol that exposed the thermal
+   confound, now aimed at the specific number in §6 that came back backwards
+   on a first pass. If it holds, the SYSTEM_DESIGN.md table's "1.2×" for
+   deepseek2 decode needs the same rewrite qwen3moe already got.
 2. **The routing hit-rate curve.** Dump the router's top-8 per layer per
    token over a few hundred tokens and plot hits against pool size. It
    sizes every cache decision in Stage 3 and Stage 4, it settles whether
    load-balanced routing has flattened the skew enough to kill the caching
    thesis outright, and it needs no kernels. Cheap either way, and a flat
    curve saves months.
-3. **A controlled decode A/B**, ≥256 tokens, ≥3 interleaved pairs, idle
-   box — the protocol that exposed the thermal confound, now that there is
-   a stage table to read alongside the totals.
 
-## 7. Commitments
+## 8. Commitments
 
 The 1.25× and 1.4× decode targets are withdrawn. They were computed from a
 bandwidth ratio this box does not have. The honest claim for HYBRID decode
