@@ -10,4 +10,8 @@ int selftest_tokenizer(const GgufFile *g);
 int selftest_prefill(const GgufFile *g);
 int selftest_hybrid(const GgufFile *g);
 
+/* Not a pass/fail check: prints the per-shape throughput table and returns
+   0, or 1 when the model or the gpu could not be brought up. */
+int selftest_bench(const GgufFile *g);
+
 #endif

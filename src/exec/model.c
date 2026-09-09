@@ -255,6 +255,14 @@ static void load_layer(Loader *loader, Model *model, Layer *layer, int index) {
     }
 }
 
+/* The layer's deterministic feed-forward: the dense block's own ffn, or the
+   MoE layer's shared expert. Every token reads it, so strategies place it on
+   their fastest tier; everything stochastic stays behind. */
+const FeedForward *model_base_ffn(const Model *model, const Layer *layer) {
+    if (!layer->has_experts) return &layer->dense;
+    return model->n_expert_shared > 0 ? &layer->shared_expert : NULL;
+}
+
 int model_load(Model *model, const GgufFile *gguf, char *err, size_t errsz) {
     memset(model, 0, sizeof *model);
 

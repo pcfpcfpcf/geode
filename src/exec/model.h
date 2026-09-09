@@ -94,4 +94,9 @@ typedef struct {
 int model_load(Model *model, const GgufFile *gguf, char *err, size_t errsz);
 void model_free(Model *model);
 
+/* The layer's deterministic feed-forward: the dense block's own ffn, or the
+   MoE layer's shared expert. Every token reads it, so strategies place it
+   on their fastest tier; the routed experts are what remains. */
+const FeedForward *model_base_ffn(const Model *model, const Layer *layer);
+
 #endif

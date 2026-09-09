@@ -200,6 +200,11 @@ static int run_hybrid(const GgufFile *g, const RunArgs *a) {
     return selftest_hybrid(g);
 }
 
+static int run_gemm(const GgufFile *g, const RunArgs *a) {
+    (void)a;
+    return selftest_bench(g);
+}
+
 typedef struct {
     const char *name;
     const char *options; /* NULL for a command taking only a model */
@@ -220,6 +225,8 @@ static const Command commands[] = {
      run_prefill},
     {"exec-hybrid", NULL, "check the gpu attention against the cpu's logits",
      run_hybrid},
+    {"exec-gemm", NULL, "bench the gpu gemms the hybrid executor runs",
+     run_gemm},
 };
 
 static const Command *find_command(const char *name) {

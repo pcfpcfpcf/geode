@@ -1,5 +1,6 @@
 #include "selftest.h"
 
+#include "cuda.h"
 #include "forward.h"
 #include "kernels.h"
 #include "model.h"
@@ -15,6 +16,7 @@ void gpu_attention(Runtime *runtime, const Layer *layer,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define PROMPT_TOKENS_MAX 2048
 
@@ -408,4 +410,154 @@ int selftest_hybrid(const GgufFile *g) {
     tokenizer_free(&t);
     model_free(&model);
     return report("hybrid", ok);
+}
+
+/* The gemm shapes the hybrid executor puts on the gpu -- attention per
+   layer plus the base feed-forward -- timed at decode's batch and the
+   prefill widths, against the probe's ceilings. The probe measures the
+   hardware; this measures the kernels the executor actually launches, so
+   the gap per shape is visible instead of folded into one end-to-end
+   number. The encoding per shape is the uploader's choice: Q4_K streams
+   at quant size, everything else lands as f16. */
+#define BENCH_SHAPES 16
+
+typedef struct {
+    char name[40];
+    int n_in, head_out, n_head, type; /* CUDA_W_* */
+} BenchShape;
+
+static void bench_add(BenchShape *shapes, int *n_shapes, const char *what,
+                      const GgufTensor *tensor, int n_in, int head_out,
+                      int n_head) {
+    int type = tensor->type == GGML_TYPE_Q4_K && n_in % QK_K == 0
+                   ? CUDA_W_Q4K
+                   : CUDA_W_F16;
+    for (int i = 0; i < *n_shapes; i++)
+        if (shapes[i].n_in == n_in && shapes[i].head_out == head_out &&
+            shapes[i].n_head == n_head && shapes[i].type == type)
+            return;
+    BenchShape *s = &shapes[(*n_shapes)++];
+    snprintf(s->name, sizeof s->name, "%-12s %-4s %5d->%-5dx%d", what,
+             type == CUDA_W_Q4K ? "q4k" : "f16", n_in, head_out, n_head);
+    s->n_in = n_in;
+    s->head_out = head_out;
+    s->n_head = n_head;
+    s->type = type;
+}
+
+int selftest_bench(const GgufFile *g) {
+    char err[256];
+    Model model;
+    if (!model_load(&model, g, err, sizeof err)) {
+        printf("gemm: %s\n", err);
+        return 1;
+    }
+    CudaDevice *dev;
+    if (!cuda_start(&dev, err, sizeof err)) {
+        printf("gemm: %s\n", err);
+        model_free(&model);
+        return 1;
+    }
+
+    BenchShape shapes[BENCH_SHAPES];
+    int n_shapes = 0;
+    const Model *m = &model;
+    for (int i = 0; i < m->n_layer; i++) {
+        const Layer *layer = &m->layers[i];
+        if (m->attention == ATTN_MLA) {
+            bench_add(shapes, &n_shapes, "kv_a", layer->kv_a_mqa, m->n_embd,
+                      m->kv_lora_rank + m->qk_rope_dim, 1);
+            bench_add(shapes, &n_shapes, "k_b", layer->k_b, m->qk_nope_dim,
+                      m->kv_lora_rank, m->n_head);
+            bench_add(shapes, &n_shapes, "v_b", layer->v_b, m->kv_lora_rank,
+                      m->head_dim_v, m->n_head);
+        } else {
+            bench_add(shapes, &n_shapes, "attn_k", layer->attn_k, m->n_embd,
+                      m->n_head_kv * m->head_dim_k, 1);
+            bench_add(shapes, &n_shapes, "attn_v", layer->attn_v, m->n_embd,
+                      m->n_head_kv * m->head_dim_v, 1);
+        }
+        bench_add(shapes, &n_shapes, "attn_q", layer->attn_q, m->n_embd,
+                  m->n_head * m->head_dim_k, 1);
+        bench_add(shapes, &n_shapes, "attn_output", layer->attn_output,
+                  m->n_head * m->head_dim_v, m->n_embd, 1);
+        const FeedForward *base = model_base_ffn(m, layer);
+        if (base) {
+            int width = (int)base->gate->dims[1];
+            bench_add(shapes, &n_shapes, "ffn_gate", base->gate, m->n_embd,
+                      width, 1);
+            bench_add(shapes, &n_shapes, "ffn_up", base->up, m->n_embd, width,
+                      1);
+            bench_add(shapes, &n_shapes, "ffn_down", base->down, width,
+                      m->n_embd, 1);
+        }
+    }
+
+    int batches[] = {1, PREFILL_CHUNK / 4, PREFILL_CHUNK / 2, PREFILL_CHUNK};
+    for (unsigned b = 0; b < sizeof batches / sizeof *batches; b++) {
+        int n_tokens = batches[b];
+        printf("\nbatch %d:\n%-30s %9s %9s %9s\n", n_tokens, "shape",
+               "ms/call", "GFLOPS", "GB/s");
+        for (int s = 0; s < n_shapes; s++) {
+            const BenchShape *sh = &shapes[s];
+            int rows = sh->head_out * sh->n_head;
+            size_t row_bytes = sh->type == CUDA_W_Q4K
+                                   ? (size_t)sh->n_in / 256 * 144
+                                   : (size_t)sh->n_in * 2;
+            size_t weight_bytes = (size_t)rows * row_bytes;
+            size_t x_bytes = (size_t)n_tokens * sh->n_in * 4;
+            size_t out_bytes = (size_t)n_tokens * rows * 4;
+            unsigned long long dw =
+                cuda_alloc(dev, weight_bytes, err, sizeof err);
+            unsigned long long dx =
+                cuda_alloc(dev, x_bytes, err, sizeof err);
+            unsigned long long dout =
+                cuda_alloc(dev, out_bytes, err, sizeof err);
+            if (!dw || !dx || !dout) {
+                printf("gemm: %s\n", "gpu out of memory for the bench");
+                cuda_stop(dev);
+                model_free(&model);
+                return 1;
+            }
+            /* Timing only: zero q4_k blocks dequant to zero, f16 rows hold
+               1.0 -- the instruction count is value-independent. */
+            void *fill = calloc(1, weight_bytes);
+            if (sh->type == CUDA_W_F16)
+                for (size_t i = 0; i < weight_bytes / 2; i++)
+                    ((uint16_t *)fill)[i] = fp32_to_fp16(1.0f);
+            cuda_copy_to(dev, dw, fill, weight_bytes);
+            free(fill);
+            float *x = malloc(x_bytes);
+            for (size_t i = 0; i < x_bytes / 4; i++) x[i] = 0.01f;
+            cuda_copy_to(dev, dx, x, x_bytes);
+            free(x);
+
+            int reps = n_tokens == 1 ? 500 : 200;
+            for (int i = 0; i < 20; i++)
+                cuda_gemm(dev, dw, dx, dout, sh->n_in, sh->head_out,
+                          sh->n_head, sh->n_in, sh->n_head > 1 ? sh->n_in : 0,
+                          rows, n_tokens, sh->type);
+            cuda_sync(dev);
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            double t0 = ts.tv_sec + ts.tv_nsec / 1e9;
+            for (int i = 0; i < reps; i++)
+                cuda_gemm(dev, dw, dx, dout, sh->n_in, sh->head_out,
+                          sh->n_head, sh->n_in, sh->n_head > 1 ? sh->n_in : 0,
+                          rows, n_tokens, sh->type);
+            cuda_sync(dev);
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            double ms = (ts.tv_sec + ts.tv_nsec / 1e9 - t0) * 1e3 / reps;
+            printf("%-30s %9.3f %9.1f %9.1f\n", sh->name, ms,
+                   2.0 * rows * sh->n_in * n_tokens / ms / 1e6,
+                   weight_bytes / ms / 1e6);
+            cuda_free(dev, dw);
+            cuda_free(dev, dx);
+            cuda_free(dev, dout);
+        }
+    }
+
+    cuda_stop(dev);
+    model_free(&model);
+    return 0;
 }

@@ -126,15 +126,6 @@ static int upload_tensor(CudaDevice *dev, const GgufTensor *t, DeviceTensor *out
     return 1;
 }
 
-/* The layer's deterministic feed-forward: the dense block's own ffn, or the
-   MoE layer's shared expert. Every token reads it, so it rides along with
-   attention -- placement, not caching: nothing about it is predicted. */
-static const FeedForward *layer_base_ffn(const Model *model,
-                                         const Layer *layer) {
-    if (!layer->has_experts) return &layer->dense;
-    return model->n_expert_shared > 0 ? &layer->shared_expert : NULL;
-}
-
 /* Every weight byte the strategy uploads, for the vram budget check.
    Q4_K tensors stream at quant size; everything else grows to f16 on the
    way up. */
@@ -155,7 +146,7 @@ static size_t weights_upload_bytes(const Model *model) {
             tensors[n++] = layer->attn_v;
             tensors[n++] = layer->attn_q_norm;
         }
-        const FeedForward *base = layer_base_ffn(model, layer);
+        const FeedForward *base = model_base_ffn(model, layer);
         if (base) {
             tensors[n++] = base->gate;
             tensors[n++] = base->up;
@@ -528,7 +519,7 @@ static int upload_layer(CudaDevice *dev, const Model *model, int index,
         if (!hl->kv_norm) return 0;
     }
 
-    const FeedForward *base = layer_base_ffn(model, layer);
+    const FeedForward *base = model_base_ffn(model, layer);
     if (!base) return 1;
     if (!upload_tensor(dev, base->gate, &hl->ffn_gate, err, errsz) ||
         !upload_tensor(dev, base->up, &hl->ffn_up, err, errsz) ||
@@ -542,7 +533,7 @@ static int upload_layer(CudaDevice *dev, const Model *model, int index,
 static int base_ffn_width(const Model *model) {
     int widest = 0;
     for (int i = 0; i < model->n_layer; i++) {
-        const FeedForward *base = layer_base_ffn(model, &model->layers[i]);
+        const FeedForward *base = model_base_ffn(model, &model->layers[i]);
         if (base) {
             int width = (int)base->gate->dims[1];
             if (width > widest) widest = width;
