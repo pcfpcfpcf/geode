@@ -18,8 +18,6 @@
 #define GEMM_ROWS_PER_BLOCK 8
 #define GEMM_TILE_MAX 8
 #define GEMM_TILE_COUNT 4       /* 1, 2, 4, 8 */
-/* The q4_k scale staging: 16 floats (8 scales, 8 negated mins) per warp. */
-#define GEMM_SCALE_SHARED 512
 
 /* The multi-token GEMM, for prefill's shapes. The row-per-warp kernels above
    dequantize every weight nibble once per token, so their issue rate
@@ -195,40 +193,47 @@ static void gemm_token2(FILE *out, int t, int w0) {
    sums the folds close over. The block's contribution lands in a
    temp first so the accumulator's serial chain is one add per
    block, not a four-deep fma stack. */
-static void gemm_q4_token(FILE *out, int t, int tile) {
-    (void)tile;
+static void gemm_q4_token(FILE *out, int t, int xb) {
+    /* xb is the register the pipeline staged this block's x values in,
+       or -1 when the token loads them itself (the wider prefill tiles,
+       where the registers only exist per token). */
+    if (xb < 0) {
+        fprintf(out,
+                "        ld.global.v4.f32 {%%f10,%%f11,%%f12,%%f13}, [%%rd%d];\n"
+                "        ld.global.v4.f32 {%%f14,%%f15,%%f16,%%f17}, [%%rd%d+128];\n",
+                16 + t, 16 + t);
+        xb = 10;
+    }
     fprintf(out,
-            "        ld.global.v4.f32 {%%f10,%%f11,%%f12,%%f13}, [%%rd%d];\n"
-            "        ld.global.v4.f32 {%%f14,%%f15,%%f16,%%f17}, [%%rd%d+128];\n"
             "        prmt.b32 %%r65, %%r46, %%r63, 0x6540;\n"
             "        cvt.rn.f32.u32 %%f18, %%r65;\n"
-            "        mul.rn.f32 %%f8, %%f18, %%f10;\n"
+            "        mul.rn.f32 %%f8, %%f18, %%f%d;\n"
             "        prmt.b32 %%r65, %%r46, %%r63, 0x6541;\n"
             "        cvt.rn.f32.u32 %%f18, %%r65;\n"
-            "        fma.rn.f32 %%f8, %%f18, %%f11, %%f8;\n"
+            "        fma.rn.f32 %%f8, %%f18, %%f%d, %%f8;\n"
             "        prmt.b32 %%r65, %%r46, %%r63, 0x6542;\n"
             "        cvt.rn.f32.u32 %%f18, %%r65;\n"
-            "        fma.rn.f32 %%f8, %%f18, %%f12, %%f8;\n"
+            "        fma.rn.f32 %%f8, %%f18, %%f%d, %%f8;\n"
             "        prmt.b32 %%r65, %%r46, %%r63, 0x6543;\n"
             "        cvt.rn.f32.u32 %%f18, %%r65;\n"
-            "        fma.rn.f32 %%f8, %%f18, %%f13, %%f8;\n"
+            "        fma.rn.f32 %%f8, %%f18, %%f%d, %%f8;\n"
             "        prmt.b32 %%r65, %%r47, %%r63, 0x6540;\n"
             "        cvt.rn.f32.u32 %%f18, %%r65;\n"
-            "        mul.rn.f32 %%f9, %%f18, %%f14;\n"
+            "        mul.rn.f32 %%f9, %%f18, %%f%d;\n"
             "        prmt.b32 %%r65, %%r47, %%r63, 0x6541;\n"
             "        cvt.rn.f32.u32 %%f18, %%r65;\n"
-            "        fma.rn.f32 %%f9, %%f18, %%f15, %%f9;\n"
+            "        fma.rn.f32 %%f9, %%f18, %%f%d, %%f9;\n"
             "        prmt.b32 %%r65, %%r47, %%r63, 0x6542;\n"
             "        cvt.rn.f32.u32 %%f18, %%r65;\n"
-            "        fma.rn.f32 %%f9, %%f18, %%f16, %%f9;\n"
+            "        fma.rn.f32 %%f9, %%f18, %%f%d, %%f9;\n"
             "        prmt.b32 %%r65, %%r47, %%r63, 0x6543;\n"
             "        cvt.rn.f32.u32 %%f18, %%r65;\n"
-            "        fma.rn.f32 %%f9, %%f18, %%f17, %%f9;\n"
-            "        add.f32 %%f23, %%f10, %%f11;\n"
-            "        add.f32 %%f24, %%f12, %%f13;\n"
+            "        fma.rn.f32 %%f9, %%f18, %%f%d, %%f9;\n"
+            "        add.f32 %%f23, %%f%d, %%f%d;\n"
+            "        add.f32 %%f24, %%f%d, %%f%d;\n"
             "        add.f32 %%f23, %%f23, %%f24;\n"
-            "        add.f32 %%f24, %%f14, %%f15;\n"
-            "        add.f32 %%f25, %%f16, %%f17;\n"
+            "        add.f32 %%f24, %%f%d, %%f%d;\n"
+            "        add.f32 %%f25, %%f%d, %%f%d;\n"
             "        add.f32 %%f24, %%f24, %%f25;\n"
             "        mul.f32 %%f26, %%f8, %%f19;\n"
             "        fma.rn.f32 %%f26, %%f23, %%f21, %%f26;\n"
@@ -236,7 +241,9 @@ static void gemm_q4_token(FILE *out, int t, int tile) {
             "        fma.rn.f32 %%f26, %%f24, %%f22, %%f26;\n"
             "        add.f32 %%f%d, %%f%d, %%f26;\n"
             "        add.s64 %%rd%d, %%rd%d, 1024;\n",
-            16 + t, 16 + t,
+            xb, xb + 1, xb + 2, xb + 3,
+            xb + 4, xb + 5, xb + 6, xb + 7,
+            xb, xb + 1, xb + 2, xb + 3, xb + 4, xb + 5, xb + 6, xb + 7,
             40 + t, 40 + t, 16 + t, 16 + t);
 }
 
@@ -279,17 +286,22 @@ static void gemm_q4_fold(FILE *out, int acc, int nlo, int nhi, int sc0,
             sc0, mn0, sc1, mn1, acc, acc);
 }
 
-static void gemm_q4_token2(FILE *out, int t) {
+static void gemm_q4_token2(FILE *out, int t, int xb) {
+    if (xb < 0) {
+        fprintf(out,
+                "        ld.global.v4.f32 {%%f10,%%f11,%%f12,%%f13}, [%%rd%d];\n"
+                "        ld.global.v4.f32 {%%f14,%%f15,%%f16,%%f17}, [%%rd%d+128];\n",
+                16 + t, 16 + t);
+        xb = 10;
+    }
     fprintf(out,
-            "        ld.global.v4.f32 {%%f10,%%f11,%%f12,%%f13}, [%%rd%d];\n"
-            "        ld.global.v4.f32 {%%f14,%%f15,%%f16,%%f17}, [%%rd%d+128];\n"
-            "        add.f32 %%f23, %%f10, %%f11;\n"
-            "        add.f32 %%f24, %%f12, %%f13;\n"
+            "        add.f32 %%f23, %%f%d, %%f%d;\n"
+            "        add.f32 %%f24, %%f%d, %%f%d;\n"
             "        add.f32 %%f23, %%f23, %%f24;\n"
-            "        add.f32 %%f24, %%f14, %%f15;\n"
-            "        add.f32 %%f25, %%f16, %%f17;\n"
+            "        add.f32 %%f24, %%f%d, %%f%d;\n"
+            "        add.f32 %%f25, %%f%d, %%f%d;\n"
             "        add.f32 %%f24, %%f24, %%f25;\n",
-            16 + t, 16 + t);
+            xb, xb + 1, xb + 2, xb + 3, xb + 4, xb + 5, xb + 6, xb + 7);
     gemm_q4_fold(out, 40 + 2 * t, 46, 47, 19, 20, 21, 22);
     gemm_q4_fold(out, 41 + 2 * t, 5, 6, 27, 28, 29, 30);
     fprintf(out,
@@ -315,6 +327,185 @@ static void gemm_token_ptr(FILE *out, int t) {
             t, 16 + t);
 }
 
+/* One body of the three-body q4 block loop. Body k computes blocks
+   i ≡ k (mod 3) out of generation k's registers while loading block
+   i+2 into generation (k+2)%3 -- the set body k-1 just finished
+   consuming -- so two full bodies stand between a weight load and its
+   first use. There are no rotation moves: a move would depend on the
+   load issued this body and couple the generations back into a
+   one-body pipeline. A predicated-off load leaves stale registers
+   behind; the guard at the next body's head retires their consumers
+   before any read. Weight loads ride the read-only cache. x pipelines
+   one body deep through f0-f7 (idle in the q4 branch -- the f32/f16
+   paths own them elsewhere); its foot move is safe because the L2
+   x latency hides under one body of issue, and the wider prefill
+   tiles keep loading x inline. */
+static void gemm_q4_body(FILE *out, int tile, int r, int k) {
+    int ri = r - 1, pf = (k + 2) % 3, next = (k + 1) % 3;
+    /* Generation register sets: g0 holds what the prologue loaded for
+       block 0, g1 block 1, g2 the first in-body prefetch. */
+    static const char *const q0[2][3] = {
+        {"%r45", "%r59", "%r71"}, {"%r45", "%r59", "%r72"}};
+    static const char *const q1[3] = {"%r66", "%r60", "%r73"};
+    static const char *const d0[2][3] = {
+        {"%rs1", "%rs3", "%rs5"}, {"%rs1", "%rs5", "%rs9"}};
+    static const char *const dm0[2][3] = {
+        {"%rs2", "%rs4", "%rs6"}, {"%rs2", "%rs6", "%rs10"}};
+    static const char *const d1[3] = {"%rs3", "%rs7", "%rs11"};
+    static const char *const dm1[3] = {"%rs4", "%rs8", "%rs12"};
+    static const char *const u0[2][3][3] = {
+        {{"%r1", "%r2", "%r3"}, {"%r56", "%r57", "%r58"},
+         {"%r73", "%r74", "%r75"}},
+        {{"%r1", "%r2", "%r3"}, {"%r56", "%r57", "%r58"},
+         {"%r74", "%r75", "%r76"}}};
+    static const char *const u1[3][3] = {
+        {"%r68", "%r69", "%r70"}, {"%r61", "%r62", "%r67"},
+        {"%r77", "%r78", "%r79"}};
+    fprintf(out,
+            "$L_q%d:\n"
+            "    setp.ge.s32 %%p1, %%r39, %%r30;\n"
+            "    @%%p1 bra $L_q_done;\n"
+            "    add.u32 %%r26, %%r39, 2;\n"
+            "    setp.lt.s32 %%p8, %%r26, %%r30;\n"
+            "    @%%p8 ld.global.nc.u32 %s, [%%rd15+288];\n"
+            "    @%%p8 ld.global.nc.b16 %s, [%%rd13+288];\n"
+            "    @%%p8 ld.global.nc.b16 %s, [%%rd13+290];\n"
+            "    setp.lt.and.s32 %%p9, %%r12, 8, %%p8;\n"
+            "    add.s64 %%rd1, %%rd14, %%rd4;\n"
+            "    add.s64 %%rd1, %%rd1, 288;\n"
+            "    @%%p9 ld.global.nc.u8 %s, [%%rd1];\n"
+            "    @%%p9 ld.global.nc.u8 %s, [%%rd1+4];\n"
+            "    add.s64 %%rd2, %%rd1, -4;\n"
+            "    @%%p9 ld.global.nc.u8 %s, [%%rd2];\n",
+            k, q0[ri][pf], d0[ri][pf], dm0[ri][pf], u0[ri][pf][0],
+            u0[ri][pf][1], u0[ri][pf][2]);
+    if (r == 2)
+        fprintf(out,
+                "    and.pred %%p10, %%p0, %%p8;\n"
+                "    @%%p10 ld.global.nc.u32 %s, [%%rd7+288];\n"
+                "    @%%p10 ld.global.nc.b16 %s, [%%rd0+288];\n"
+                "    @%%p10 ld.global.nc.b16 %s, [%%rd0+290];\n"
+                "    and.pred %%p10, %%p2, %%p8;\n"
+                "    add.s64 %%rd6, %%rd5, %%rd4;\n"
+                "    add.s64 %%rd6, %%rd6, 288;\n"
+                "    @%%p10 ld.global.nc.u8 %s, [%%rd6];\n"
+                "    @%%p10 ld.global.nc.u8 %s, [%%rd6+4];\n"
+                "    add.s64 %%rd2, %%rd6, -4;\n"
+                "    @%%p10 ld.global.nc.u8 %s, [%%rd2];\n",
+                q1[pf], d1[pf], dm1[pf], u1[pf][0], u1[pf][1], u1[pf][2]);
+    if (tile == 1)
+        fprintf(out,
+                "    add.u32 %%r27, %%r39, 1;\n"
+                "    setp.lt.s32 %%p9, %%r27, %%r30;\n"
+                "    @%%p9 ld.global.v4.f32 {%%f0,%%f1,%%f2,%%f3}, [%%rd16+1024];\n"
+                "    @%%p9 ld.global.v4.f32 {%%f4,%%f5,%%f6,%%f7}, [%%rd16+1152];\n");
+    fprintf(out,
+            "    cvt.f32.f16 %%f34, %s;\n"
+            "    cvt.f32.f16 %%f35, %s;\n",
+            d0[ri][k], dm0[ri][k]);
+    if (r == 2)
+        fprintf(out,
+                "    cvt.f32.f16 %%f36, %s;\n"
+                "    cvt.f32.f16 %%f37, %s;\n",
+                d1[k], dm1[k]);
+    fprintf(out,
+            "    @!%%p3 bra $L_ns%d;\n"
+            "    and.b32 %%r4, %s, 63;\n"
+            "    and.b32 %%r5, %s, 63;\n"
+            "    and.b32 %%r6, %s, 15;\n"
+            "    shr.u32 %%r7, %s, 6;\n"
+            "    shl.b32 %%r7, %%r7, 4;\n"
+            "    or.b32 %%r6, %%r6, %%r7;\n"
+            "    shr.u32 %%r7, %s, 4;\n"
+            "    shr.u32 %%r8, %s, 6;\n"
+            "    shl.b32 %%r8, %%r8, 4;\n"
+            "    or.b32 %%r8, %%r7, %%r8;\n"
+            "    selp.b32 %%r4, %%r4, %%r6, %%p4;\n"
+            "    selp.b32 %%r5, %%r5, %%r8, %%p4;\n"
+            "    cvt.rn.f32.u32 %%f18, %%r4;\n"
+            "    cvt.rn.f32.u32 %%f19, %%r5;\n"
+            "    mul.f32 %%f18, %%f18, %%f34;\n"
+            "    mul.f32 %%f19, %%f19, %%f35;\n"
+            "    sub.f32 %%f19, 0f00000000, %%f19;\n",
+            k, u0[ri][k][0], u0[ri][k][1], u0[ri][k][1], u0[ri][k][2],
+            u0[ri][k][1], u0[ri][k][0]);
+    if (r == 2)
+        fprintf(out,
+                "    and.b32 %%r4, %s, 63;\n"
+                "    and.b32 %%r5, %s, 63;\n"
+                "    and.b32 %%r6, %s, 15;\n"
+                "    shr.u32 %%r7, %s, 6;\n"
+                "    shl.b32 %%r7, %%r7, 4;\n"
+                "    or.b32 %%r6, %%r6, %%r7;\n"
+                "    shr.u32 %%r7, %s, 4;\n"
+                "    shr.u32 %%r8, %s, 6;\n"
+                "    shl.b32 %%r8, %%r8, 4;\n"
+                "    or.b32 %%r8, %%r7, %%r8;\n"
+                "    selp.b32 %%r4, %%r4, %%r6, %%p4;\n"
+                "    selp.b32 %%r5, %%r5, %%r8, %%p4;\n"
+                "    cvt.rn.f32.u32 %%f31, %%r4;\n"
+                "    cvt.rn.f32.u32 %%f32, %%r5;\n"
+                "    mul.f32 %%f31, %%f31, %%f36;\n"
+                "    mul.f32 %%f32, %%f32, %%f37;\n"
+                "    sub.f32 %%f32, 0f00000000, %%f32;\n",
+                u1[k][0], u1[k][1], u1[k][1], u1[k][2], u1[k][1], u1[k][0]);
+    /* Every lane pulls its sub-block pair's scales from the decoding
+       lanes with shfl instead of a shared round trip: no bar to sync
+       and no shared latency on the critical path. Lanes 8-31 rejoin
+       from the branch above in time to take part -- shfl is warp-wide.
+       r36 = 2*(lane>>3) names the pair's two staging lanes. */
+    fprintf(out,
+            "$L_ns%d:\n"
+            "    shfl.idx.b32 %%f21, %%f19, %%r36, 31;\n"
+            "    shfl.idx.b32 %%f22, %%f19, %%r37, 31;\n"
+            "    shfl.idx.b32 %%f19, %%f18, %%r36, 31;\n"
+            "    shfl.idx.b32 %%f20, %%f18, %%r37, 31;\n",
+            k);
+    if (r == 2)
+        fprintf(out,
+                "    shfl.idx.b32 %%f27, %%f31, %%r36, 31;\n"
+                "    shfl.idx.b32 %%f28, %%f31, %%r37, 31;\n"
+                "    shfl.idx.b32 %%f29, %%f32, %%r36, 31;\n"
+                "    shfl.idx.b32 %%f30, %%f32, %%r37, 31;\n");
+    fprintf(out,
+            "    and.b32 %%r46, %s, 0x0F0F0F0F;\n"
+            "    shr.u32 %%r47, %s, 4;\n"
+            "    and.b32 %%r47, %%r47, 0x0F0F0F0F;\n",
+            q0[ri][k], q0[ri][k]);
+    if (r == 2)
+        fprintf(out,
+                "    and.b32 %%r5, %s, 0x0F0F0F0F;\n"
+                "    shr.u32 %%r6, %s, 4;\n"
+                "    and.b32 %%r6, %%r6, 0x0F0F0F0F;\n",
+                q1[k], q1[k]);
+    for (int t = 0; t < tile; t++)
+        if (r == 2) gemm_q4_token2(out, t, tile == 1 ? 10 : -1);
+        else gemm_q4_token(out, t, tile == 1 ? 10 : -1);
+    if (tile == 1)
+        fprintf(out,
+                "    mov.f32 %%f10, %%f0;\n"
+                "    mov.f32 %%f11, %%f1;\n"
+                "    mov.f32 %%f12, %%f2;\n"
+                "    mov.f32 %%f13, %%f3;\n"
+                "    mov.f32 %%f14, %%f4;\n"
+                "    mov.f32 %%f15, %%f5;\n"
+                "    mov.f32 %%f16, %%f6;\n"
+                "    mov.f32 %%f17, %%f7;\n");
+    fprintf(out,
+            "    add.s64 %%rd13, %%rd13, 144;\n"
+            "    add.s64 %%rd14, %%rd14, 144;\n"
+            "    add.s64 %%rd15, %%rd15, 144;\n");
+    if (r == 2)
+        fprintf(out,
+                "    add.s64 %%rd0, %%rd0, 144;\n"
+                "    add.s64 %%rd5, %%rd5, 144;\n"
+                "    add.s64 %%rd7, %%rd7, 144;\n");
+    fprintf(out,
+            "    add.u32 %%r39, %%r39, 1;\n"
+            "    bra $L_q%d;\n",
+            next);
+}
+
 /* geode_gemm_t{tile}_r{rows}: out[token][row] = W_row . x[token].
 
    One entry per token-tile width (unrolled accumulators) and per
@@ -336,12 +527,11 @@ static void gemm_entry(FILE *out, int tile, int r) {
             "    .param .u32 p_x_head_stride, .param .u32 p_out_stride,\n"
             "    .param .u32 p_n_tokens, .param .u32 p_type)\n"
             "{\n"
-            "    .reg .pred %%p<8>;\n"
+            "    .reg .pred %%p<14>;\n"
             "    .reg .f32 %%f<56>;\n"
             "    .reg .b16 %%rs<17>;\n"
-            "    .reg .u32 %%r<68>;\n"
-            "    .reg .u64 %%rd<24>;\n"
-            "    .shared .align 16 .b8 geode_shm[%d];\n"
+"    .reg .u32 %%r<80>;\n"
+            "    .reg .b64 %%rd<24>;\n"
             "    ld.param.u64 %%rd10, [p_w];\n"
             "    ld.param.u64 %%rd11, [p_x];\n"
             "    ld.param.u64 %%rd12, [p_out];\n"
@@ -356,15 +546,12 @@ static void gemm_entry(FILE *out, int tile, int r) {
             "    mov.u32 %%r10, %%tid.x;\n"
             "    shr.u32 %%r11, %%r10, 5;\n"
             "    and.b32 %%r12, %%r10, 31;\n"
-            "    mov.u32 %%r13, geode_shm;\n"
             "    mul.lo.u32 %%r16, %%r49, %%r50;\n"
             "    mov.u32 %%r19, %%ctaid.y;\n"
             "    mul.lo.u32 %%r19, %%r19, %d;\n"
             "    mov.u32 %%r63, 0;\n"
-            "    shl.b32 %%r22, %%r11, %d;\n"
-            "    add.u32 %%r32, %%r13, %%r22;\n"
             "    mov.u32 %%r64, %%ctaid.x;\n",
-            tile, r, r == 2 ? 1024 : 512, tile, r == 2 ? 7 : 6);
+            tile, r, tile);
     fprintf(out,
             "    $L_row:\n"
             "    shl.b32 %%r14, %%r64, %d;\n",
@@ -493,8 +680,7 @@ static void gemm_entry(FILE *out, int tile, int r) {
             "    cvt.u64.u32 %%rd3, %%r35;\n"
             "    add.s64 %%rd15, %%rd13, %%rd3;\n"
             "    shl.b32 %%r36, %%r31, 1;\n"
-            "    shl.b32 %%r37, %%r36, 2;\n"
-            "    add.u32 %%r38, %%r32, %%r37;\n"
+            "    add.u32 %%r37, %%r36, 1;\n"
             "    mov.u32 %%r39, 0;\n"
             "    cvt.u64.u32 %%rd3, %%r41;\n");
     if (r == 2)
@@ -504,124 +690,69 @@ static void gemm_entry(FILE *out, int tile, int r) {
                 "    cvt.u64.u32 %%rd7, %%r35;\n"
                 "    add.s64 %%rd7, %%rd0, %%rd7;\n");
     for (int t = 0; t < tile; t++) gemm_token_ptr(out, t);
+    /* Software-pipelined q4 dot: the prologue loads blocks 0 and 1, then
+       the three-body loop below keeps two blocks of lead on every
+       weight read -- see gemm_q4_body. */
     fprintf(out,
-            "$L_qb:\n"
-            "    setp.ge.s32 %%p1, %%r39, %%r30;\n"
-            "    @%%p1 bra $L_q_done;\n"
-            "    ld.global.u32 %%r45, [%%rd15];\n"
-            "    ld.global.b16 %%rs1, [%%rd13];\n"
-            "    ld.global.b16 %%rs2, [%%rd13+2];\n"
-            "    cvt.f32.f16 %%f34, %%rs1;\n"
-            "    cvt.f32.f16 %%f35, %%rs2;\n");
-    if (r == 2)
-        fprintf(out,
-                "    @%%p0 ld.global.u32 %%r66, [%%rd7];\n"
-                "    @%%p0 ld.global.b16 %%rs3, [%%rd0];\n"
-                "    @%%p0 ld.global.b16 %%rs4, [%%rd0+2];\n"
-                "    cvt.f32.f16 %%f36, %%rs3;\n"
-                "    cvt.f32.f16 %%f37, %%rs4;\n");
-    fprintf(out,
-            "    add.s64 %%rd14, %%rd13, 4;\n"
             "    setp.lt.s32 %%p3, %%r12, 8;\n"
-            "    @!%%p3 bra $L_noscale;\n"
-            "    cvt.u64.u32 %%rd1, %%r12;\n"
-            "    add.s64 %%rd1, %%rd14, %%rd1;\n"
-            "    ld.global.u8 %%r1, [%%rd1];\n"
-            "    ld.global.u8 %%r2, [%%rd1+4];\n"
-            "    add.s64 %%rd2, %%rd1, -4;\n"
-            "    ld.global.u8 %%r3, [%%rd2];\n"
             "    setp.lt.s32 %%p4, %%r12, 4;\n"
-            "    and.b32 %%r4, %%r1, 63;\n"
-            "    and.b32 %%r5, %%r2, 63;\n"
-            "    and.b32 %%r6, %%r2, 15;\n"
-            "    shr.u32 %%r7, %%r3, 6;\n"
-            "    shl.b32 %%r7, %%r7, 4;\n"
-            "    or.b32 %%r6, %%r6, %%r7;\n"
-            "    shr.u32 %%r7, %%r2, 4;\n"
-            "    shr.u32 %%r8, %%r1, 6;\n"
-            "    shl.b32 %%r8, %%r8, 4;\n"
-            "    or.b32 %%r8, %%r7, %%r8;\n"
-            "    selp.b32 %%r4, %%r4, %%r6, %%p4;\n"
-            "    selp.b32 %%r5, %%r5, %%r8, %%p4;\n"
-            "    cvt.rn.f32.u32 %%f18, %%r4;\n"
-            "    cvt.rn.f32.u32 %%f19, %%r5;\n"
-            "    mul.f32 %%f18, %%f18, %%f34;\n"
-            "    mul.f32 %%f19, %%f19, %%f35;\n"
-            "    sub.f32 %%f19, 0f00000000, %%f19;\n"
-            "    shl.b32 %%r7, %%r12, 2;\n"
-            "    add.u32 %%r8, %%r32, %%r7;\n"
-            "    add.u32 %%r9, %%r8, 32;\n"
-            "    st.shared.f32 [%%r8], %%f18;\n"
-            "    st.shared.f32 [%%r9], %%f19;\n");
+            "    cvt.u64.u32 %%rd4, %%r12;\n"
+            "    add.s64 %%rd14, %%rd13, 4;\n"
+            "    setp.gt.s32 %%p9, %%r30, 0;\n"
+            "    @%%p9 ld.global.nc.u32 %%r45, [%%rd15];\n"
+            "    @%%p9 ld.global.nc.b16 %%rs1, [%%rd13];\n"
+            "    @%%p9 ld.global.nc.b16 %%rs2, [%%rd13+2];\n"
+            "    setp.lt.and.s32 %%p10, %%r12, 8, %%p9;\n"
+            "    add.s64 %%rd1, %%rd14, %%rd4;\n"
+            "    @%%p10 ld.global.nc.u8 %%r1, [%%rd1];\n"
+            "    @%%p10 ld.global.nc.u8 %%r2, [%%rd1+4];\n"
+            "    add.s64 %%rd2, %%rd1, -4;\n"
+            "    @%%p10 ld.global.nc.u8 %%r3, [%%rd2];\n"
+            "    setp.gt.s32 %%p8, %%r30, 1;\n"
+            "    @%%p8 ld.global.nc.u32 %s, [%%rd15+144];\n"
+            "    @%%p8 ld.global.nc.b16 %s, [%%rd13+144];\n"
+            "    @%%p8 ld.global.nc.b16 %s, [%%rd13+146];\n",
+            r == 2 ? "%r59" : "%r59", r == 2 ? "%rs5" : "%rs3",
+            r == 2 ? "%rs6" : "%rs4");
+    fprintf(out,
+            "    setp.lt.and.s32 %%p12, %%r12, 8, %%p8;\n"
+            "    add.s64 %%rd1, %%rd14, %%rd4;\n"
+            "    add.s64 %%rd1, %%rd1, 144;\n"
+            "    @%%p12 ld.global.nc.u8 %%r56, [%%rd1];\n"
+            "    @%%p12 ld.global.nc.u8 %%r57, [%%rd1+4];\n"
+            "    add.s64 %%rd2, %%rd1, -4;\n"
+            "    @%%p12 ld.global.nc.u8 %%r58, [%%rd2];\n");
     if (r == 2)
         fprintf(out,
+                "    add.s64 %%rd5, %%rd0, 4;\n"
                 "    setp.lt.and.s32 %%p2, %%r12, 8, %%p0;\n"
-                "    add.s64 %%rd14, %%rd0, 4;\n"
-                "    cvt.u64.u32 %%rd1, %%r12;\n"
-                "    add.s64 %%rd1, %%rd14, %%rd1;\n"
-                "    @%%p2 ld.global.u8 %%r1, [%%rd1];\n"
-                "    @%%p2 ld.global.u8 %%r2, [%%rd1+4];\n"
-                "    add.s64 %%rd2, %%rd1, -4;\n"
-                "    @%%p2 ld.global.u8 %%r3, [%%rd2];\n"
-                "    setp.lt.s32 %%p4, %%r12, 4;\n"
-                "    and.b32 %%r4, %%r1, 63;\n"
-                "    and.b32 %%r5, %%r2, 63;\n"
-                "    and.b32 %%r6, %%r2, 15;\n"
-                "    shr.u32 %%r7, %%r3, 6;\n"
-                "    shl.b32 %%r7, %%r7, 4;\n"
-                "    or.b32 %%r6, %%r6, %%r7;\n"
-                "    shr.u32 %%r7, %%r2, 4;\n"
-                "    shr.u32 %%r8, %%r1, 6;\n"
-                "    shl.b32 %%r8, %%r8, 4;\n"
-                "    or.b32 %%r8, %%r7, %%r8;\n"
-                "    selp.b32 %%r4, %%r4, %%r6, %%p4;\n"
-                "    selp.b32 %%r5, %%r5, %%r8, %%p4;\n"
-                "    cvt.rn.f32.u32 %%f18, %%r4;\n"
-                "    cvt.rn.f32.u32 %%f19, %%r5;\n"
-                "    mul.f32 %%f18, %%f18, %%f36;\n"
-                "    mul.f32 %%f19, %%f19, %%f37;\n"
-                "    sub.f32 %%f19, 0f00000000, %%f19;\n"
-                "    shl.b32 %%r7, %%r12, 2;\n"
-                "    add.u32 %%r8, %%r32, %%r7;\n"
-                "    add.u32 %%r8, %%r8, 64;\n"
-                "    add.u32 %%r9, %%r8, 32;\n"
-                "    @%%p2 st.shared.f32 [%%r8], %%f18;\n"
-                "    @%%p2 st.shared.f32 [%%r9], %%f19;\n");
-    fprintf(out,
-            "$L_noscale:\n"
-            "    bar.warp.sync 0xffffffff;\n"
-            "    and.b32 %%r46, %%r45, 0x0F0F0F0F;\n"
-            "    shr.u32 %%r47, %%r45, 4;\n"
-            "    and.b32 %%r47, %%r47, 0x0F0F0F0F;\n");
-    if (r == 2)
+                "    and.pred %%p11, %%p0, %%p9;\n"
+                "    @%%p11 ld.global.nc.u32 %%r66, [%%rd7];\n"
+                "    @%%p11 ld.global.nc.b16 %%rs3, [%%rd0];\n"
+                "    @%%p11 ld.global.nc.b16 %%rs4, [%%rd0+2];\n"
+                "    and.pred %%p11, %%p2, %%p9;\n"
+                "    add.s64 %%rd6, %%rd5, %%rd4;\n"
+                "    @%%p11 ld.global.nc.u8 %%r68, [%%rd6];\n"
+                "    @%%p11 ld.global.nc.u8 %%r69, [%%rd6+4];\n"
+                "    add.s64 %%rd2, %%rd6, -4;\n"
+                "    @%%p11 ld.global.nc.u8 %%r70, [%%rd2];\n"
+                "    and.pred %%p13, %%p0, %%p8;\n"
+                "    @%%p13 ld.global.nc.u32 %%r60, [%%rd7+144];\n"
+                "    @%%p13 ld.global.nc.b16 %%rs7, [%%rd0+144];\n"
+                "    @%%p13 ld.global.nc.b16 %%rs8, [%%rd0+146];\n"
+                "    and.pred %%p13, %%p2, %%p8;\n"
+                "    add.s64 %%rd6, %%rd5, %%rd4;\n"
+                "    add.s64 %%rd6, %%rd6, 144;\n"
+                "    @%%p13 ld.global.nc.u8 %%r61, [%%rd6];\n"
+                "    @%%p13 ld.global.nc.u8 %%r62, [%%rd6+4];\n"
+                "    add.s64 %%rd2, %%rd6, -4;\n"
+                "    @%%p13 ld.global.nc.u8 %%r67, [%%rd2];\n");
+    if (tile == 1)
         fprintf(out,
-                "    and.b32 %%r5, %%r66, 0x0F0F0F0F;\n"
-                "    shr.u32 %%r6, %%r66, 4;\n"
-                "    and.b32 %%r6, %%r6, 0x0F0F0F0F;\n");
+                "    @%%p9 ld.global.v4.f32 {%%f10,%%f11,%%f12,%%f13}, [%%rd16];\n"
+                "    @%%p9 ld.global.v4.f32 {%%f14,%%f15,%%f16,%%f17}, [%%rd16+128];\n");
+    for (int k = 0; k < 3; k++) gemm_q4_body(out, tile, r, k);
     fprintf(out,
-            "    ld.shared.f32 %%f19, [%%r38];\n"
-            "    ld.shared.f32 %%f20, [%%r38+4];\n"
-            "    ld.shared.f32 %%f21, [%%r38+32];\n"
-            "    ld.shared.f32 %%f22, [%%r38+36];\n");
-    if (r == 2)
-        fprintf(out,
-                "    ld.shared.f32 %%f27, [%%r38+64];\n"
-                "    ld.shared.f32 %%f28, [%%r38+68];\n"
-                "    ld.shared.f32 %%f29, [%%r38+96];\n"
-                "    ld.shared.f32 %%f30, [%%r38+100];\n");
-    for (int t = 0; t < tile; t++)
-        if (r == 2) gemm_q4_token2(out, t);
-        else gemm_q4_token(out, t, tile);
-    fprintf(out,
-            "    add.s64 %%rd13, %%rd13, 144;\n"
-            "    add.s64 %%rd15, %%rd15, 144;\n");
-    if (r == 2)
-        fprintf(out,
-                "    add.s64 %%rd0, %%rd0, 144;\n"
-                "    add.s64 %%rd7, %%rd7, 144;\n");
-    fprintf(out,
-            "    add.u32 %%r39, %%r39, 1;\n"
-            "    bra $L_qb;\n"
             "$L_q_done:\n"
             "$L_reduce:\n");
     fprintf(out,
@@ -3212,11 +3343,11 @@ char jit_log[2048] = "";
 
     /* How many gemm blocks stay resident decides the launch width; missing
        calls fall back to one block per row tile, correct but unpipelined. */
-    enum { CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16 };
-    if (dev->dev_attr && dev->occupancy &&
-        !dev->dev_attr(&dev->n_sm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                       dev->device) &&
-        dev->n_sm > 0)
+enum { CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16 };
+     if (dev->dev_attr && dev->occupancy &&
+         !dev->dev_attr(&dev->n_sm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                        dev->device) &&
+         dev->n_sm > 0)
         for (int i = 0; i < GEMM_TILE_COUNT; i++)
             for (int j = 0; j < 2; j++) {
                 int per_sm = 0;
@@ -3243,10 +3374,13 @@ char jit_log[2048] = "";
     if (!check_gemm(dev, CUDA_W_F32, SELF_TEST_TOKENS, err, errsz) ||
         !check_gemm(dev, CUDA_W_Q4K, SELF_TEST_TOKENS, err, errsz) ||
         !check_gemm(dev, CUDA_W_F16, SELF_TEST_TOKENS, err, errsz) ||
+        /* n_tokens 1 is the decode shape: the tile-1 kernels, where the
+           q4 dot's weight and x pipelines live. */
+        !check_gemm(dev, CUDA_W_Q4K, 1, err, errsz) ||
         !check_gemm_heads(dev, CUDA_W_F32, 16, 2, err, errsz) ||
         !check_gemm_heads(dev, CUDA_W_Q4K, 16, 2, err, errsz) ||
+        !check_gemm_heads(dev, CUDA_W_Q4K, 24, 1, err, errsz) ||
         !check_gemm_heads(dev, CUDA_W_F32, 24, 2, err, errsz) ||
-        !check_gemm_heads(dev, CUDA_W_Q4K, 24, 2, err, errsz) ||
         /* The token-tiled gemms: one width per tile entry, tails on the
            token and row axes, and stacked heads through grid.z. */
         !check_gemm(dev, CUDA_W_Q4K, 16, err, errsz) ||

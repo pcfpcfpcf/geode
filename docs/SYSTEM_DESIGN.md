@@ -119,7 +119,7 @@ Same box ± GPU:
 | | Decode | Cold prefill | KV capacity | Sync cost |
 |---|---|---|---|---|
 | CPU-STREAM | 1.0× (baseline) | 1.0× | all of DRAM | — |
-| HYBRID | **1.2× measured at batch 1** (bandwidth model: 2.1× — per-layer gemv latency eats the rest); **grows with ctx** | 1.1× measured, ~2× predicted (GEMM-shaped) | capped by VRAM; offload back to RAM negates | per-layer PCIe transfers + pipeline bubbles |
+| HYBRID | **architecture-dependent, not a constant**: 1.2× on deepseek2 at batch 1, **0.82× on qwen3moe** (9.84 against 12.04 tok/s, traced) — the GPU streams q4 gemv slower than this box's DRAM, and only a shared expert gives the routed pass anything to overlap with (STAGE_1_5.md) | 1.1× measured, ~2× predicted (GEMM-shaped) | capped by VRAM; offload back to RAM negates | per-layer PCIe transfers + pipeline bubbles |
 
 Decode multipliers are the bandwidth model of the table below, with the
 measured interleaved batch-1 A/B alongside. The planner predicts less than
@@ -171,18 +171,40 @@ earns its keep only where the GPU's bandwidth edge is wide enough to leave
 headroom (`h_balanced` rises toward 1 as `bw_fast/bw_slow` grows) — the same
 bandwidth-ratio rule as below, at a new operating point.
 
+Stage 1.5 measured `bw_fast` rather than inferring it, and the sign does not
+turn. On the same work the GPU's attention chain runs at 13.9 GB/s against
+the CPU's 23.3 (STAGE_1_5.md §3): `bw_fast/bw_slow` is *below one*, so the
+fast tier is the slow tier, and `h_balanced` stays negative for reasons the
+resident base has nothing to do with. For Qwen3-30B-A3B — `fixed_fast` 1224
+MB as attention+base+KV@4k, `movable` 1097 MB — that is
+`(13.9×1097 − 22.8×1224)/(1097×36.7) = −0.31`. The Phase-1 gemv pipelining
+moved the bench rows to 18–23 GB/s and does not change the ordering. PCIe
+closes the question from the other side: 10.1 GB/s measured, under DRAM's
+21.1, so expert bytes cannot be *streamed* to the card at decode time at
+all — a pool here has to be resident and loaded once, out of the ~1.6 GB of
+VRAM that attention+KV+base does not already claim. The "cache nothing" row
+above is a measurement on this box, not a pending re-measurement. (Its DRAM
+constant, 24.3 GB/s, is a stale probe; the current one reads 21.1.)
+
 The h=0 row is the Stage-1 deliverable itself: attention+KV+base in VRAM
-clears CPU-STREAM by 2.1× in this bandwidth model. Measured at batch 1 the
-gap is ~1.2× (interleaved A/B) — per-layer gemv latency on both tiers, not
-bandwidth, is what the box obeys.
+clears CPU-STREAM by 2.1× in this bandwidth model. Measured, deepseek2 gets
+~1.2× of that and qwen3moe gets 0.82×, and the stage table says where the
+model went wrong: host-side upload and kernel launches cost 1.34 ms of a
+101 ms token, while the device's own execution of the attention chain runs
+at 13.9 GB/s. The error is in `bw_fast` — the card is slower than the DRAM
+it was meant to relieve — not in a per-layer tax the model left out.
 
 **Bandwidth ratio sets the policy.** The same formula covers FLASH-STREAM
-(DRAM above NVMe), but a 12× bandwidth ratio puts `h_balanced` near 1 and
-makes the curve sharply asymmetric: under-caching is catastrophic (NVMe time
-explodes), over-caching is nearly free (DRAM sits idle). There, "maximize h"
-is the right one-sided approximation. For HYBRID (HBM above DRAM, 1.4× apart)
-the curve is symmetric and you must hit the balance point — over-caching
-hurts as much as under-caching. Same mechanism, different operating point,
+(DRAM above NVMe), but an 11× bandwidth ratio (21.1 over 1.93 GB/s, probed)
+puts `h_balanced` near 1 and makes the curve sharply asymmetric:
+under-caching is catastrophic (NVMe time explodes), over-caching is nearly
+free (DRAM sits idle). There, "maximize h"
+is the right one-sided approximation. Where the two tiers sit close together
+the curve is symmetric instead and you must hit the balance point —
+over-caching hurts as much as under-caching. On this box HYBRID is not even
+that case: the ratio is *below one* (13.9 GB/s achieved on the card against
+23.3 on the cpu, same work), so there is no balance point to aim at and the
+policy is cache nothing. Same mechanism, different operating point,
 determined entirely by the bandwidth ratio between adjacent tiers.
 
 **Predictor target shifts accordingly.** The predictor does not aim for the

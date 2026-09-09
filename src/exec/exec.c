@@ -138,6 +138,7 @@ static int stream_tokens(Session *session, Runtime *runtime, const int *ids,
         printf("decode:  %d tokens in %.2fs (%.2f tok/s)\n",
                stats.n_generated, stats.decode_seconds,
                stats.n_generated / stats.decode_seconds);
+    trace_report(&runtime->trace, "decode");
     return end;
 }
 

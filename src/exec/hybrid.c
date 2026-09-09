@@ -181,10 +181,12 @@ void gpu_attention(Runtime *runtime, const Layer *layer,
     HybridLayer *hl = &hy->layers[layer_index];
     CudaDevice *dev = hy->dev;
     const CudaGeometry *g = &hy->geometry;
+    Trace *trace = &runtime->trace;
     int mla = model->attention == ATTN_MLA;
     int n_embd = model->n_embd;
     int head_dim = model->head_dim_k;
     int q_stride = model->n_head * head_dim;
+    uint64_t mark = trace_now(trace);
 
     cuda_copy_to(dev, hy->normed, runtime->normed,
                  (size_t)n_tokens * n_embd * 4);
@@ -194,6 +196,7 @@ void gpu_attention(Runtime *runtime, const Layer *layer,
         hy->cos_sin_position = position;
         hy->cos_sin_tokens = n_tokens;
     }
+    mark = trace_mark(trace, TRACE_ATTN_UPLOAD, mark);
 
     cuda_gemm(dev, hl->attn_q.ptr, hy->normed, hy->query, n_embd,
               model->n_head * head_dim, 1, n_embd, 0, q_stride, n_tokens,
@@ -247,9 +250,11 @@ void gpu_attention(Runtime *runtime, const Layer *layer,
               model->n_head * model->head_dim_v, n_embd, 1,
               model->n_head * model->head_dim_v, 0, n_embd, n_tokens,
               hl->attn_output.type);
+    mark = trace_mark(trace, TRACE_ATTN_ISSUE, mark);
 
     cuda_copy_from(dev, runtime->projected, hy->projected,
                    (size_t)n_tokens * n_embd * 4);
+    trace_mark(trace, TRACE_ATTN_DRAIN, mark);
     if (cuda_fault(dev)) {
         fprintf(stderr, "gpu fault, cannot continue: %s\n", cuda_fault(dev));
         exit(1);
@@ -266,8 +271,10 @@ static void gpu_feed_forward(Runtime *runtime, const Layer *layer,
     Hybrid *hy = runtime->device;
     HybridLayer *hl = &hy->layers[layer_index];
     const Model *model = runtime->model;
+    Trace *trace = &runtime->trace;
     int n_embd = model->n_embd;
     int width = hl->ffn_width;
+    uint64_t mark = trace_now(trace);
 
     if (width) {
         CudaDevice *dev = hy->dev;
@@ -281,14 +288,17 @@ static void gpu_feed_forward(Runtime *runtime, const Layer *layer,
                     (size_t)n_tokens * width);
         cuda_gemm(dev, hl->ffn_down.ptr, hy->ffn_activated, hy->ffn_out, width,
                   n_embd, 1, width, 0, n_embd, n_tokens, hl->ffn_down.type);
+        mark = trace_mark(trace, TRACE_FFN_ISSUE, mark);
     }
 
     forward_feed_forward_cpu(runtime, layer, n_tokens, width > 0);
 
     if (width) {
         CudaDevice *dev = hy->dev;
+        mark = trace_now(trace);
         cuda_copy_from(dev, hy->ffn_result, hy->ffn_out,
                        (size_t)n_tokens * n_embd * 4);
+        trace_mark(trace, TRACE_FFN_DRAIN, mark);
         if (cuda_fault(dev)) {
             fprintf(stderr, "gpu fault, cannot continue: %s\n",
                     cuda_fault(dev));

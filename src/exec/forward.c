@@ -647,6 +647,9 @@ void forward_feed_forward_cpu(Runtime *runtime, const Layer *layer,
                                int n_tokens, int skip_base) {
     const Model *model = runtime->model;
 
+    Trace *trace = &runtime->trace;
+    uint64_t mark = trace_now(trace);
+
     if (!layer->has_experts) {
         if (skip_base) return;
         Branch *branch = &runtime->branches[0];
@@ -657,17 +660,23 @@ void forward_feed_forward_cpu(Runtime *runtime, const Layer *layer,
         for (int t = 0; t < n_tokens; t++)
             add_branch_token(runtime, t, t, 1.0f);
         run_branches(runtime, 1, n_tokens, &runtime->normed_batch);
+        trace_mark(trace, TRACE_EXPERTS, mark);
         return;
     }
     run_matmul(runtime, runtime->router_probs, (size_t)model->n_expert,
                layer->router, 0, &runtime->normed_batch);
-    run_branches(runtime, select_branches(runtime, layer, n_tokens, skip_base),
-                 n_tokens, &runtime->normed_batch);
+    int n_branches = select_branches(runtime, layer, n_tokens, skip_base);
+    mark = trace_mark(trace, TRACE_ROUTER, mark);
+    run_branches(runtime, n_branches, n_tokens, &runtime->normed_batch);
+    trace_mark(trace, TRACE_EXPERTS, mark);
 }
 const float *forward_with(Runtime *runtime, const int *tokens, int position,
                           int n_tokens, AttentionFn attention, FfnFn ffn) {
     const Model *model = runtime->model;
+    Trace *trace = &runtime->trace;
     int n_embd = model->n_embd;
+    uint64_t started = trace_now(trace);
+    uint64_t mark = started;
 
     for (int t = 0; t < n_tokens; t++) {
         const unsigned char *embedding =
@@ -678,24 +687,31 @@ const float *forward_with(Runtime *runtime, const int *tokens, int position,
         rope_position(runtime->cos_sin + (size_t)t * model->qk_rope_dim,
                       &runtime->rope, position + t);
     }
+    mark = trace_mark(trace, TRACE_EMBED, mark);
 
     for (int index = 0; index < model->n_layer; index++) {
         const Layer *layer = &model->layers[index];
 
         normalize(runtime, layer->attn_norm, n_tokens);
+        mark = trace_mark(trace, TRACE_NORM, mark);
         attention(runtime, layer, index, position, n_tokens);
+        mark = trace_mark(trace, TRACE_ATTENTION, mark);
         for (int t = 0; t < n_tokens; t++)
             add_scaled(runtime->residual + (size_t)t * n_embd,
                        runtime->projected + (size_t)t * n_embd, 1.0f, n_embd);
+        mark = trace_mark(trace, TRACE_RESIDUAL, mark);
 
         normalize(runtime, layer->ffn_norm, n_tokens);
+        mark = trace_mark(trace, TRACE_NORM, mark);
         if (ffn)
             ffn(runtime, layer, index, n_tokens);
         else
             forward_feed_forward_cpu(runtime, layer, n_tokens, 0);
+        mark = trace_mark(trace, TRACE_FFN, mark);
         for (int t = 0; t < n_tokens; t++)
             add_scaled(runtime->residual + (size_t)t * n_embd,
                        runtime->projected + (size_t)t * n_embd, 1.0f, n_embd);
+        mark = trace_mark(trace, TRACE_RESIDUAL, mark);
     }
 
     /* Only the last token is sampled, and the output matrix is the widest in
@@ -706,8 +722,11 @@ const float *forward_with(Runtime *runtime, const int *tokens, int position,
             model->output_norm->data, n_embd, model->rms_eps);
     activation_set(&runtime->normed_batch, runtime->normed_scratch,
                    runtime->normed, (size_t)n_embd, n_embd, 1);
+    mark = trace_mark(trace, TRACE_NORM, mark);
     run_matmul(runtime, runtime->logits, (size_t)model->n_vocab, model->output,
                0, &runtime->normed_batch);
+    trace_mark(trace, TRACE_LOGITS, mark);
+    trace_pass(trace, started, n_tokens);
     return runtime->logits;
 }
 
@@ -739,6 +758,7 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
         return NULL;
     }
     runtime->model = model;
+    trace_open(&runtime->trace, model->n_layer);
     /* Every position-indexed buffer holds a whole number of blocks, so a cache
        pass can run the block a chunk ends inside of to its end. */
     runtime->n_ctx = n_ctx = cache_rows(n_ctx);
