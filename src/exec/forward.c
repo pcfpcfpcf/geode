@@ -614,6 +614,10 @@ static int select_branches(Runtime *runtime, const Layer *layer, int n_tokens,
 
     for (int t = 0; t < n_tokens; t++) rank_experts(runtime, layer, t);
 
+    for (int t = 0; t < n_tokens; t++)
+        router_dump_row(&runtime->dump, (int)(layer - model->layers),
+                        runtime->chosen + (size_t)t * used);
+
     for (int e = 0; e < model->n_expert; e++) {
         int begin = flat;
         for (int t = 0; t < n_tokens; t++)
@@ -759,6 +763,8 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
     }
     runtime->model = model;
     trace_open(&runtime->trace, model->n_layer);
+    router_dump_open(&runtime->dump, model->n_layer, model->n_expert,
+                     model->n_expert_used);
     /* Every position-indexed buffer holds a whole number of blocks, so a cache
        pass can run the block a chunk ends inside of to its end. */
     runtime->n_ctx = n_ctx = cache_rows(n_ctx);
@@ -904,6 +910,7 @@ Runtime *runtime_start(const Model *model, int n_ctx, int n_threads, char *err,
 
 void runtime_stop(Runtime *runtime) {
     if (!runtime) return;
+    router_dump_close(&runtime->dump);
     pool_stop(runtime->pool);
     free(runtime->cache);
     free(runtime->cache_scale);

@@ -26,6 +26,12 @@ a different measurement. The `accounted` row against `wall` is the
 integrity check: it came out equal on every run below, so no time is
 hiding.
 
+`GEODE_ROUTER_DUMP=path` (`src/exec/router_dump.c`) is the second
+instrument: one line per layer per decoded token holding that token's
+routed-expert ids. It is armed at the same point the trace is reset, so it
+too is decode only. `scripts/router_hits.py` turns a dump into the
+hit-rate-vs-pool-size curve of §7.
+
 ## 2. Qwen3-30B-A3B Q4_K_M, both strategies
 
 Per-token component bytes from the manifest: attention 516.5 MB, base
@@ -183,21 +189,73 @@ A/B open item 1 below asks for, and the table's claim was made on runs at
 least as short as the one that produced the 7.2 GB/s number this section just
 retracted. Filed as open item 1 below.
 
-## 7. Open, in order of expected value
+## 7. Routing skew, measured
+
+The caching thesis in Stage 3/4 rests on the routed experts being read
+unevenly enough that a resident pool of the hot ones serves most of the
+traffic. Open item 2 asked whether load-balanced routing has flattened that
+skew away. It has not — on either model.
+
+400 decoded tokens, `GEODE_ROUTER_DUMP` over the same three-part prompt,
+`scripts/router_hits.py`. `static` holds each layer's K globally-hottest
+experts fixed; `lru` demand-pages a pool of K, evicting least-recently-used
+— the ceiling and a realistic floor for a prefetch-on-miss pool.
+
+**GigaChat (deepseek2, 64 experts, 4/token, 25 routed layers).** 28.4% of a
+token's experts carry over from the token before it, against a 6.2% uniform
+baseline.
+
+| pool K | K/N | static hit | lru hit | flattest layer (static) |
+|---|---|---|---|---|
+| 8 | 12% | 45% | 41% | 28% |
+| 16 | 25% | 64% | 61% | 45% |
+| 32 | 50% | 87% | 82% | 71% |
+
+**Qwen3-30B-A3B (qwen3moe, 128 experts, 8/token, 48 layers).** 43.1%
+carryover — *more* autocorrelated than GigaChat, not less.
+
+| pool K | K/N | static hit | lru hit | flattest layer (static) |
+|---|---|---|---|---|
+| 16 | 12% | 58% | 56% | 34% |
+| 32 | 25% | 82% | 79% | 57% |
+| 64 | 50% | 98% | 96% | 87% |
+
+A pool sized at an eighth of the stack serves 3.6× (GigaChat) to 4.6× (Qwen)
+its uniform share; even the single flattest layer in each model clears the
+uniform line at every K. The load-balancing bias evens out *aggregate*
+expert utilization over a long run — it does not make the per-token choice
+uniform, and it does not touch the token-to-token locality a small cache
+lives on.
+
+What this does and does not change:
+
+- **HYBRID decode is still not it.** §4 killed the GPU pool on the tier
+  ratio — `bw_fast/bw_slow` is 13.9/22.8, below one, and PCIe (10.1 GB/s)
+  is under DRAM (21.1). No hit rate rescues a ratio. The routed experts
+  already stream from DRAM at the roofline and there is no faster tier with
+  room to hold them.
+- **FLASH-STREAM gets a tailwind.** It is the one regime §5 keeps open
+  (DRAM/NVMe = 11×), and its planner score uses `H_ASSUMED = 0.50`
+  (`src/planner/planner.c`). Measured static hit at a quarter-stack pool is
+  64–82%, LRU 61–79%; at half-stack, 87–98% / 82–96%. The assumption is
+  conservative, so the planner under-predicts FLASH-STREAM tok/s rather than
+  over-predicting it — the safe direction, and worth revisiting the constant
+  once there is a real run to calibrate against.
+
+## 8. Open
 
 1. **Re-run the deepseek2 HYBRID-vs-CPU-STREAM decode claim.** ≥256 tokens,
    ≥3 interleaved pairs, idle box — the protocol that exposed the thermal
    confound, now aimed at the specific number in §6 that came back backwards
    on a first pass. If it holds, the SYSTEM_DESIGN.md table's "1.2×" for
    deepseek2 decode needs the same rewrite qwen3moe already got.
-2. **The routing hit-rate curve.** Dump the router's top-8 per layer per
-   token over a few hundred tokens and plot hits against pool size. It
-   sizes every cache decision in Stage 3 and Stage 4, it settles whether
-   load-balanced routing has flattened the skew enough to kill the caching
-   thesis outright, and it needs no kernels. Cheap either way, and a flat
-   curve saves months.
+2. **The hit-rate curve on a model that does not fit in RAM.** §7 is two
+   in-RAM models decoding on DRAM; it establishes that the skew exists and
+   survives load balancing, not that NVMe prefetch keeps up at decode rate.
+   FLASH-STREAM only runs on a model larger than 32 GB, and the `h` that
+   matters there is the one measured under actual eviction pressure.
 
-## 8. Commitments
+## 9. Commitments
 
 The 1.25× and 1.4× decode targets are withdrawn. They were computed from a
 bandwidth ratio this box does not have. The honest claim for HYBRID decode

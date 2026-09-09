@@ -66,6 +66,7 @@ int session_stream(Session *session, Runtime *runtime, const int *ids,
     /* Prefill runs the same code over chunks of 64, so its stage table is
        a different measurement; what a caller reports is the decode one. */
     trace_reset(&runtime->trace);
+    router_dump_arm(&runtime->dump);
 
     /* A reply closes with the message separator; a role separator in the
        middle of it means the model has started echoing the prompt template,

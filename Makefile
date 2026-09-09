@@ -11,7 +11,7 @@ GEODE_SRC = src/geode.c \
             src/exec/gguf.c src/exec/kernels.c src/exec/tokenizer.c \
             src/exec/model.c src/exec/forward.c \
             src/exec/plan.c src/exec/strategy.c src/exec/cpu_stream.c \
-            src/exec/trace.c \
+            src/exec/trace.c src/exec/router_dump.c \
             src/exec/cuda.c src/exec/hybrid.c \
             src/exec/chat.c src/exec/sampler.c \
             src/exec/session.c src/exec/serve.c \

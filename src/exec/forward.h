@@ -4,6 +4,7 @@
 #include "kernels.h"
 #include "model.h"
 #include "parallel.h"
+#include "router_dump.h"
 #include "trace.h"
 
 typedef struct Runtime Runtime;
@@ -43,6 +44,7 @@ struct Runtime {
     void *device;
     ThreadPool *pool;
     Trace trace;
+    RouterDump dump;
     RopeConfig rope;
     int n_ctx;
     int cache_width;
