@@ -97,6 +97,12 @@ void cuda_kv_prep(CudaDevice *dev, unsigned long long kv_projected,
                   unsigned long long slot_base,
                   unsigned long long geometry_on_device, int n_tokens);
 
+/* activated[i] = silu(gate[i]) * up[i] over the first `total` f32 elements.
+   The feed-forward's activation on the gpu, between the gate/up gemm and the
+   down gemm. */
+void cuda_swiglu(CudaDevice *dev, unsigned long long gate,
+                 unsigned long long up, unsigned long long out, size_t total);
+
 /* Scores every cached position of one layer for every head and token,
    softmaxes each row, and folds the weighted cache into the attention output:
    MLA into the latent buffer that v_b reads, GQA straight into the head-value

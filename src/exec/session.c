@@ -14,15 +14,15 @@ static double now_seconds(void) {
 }
 
 int session_open(Session *session, const GgufFile *g, const char *model,
-                 char *err, size_t errsz) {
+                 const char *strategy_wanted, char *err, size_t errsz) {
     char plan_err[256];
     int planned = plan_load(&session->plan, geode_model_home(model, "plan"),
                             plan_err, sizeof plan_err);
 
     double predicted[2];
     char note[256];
-    session->strategy =
-        strategy_choose(&session->plan, predicted, note, sizeof note);
+    session->strategy = strategy_choose(&session->plan, strategy_wanted,
+                                        predicted, note, sizeof note);
     if (!session->strategy) {
         snprintf(err, errsz, "%s", note);
         return 0;

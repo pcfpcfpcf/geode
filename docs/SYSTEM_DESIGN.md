@@ -100,29 +100,33 @@ Re-plan if achieved diverges >30% from predicted.
 |---|---|---|---|
 | RESIDENT | VRAM | fits in VRAM | llama.cpp / vLLM |
 | CPU-STREAM | DRAM | fits in DRAM | **built in-house** |
-| HYBRID | CPU-STREAM + attention/KV in VRAM | GPU present, prefill-heavy workload | **built in-house** |
+| HYBRID | CPU-STREAM + attention/KV/base in VRAM | GPU present, prefill-heavy workload | **built in-house** |
 | FLASH-STREAM | DRAM pool + NVMe | else | **built in-house** |
 
-**HYBRID accelerates both prefill and decode.** Prefill: attention/KV GEMM on
-the GPU. Decode gains twice, and the two gains are independent. First, moving
-attention+KV to VRAM takes their bytes off the DRAM path — 495 of 1139 MB per
-token on the target box at 4k ctx — which stands on its own with no expert
-cache at all. Second, the parallel-tier expert cache (see below) splits routed
-expert reads across HBM and DRAM, so the two bandwidth sources stack.
-Attention placement is a *variable* the planner scores, not a strategy
-constant.
+**HYBRID accelerates both prefill and decode.** Prefill: attention/KV/base
+GEMM on the GPU. Decode gains twice, and the two gains are independent.
+First, every deterministic read rides the GPU — attention+KV+base, 783 of
+1139 MB per token on the target box at 4k ctx — which stands on its own with
+no expert cache at all; the base FFN's gemms (the dense blocks and the
+shared experts) launch before the CPU's routed matmuls, so their bytes leave
+the DRAM path while their time hides under the routed work. Second, the
+parallel-tier expert cache (see below) splits routed expert reads across
+HBM and DRAM, so the two bandwidth sources stack. Component placement is a
+*variable* the planner scores, not a strategy constant.
 
 Same box ± GPU:
 
 | | Decode | Cold prefill | KV capacity | Sync cost |
 |---|---|---|---|---|
 | CPU-STREAM | 1.0× (baseline) | 1.0× | all of DRAM | — |
-| HYBRID | 1.8× without expert cache, 2.4× with (see below); **grows with ctx** | 3–6× | capped by VRAM; offload back to RAM negates | per-layer PCIe transfers + pipeline bubbles |
+| HYBRID | **1.2× measured at batch 1** (bandwidth model: 2.1× — per-layer gemv latency eats the rest); **grows with ctx** | 1.1× measured, ~2× predicted (GEMM-shaped) | capped by VRAM; offload back to RAM negates | per-layer PCIe transfers + pipeline bubbles |
 
-Decode multipliers are the bandwidth model of the table below. The planner
-predicts less — 1.5× point estimate on the target box — because it also charges
-the cpu dequant-flops bound and a PCIe sync factor. Stage 1 measures which one
-the box obeys.
+Decode multipliers are the bandwidth model of the table below, with the
+measured interleaved batch-1 A/B alongside. The planner predicts less than
+the bandwidth model because it also charges the cpu dequant-flops bound, a
+gemv-shape efficiency factor and a PCIe sync factor. Stage 1's measurement
+says which term the box obeys: at batch 1 both tiers deliver well under
+their probed streams on gemv shapes, so the ratio lands at ~1.2×, not 2×.
 
 Planner rule: add GPU to the plan iff `prefill_savings > pcie_overhead` at the
 workload's context length and prefill:decode ratio. Warm-cache agentic loops
@@ -132,9 +136,9 @@ workload's context length and prefill:decode ratio. Warm-cache agentic loops
 **Expert cache policy — balance, don't maximize.** The pool concept
 generalizes beyond FLASH-STREAM: cache hot experts at *every* tier boundary,
 not just DRAM above NVMe. For HYBRID this means a VRAM expert cache above
-DRAM — attention+KV resident in VRAM as before, plus as many hot experts as
-the balance point calls for. Both tiers read in parallel; the bottleneck is
-`max(gpu_time, dram_time)`, not the sum.
+DRAM — attention+KV+base resident in VRAM as before, plus as many hot
+experts as the balance point calls for. Both tiers read in parallel; the
+bottleneck is `max(gpu_time, dram_time)`, not the sum.
 
 The optimal admission is the hit rate that load-balances the two tiers —
 not the highest hit rate the cache can hold:
@@ -147,23 +151,30 @@ tier and `movable` is the routed expert bytes/token. Past this point, every
 expert promoted to the fast tier makes it *slower* — you're moving work from
 an underutilized tier to an overutilized one.
 
-On the target box (HBM 34.8 GB/s, DRAM 24.3 GB/s; fixed GPU 495 MB =
-attention+KV@4k, fixed DRAM 287 MB = base, movable 356 MB = routed).
+On the target box (HBM 34.8 GB/s, DRAM 24.3 GB/s; fixed GPU 783 MB =
+attention+KV@4k+base, fixed DRAM 0, movable 356 MB = routed).
 CPU-STREAM reads all 1139 MB from DRAM — 46.8 ms, 21.4 tok/s — and is the
 baseline both right-hand columns divide by:
 
 | h | GPU ms | DRAM ms | bottleneck | tok/s | vs CPU-STREAM 21.4 | vs ollama 8.75 |
 |---|---|---|---|---|---|---|
-| 0 (no cache) | 14.2 | 26.5 | DRAM | 37.8 | 1.8× | 4.3× |
-| **0.49** | **19.3** | **19.3** | **either** | **51.9** | **2.4×** | **5.9×** |
-| 0.85 | 22.9 | 14.0 | GPU | 43.6 | 2.0× | 5.0× |
-| 1.0 | 24.4 | 11.8 | GPU | 40.9 | 1.9× | 4.7× |
+| **0 (no cache)** | **22.5** | **14.7** | **GPU** | **44.4** | **2.1×** | **5.1×** |
+| 0.49 | 27.5 | 7.5 | GPU | 36.4 | 1.7× | 4.2× |
+| 0.85 | 31.2 | 2.2 | GPU | 32.1 | 1.5× | 3.7× |
+| 1.0 | 32.7 | 0 | GPU | 30.5 | 1.4× | 3.5× |
 
-h=0.85 is worse than h=0.49. "Cache as much as fits" over-caches into
-GPU-bound territory and throws away the parallel-bandwidth advantage.
+With the base resident, the GPU is the bottleneck before the cache admits a
+single expert: `h_balanced = (34.8×356 − 24.3×783)/(356×59.1) < 0`, so the
+balanced admission on this box is *cache nothing* — every promotion moves
+bytes from an underutilized DRAM to an oversubscribed HBM. The HYBRID cache
+earns its keep only where the GPU's bandwidth edge is wide enough to leave
+headroom (`h_balanced` rises toward 1 as `bw_fast/bw_slow` grows) — the same
+bandwidth-ratio rule as below, at a new operating point.
 
-The h=0 row is also why the Stage-1 gate is winnable before this cache
-exists: attention+KV in VRAM alone clears CPU-STREAM by 1.8×.
+The h=0 row is the Stage-1 deliverable itself: attention+KV+base in VRAM
+clears CPU-STREAM by 2.1× in this bandwidth model. Measured at batch 1 the
+gap is ~1.2× (interleaved A/B) — per-layer gemv latency on both tiers, not
+bandwidth, is what the box obeys.
 
 **Bandwidth ratio sets the policy.** The same formula covers FLASH-STREAM
 (DRAM above NVMe), but a 12× bandwidth ratio puts `h_balanced` near 1 and
@@ -177,7 +188,7 @@ determined entirely by the bandwidth ratio between adjacent tiers.
 **Predictor target shifts accordingly.** The predictor does not aim for the
 highest possible h — it aims for `h_balanced` on this hardware. For
 FLASH-STREAM (far tiers) this collapses to "maximize h" and the existing
-Stage-3 kill criterion (`hit rate <70% with trace pinning`) still holds. For
+Stage-4 kill criterion (`hit rate <70% with trace pinning`) still holds. For
 HYBRID (close tiers) over-prediction is a performance bug, not just wasted
 cache, and the kill criterion is "achieved h within tolerance of
 `h_balanced`" — missing high hurts as much as missing low.
@@ -240,7 +251,7 @@ predict: 60–90 tok/s decode (calibrating), TTFT ~4s @ 4k
 4. Emit package: weights (both variants) + `manifest.json` + **signed eval
    report** (`full-q4` vs `decomposed` on a fixed public suite + customer task
    set). The eval report is the compliance answer for gov-adjacent buyers and
-   automates the Stage-2 kill criterion: it becomes a diff against a signed
+   automates the Stage-3 kill criterion: it becomes a diff against a signed
    baseline, not a judgment call.
 
 ## 4. Contracts (write these first)
@@ -303,9 +314,9 @@ predict: 60–90 tok/s decode (calibrating), TTFT ~4s @ 4k
 | Stage | Deliverable | Kill criterion |
 |---|---|---|
 | 0 | probe + bench harness; baseline on target box | box BW too low → re-scope promise |
-| 1 | **in-house executor**: CPU-STREAM first (all on DRAM), then attention+KV on GPU → HYBRID. Minimal scope — one arch, Q4_K_M, batch 1–8; port ggml kernels as reference | HYBRID achieved < CPU-STREAM achieved |
-| 2 | decomposition pipeline | quality loss on task evals → full-weight fallback |
-| 3 | expert cache: pool, predictor, balance admission, parallel-tier read. First application: HYBRID (VRAM above DRAM) | achieved h outside tolerance of `h_balanced` |
+| 1 | **in-house executor**: CPU-STREAM first (all on DRAM), then attention+KV+base on GPU → HYBRID. Minimal scope — one arch, Q4_K_M, batch 1–8; port ggml kernels as reference | HYBRID achieved < CPU-STREAM achieved |
+| 2 | expert cache: pool, predictor, balance admission, parallel-tier read. First application: HYBRID (VRAM above DRAM) | achieved h outside tolerance of `h_balanced` |
+| 3 | decomposition pipeline | quality loss on task evals → full-weight fallback |
 | 4 | FLASH-STREAM executor (NVMe prefetch, layout, latency term) — expert cache applied to the disk tier | hit rate <70% with trace pinning |
 | 5 | MTP speculation | acceptance <2.0 |
 | 6 | RESIDENT parity, polish, registry | — |
@@ -315,7 +326,7 @@ layers — component-level placement is impossible inside its scheduler — and
 kt-kernel won't run on Maxwell. Placement is the product; it can't be delegated
 to a backend. Scope stays minimal: one architecture, one quant, batch 1–8,
 kernels ported from ggml as reference. The moat still starts at Stage 2
-(decomposition) and 3 (expert cache) — the executor is the vehicle, not the IP.
+(expert cache) and 3 (decomposition) — the executor is the vehicle, not the IP.
 
 ## 7. Competition / gap
 

@@ -22,11 +22,22 @@ typedef struct {
    this build has -- the planner refuses CPU-STREAM on a box the model does not
    fit in, and running it anyway would thrash rather than be slow.
 
+   `override` names a strategy the caller insists on, and wins over the plan;
+   the planner's objection, if any, is reported rather than obeyed. NULL or
+   empty leaves the choice to the plan.
+
    `predicted` takes the decode band the planner promised whichever strategy
    comes back, zeroed when it scored none. `note` takes the line to print: the
    plan is only a request, and which executor actually ran is the first thing a
    reader needs. */
-const Strategy *strategy_choose(const Plan *plan, double *predicted, char *note,
-                                size_t notesz);
+const Strategy *strategy_choose(const Plan *plan, const char *override,
+                                double *predicted, char *note, size_t notesz);
+
+/* The strategy spelled `name`, or NULL. Names are the strategies' own, as
+   printed in the plan. */
+const Strategy *strategy_find(const char *name);
+
+/* The names of every strategy this build has, comma-separated. */
+void strategy_names(char *out, size_t cap);
 
 #endif

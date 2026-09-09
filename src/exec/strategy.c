@@ -18,10 +18,18 @@ static const Strategy *const strategies[] = {
 /* What runs when the plan says nothing about any strategy this build has. */
 #define DEFAULT_STRATEGY (&cpu_stream)
 
-static const Strategy *strategy_named(const char *name) {
+const Strategy *strategy_find(const char *name) {
     for (unsigned i = 0; i < sizeof strategies / sizeof *strategies; i++)
         if (strcmp(strategies[i]->name, name) == 0) return strategies[i];
     return NULL;
+}
+
+void strategy_names(char *out, size_t cap) {
+    size_t used = 0;
+    for (unsigned i = 0; i < sizeof strategies / sizeof *strategies; i++) {
+        used += (size_t)snprintf(out + used, cap - used, "%s%s",
+                                 i ? ", " : "", strategies[i]->name);
+    }
 }
 
 static void set_band(double *predicted, const double *from) {
@@ -37,7 +45,7 @@ static const Strategy *best_scored(const Plan *plan, double *predicted) {
     for (int i = 0; i < plan->n_candidates; i++) {
         const Candidate *candidate = &plan->candidates[i];
         if (!candidate->scorable) continue;
-        const Strategy *strategy = strategy_named(candidate->strategy);
+        const Strategy *strategy = strategy_find(candidate->strategy);
         if (!strategy || candidate->decode_tok_s[1] <= predicted[1]) continue;
         best = strategy;
         set_band(predicted, candidate->decode_tok_s);
@@ -45,11 +53,41 @@ static const Strategy *best_scored(const Plan *plan, double *predicted) {
     return best;
 }
 
-const Strategy *strategy_choose(const Plan *plan, double *predicted, char *note,
-                                size_t notesz) {
+/* What a caller named by hand runs, plan or no plan: the planner's objection
+   is reported in the note, not obeyed -- the caller asked for it. */
+static const Strategy *strategy_overridden(const char *override,
+                                           const Plan *plan, double *predicted,
+                                           char *note, size_t notesz) {
+    const Strategy *wanted = strategy_find(override);
+    if (!wanted) {
+        char built[128];
+        strategy_names(built, sizeof built);
+        snprintf(note, notesz, "unknown strategy '%s'; built here: %s",
+                 override, built);
+        return NULL;
+    }
+
+    const Candidate *candidate = plan_candidate(plan, wanted->name);
+    if (candidate && candidate->scorable)
+        set_band(predicted, candidate->decode_tok_s);
+    if (candidate && !candidate->scorable)
+        snprintf(note, notesz, "strategy: %s (the planner ruled it out: %s)",
+                 wanted->name,
+                 candidate->reason[0] ? candidate->reason : "no reason given");
+    else
+        snprintf(note, notesz, "strategy: %s (chosen over the plan)",
+                 wanted->name);
+    return wanted;
+}
+
+const Strategy *strategy_choose(const Plan *plan, const char *override,
+                                double *predicted, char *note, size_t notesz) {
     predicted[0] = predicted[1] = 0;
 
-    const Strategy *planned = strategy_named(plan->strategy);
+    if (override && override[0])
+        return strategy_overridden(override, plan, predicted, note, notesz);
+
+    const Strategy *planned = strategy_find(plan->strategy);
     if (planned) {
         set_band(predicted, plan->predicted_tok_s);
         snprintf(note, notesz, "strategy: %s", planned->name);

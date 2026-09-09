@@ -21,11 +21,32 @@
 /* The q4_k scale staging: 16 floats (8 scales, 8 negated mins) per warp. */
 #define GEMM_SCALE_SHARED 512
 
+/* The multi-token GEMM, for prefill's shapes. The row-per-warp kernels above
+   dequantize every weight nibble once per token, so their issue rate
+   flatlines at ~110 GFLOPS no matter the batch -- the dequant, not the
+   memory system, sets the pace. This kernel stages a 64-row x 16-k tile of
+   weights, dequantized once, and the chunk's activations in shared memory,
+   then rank-1-updates a 4x4 register micro-tile per thread: 16 fma per 5
+   shared loads, the mix the probe's sgemm proved this gpu sustains at
+   534 GFLOPS. One entry per token-tile width so the micro-tile is always
+   full; tokens below GEMM_TILED_MIN stay on the latency-shaped kernels,
+   where decode lives. */
+#define GEMM_TILED_MIN 16
+#define GEMM_TT_COUNT 3
+static const int gemm_tt[GEMM_TT_COUNT] = {16, 32, 64};
+#define TILE_K 16
+#define TILE_ROWS 64
+#define TILE_AS_BYTES 5120   /* 64 rows x 80B: 16 k-f32 + 16B pad, v4-aligned */
+#define TILE_BS_STRIDE 272   /* per k-row: 64 t-f32 + 4B pad, bank-rotating */
+#define TILE_BS_BYTES (TILE_K * TILE_BS_STRIDE)
+#define TILE_SHM_BYTES (TILE_AS_BYTES + TILE_BS_BYTES)
+
 #define SCORE_BLOCK 128
 #define SCORE_TILE 8            /* positions staged per block */
 #define SOFTMAX_BLOCK 128
 #define FOLD_BLOCK 128
 #define FOLD_R_TILE 64
+#define SILU_BLOCK 256
 
 #define LOG2_E 1.44269504088896f
 
@@ -60,11 +81,13 @@ struct CudaDevice {
     void *ctx;
     void *module;
     void *gemm_fn[GEMM_TILE_COUNT][2];
+    void *gemm_tile_fn[GEMM_TT_COUNT];
     void *score_fn;
     void *softmax_fn;
     void *fold_fn;
     void *q_prep_fn;
     void *kv_prep_fn;
+    void *swiglu_fn;
     cu_mem_alloc_t mem_alloc;
     cu_mem_free_t mem_free;
     cu_mem_info_t mem_info;
@@ -83,6 +106,7 @@ struct CudaDevice {
        the launcher never launches more, so the kernel's row-tile loop takes
        the rest. */
     int gemm_max_blocks[GEMM_TILE_COUNT][2];
+    int gemm_tile_max[GEMM_TT_COUNT];
     char fault[192];
 };
 
@@ -655,6 +679,356 @@ static void gemm_entry(FILE *out, int tile, int r) {
             "    ret;\n"
             "}\n",
             3 + (r == 2));
+}
+
+/* --------------------------------------------------------------- */
+/* geode_gemm_tile{16,32,64}: the multi-token GEMM, for prefill's
+   shapes. The row-per-warp kernels above dequantize every weight nibble
+   once per token, so their issue rate flatlines at ~110 GFLOPS no matter
+   the batch -- the dequant, not the memory system, sets the pace. This
+   kernel stages a 64-row x 16-k tile of weights, dequantized once, plus
+   the chunk's activations in shared memory, then rank-1-updates a 4x4
+   register micro-tile per thread: 16 fma per 5 shared loads, the mix the
+   probe's sgemm proved this gpu sustains at 534 GFLOPS. One entry per
+   token-tile width keeps the micro-tile full; tokens below GEMM_TILED_MIN
+   stay on the latency-shaped kernels, where decode lives.
+
+   Register map: r0 tid, r1 ty, r2 tx, r3 block threads, r4 k-tile index,
+   r5 k-tiles, r10 row-tile index, r11 head (ctaid.z), r12 shared As,
+   r13 shared Bs, r14 loader items, r16 weight row bytes, r17 row-tile
+   base, r18 nctaid.x, r20 As + ty*320, r21 Bs + tx*16, r48-r55 params,
+   f40-f55 accumulators. Loader scratch r24-r47 and r56-r71. */
+static void gemm_tile_step(FILE *out, int kk) {
+    fprintf(out,
+            "    ld.shared.f32 %%f0, [%%r20+%d];\n"
+            "    ld.shared.f32 %%f1, [%%r20+%d];\n"
+            "    ld.shared.f32 %%f2, [%%r20+%d];\n"
+            "    ld.shared.f32 %%f3, [%%r20+%d];\n"
+            "    ld.shared.v4.f32 {%%f4,%%f5,%%f6,%%f7}, [%%r21+%d];\n",
+            kk * 4, 80 + kk * 4, 160 + kk * 4, 240 + kk * 4,
+            kk * TILE_BS_STRIDE);
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            fprintf(out, "    fma.rn.f32 %%f%d, %%f%d, %%f%d, %%f%d;\n",
+                    40 + i * 4 + j, i, 4 + j, 40 + i * 4 + j);
+}
+
+/* One loader item: 8 weight values (half of one row's k-tile), staged to
+   shared as f32 whatever the encoding. Invalid rows stage zeros so the
+   compute phase needs no masks. */
+static void gemm_tile_load_a(FILE *out) {
+    fprintf(out,
+            "    shr.u32 %%r24, %%r15, 1;\n"
+            "    and.b32 %%r25, %%r15, 1;\n"
+            "    add.u32 %%r26, %%r17, %%r24;\n"
+            "    shl.b32 %%r27, %%r4, 4;\n"
+            "    shl.b32 %%r28, %%r25, 3;\n"
+            "    add.u32 %%r27, %%r27, %%r28;\n"
+            "    mul.lo.u32 %%r29, %%r24, 80;\n"
+            "    add.u32 %%r30, %%r29, %%r12;\n"
+            "    shl.b32 %%r29, %%r25, 5;\n"
+            "    add.u32 %%r30, %%r30, %%r29;\n"
+            "    setp.lt.s32 %%p5, %%r26, %%r49;\n"
+            "    mul.wide.u32 %%rd5, %%r26, %%r16;\n"
+            "    add.s64 %%rd5, %%rd5, %%rd0;\n"
+            "    mov.f32 %%f0, 0f00000000;\n"
+            "    mov.f32 %%f1, 0f00000000;\n"
+            "    mov.f32 %%f2, 0f00000000;\n"
+            "    mov.f32 %%f3, 0f00000000;\n"
+            "    mov.f32 %%f4, 0f00000000;\n"
+            "    mov.f32 %%f5, 0f00000000;\n"
+            "    mov.f32 %%f6, 0f00000000;\n"
+            "    mov.f32 %%f7, 0f00000000;\n"
+            "    setp.eq.s32 %%p10, %%r55, 1;\n"
+            "    @%%p10 bra $L_a_q4;\n"
+            "    setp.eq.s32 %%p11, %%r55, 2;\n"
+            "    @%%p11 bra $L_a_f16;\n"
+            "    shl.b32 %%r29, %%r27, 2;\n"
+            "    cvt.u64.u32 %%rd6, %%r29;\n"
+            "    add.s64 %%rd6, %%rd6, %%rd5;\n"
+            "    @%%p5 ld.global.v4.f32 {%%f0,%%f1,%%f2,%%f3}, [%%rd6];\n"
+            "    @%%p5 ld.global.v4.f32 {%%f4,%%f5,%%f6,%%f7}, [%%rd6+16];\n"
+            "    bra $L_a_st;\n"
+            "$L_a_f16:\n"
+            "    shl.b32 %%r29, %%r27, 1;\n"
+            "    cvt.u64.u32 %%rd6, %%r29;\n"
+            "    add.s64 %%rd6, %%rd6, %%rd5;\n"
+            "    mov.u16 %%rs0, 0;\n"
+            "    mov.u16 %%rs1, 0;\n"
+            "    mov.u16 %%rs2, 0;\n"
+            "    mov.u16 %%rs3, 0;\n"
+            "    mov.u16 %%rs4, 0;\n"
+            "    mov.u16 %%rs5, 0;\n"
+            "    mov.u16 %%rs6, 0;\n"
+            "    mov.u16 %%rs7, 0;\n"
+            "    @%%p5 ld.global.v4.b16 {%%rs0,%%rs1,%%rs2,%%rs3}, [%%rd6];\n"
+            "    @%%p5 ld.global.v4.b16 {%%rs4,%%rs5,%%rs6,%%rs7}, [%%rd6+8];\n"
+            "    cvt.f32.f16 %%f0, %%rs0;\n"
+            "    cvt.f32.f16 %%f1, %%rs1;\n"
+            "    cvt.f32.f16 %%f2, %%rs2;\n"
+            "    cvt.f32.f16 %%f3, %%rs3;\n"
+            "    cvt.f32.f16 %%f4, %%rs4;\n"
+            "    cvt.f32.f16 %%f5, %%rs5;\n"
+            "    cvt.f32.f16 %%f6, %%rs6;\n"
+            "    cvt.f32.f16 %%f7, %%rs7;\n"
+            "    bra $L_a_st;\n"
+            "$L_a_q4:\n"
+            /* One q4_k block covers a whole 16-wide k-tile, so the scales
+               are read once per item; the value is (d*sc)*nibble - dmin*m,
+               exactly what dequant_row computes, with the per-sub-block
+               minimum folded in the way the format intends. */
+            "    shr.u32 %%r29, %%r27, 8;\n"
+            "    mul.lo.u32 %%r29, %%r29, 144;\n"
+            "    cvt.u64.u32 %%rd6, %%r29;\n"
+            "    add.s64 %%rd6, %%rd6, %%rd5;\n"
+            "    shr.u32 %%r56, %%r27, 6;\n"
+            "    and.b32 %%r56, %%r56, 3;\n"
+            "    and.b32 %%r57, %%r27, 32;\n"
+            "    and.b32 %%r58, %%r27, 31;\n"
+            "    mov.u16 %%rs0, 0;\n"
+            "    mov.u16 %%rs1, 0;\n"
+            "    @%%p5 ld.global.b16 %%rs0, [%%rd6];\n"
+            "    @%%p5 ld.global.b16 %%rs1, [%%rd6+2];\n"
+            "    cvt.f32.f16 %%f30, %%rs0;\n"
+            "    cvt.f32.f16 %%f31, %%rs1;\n"
+            "    shl.b32 %%r59, %%r56, 1;\n"
+            "    setp.ne.s32 %%p12, %%r57, 0;\n"
+            "    selp.b32 %%r60, 1, 0, %%p12;\n"
+            "    add.u32 %%r59, %%r59, %%r60;\n"
+            "    add.u32 %%r61, %%r59, 4;\n"
+            "    sub.u32 %%r62, %%r59, 4;\n"
+            "    setp.lt.s32 %%p13, %%r59, 4;\n"
+            "    mov.u32 %%r63, 0;\n"
+            "    mov.u32 %%r64, 0;\n"
+            "    mov.u32 %%r65, 0;\n"
+            "    add.s64 %%rd7, %%rd6, 4;\n"
+            "    cvt.u64.u32 %%rd11, %%r59;\n"
+            "    add.s64 %%rd11, %%rd11, %%rd7;\n"
+            "    cvt.u64.u32 %%rd12, %%r61;\n"
+            "    add.s64 %%rd12, %%rd12, %%rd7;\n"
+            "    cvt.u64.u32 %%rd13, %%r62;\n"
+            "    add.s64 %%rd13, %%rd13, %%rd7;\n"
+            "    @%%p5 ld.global.u8 %%r63, [%%rd11];\n"
+            "    @%%p5 ld.global.u8 %%r64, [%%rd12];\n"
+            "    @!%%p13 ld.global.u8 %%r65, [%%rd13];\n"
+            /* The scale/min unpack mirrors get_scale_min_k4 in kernels.c:
+               below 4 the scales sit in their own bytes; above, the top
+               two bits of each are borrowed from a neighbour. */
+            "    and.b32 %%r66, %%r63, 63;\n"
+            "    and.b32 %%r67, %%r64, 63;\n"
+            "    and.b32 %%r68, %%r64, 15;\n"
+            "    shr.u32 %%r69, %%r65, 6;\n"
+            "    shl.b32 %%r69, %%r69, 4;\n"
+            "    or.b32 %%r68, %%r68, %%r69;\n"
+            "    shr.u32 %%r70, %%r64, 4;\n"
+            "    shr.u32 %%r71, %%r63, 6;\n"
+            "    shl.b32 %%r71, %%r71, 4;\n"
+            "    or.b32 %%r70, %%r70, %%r71;\n"
+            "    selp.b32 %%r66, %%r66, %%r68, %%p13;\n"
+            "    selp.b32 %%r67, %%r67, %%r70, %%p13;\n"
+            "    cvt.rn.f32.u32 %%f32, %%r66;\n"
+            "    cvt.rn.f32.u32 %%f33, %%r67;\n"
+            "    mul.rn.f32 %%f32, %%f30, %%f32;\n"
+            "    mul.rn.f32 %%f33, %%f31, %%f33;\n"
+            "    neg.f32 %%f33, %%f33;\n"
+            "    shl.b32 %%r66, %%r56, 5;\n"
+            "    add.u32 %%r66, %%r66, %%r58;\n"
+            "    add.u32 %%r66, %%r66, 16;\n"
+            "    cvt.u64.u32 %%rd8, %%r66;\n"
+            "    add.s64 %%rd8, %%rd8, %%rd6;\n"
+            "    mov.u32 %%r67, 0;\n"
+            "    mov.u32 %%r68, 0;\n"
+            "    @%%p5 ld.global.u32 %%r67, [%%rd8];\n"
+            "    @%%p5 ld.global.u32 %%r68, [%%rd8+4];\n"
+            "    selp.b32 %%r69, 4, 0, %%p12;\n");
+    for (int e = 0; e < 8; e++) {
+        fprintf(out,
+                "    mov.u32 %%r70, %d;\n"
+                "    add.u32 %%r70, %%r70, %%r69;\n"
+                "    bfe.u32 %%r71, %s, %%r70, 4;\n"
+                "    cvt.rn.f32.u32 %%f%d, %%r71;\n"
+                "    fma.rn.f32 %%f%d, %%f%d, %%f32, %%f33;\n",
+                (e & 3) * 8, e < 4 ? "%r67" : "%r68", e, e, e);
+    }
+    fprintf(out,
+            "    bra $L_a_st;\n"
+            "$L_a_st:\n"
+            "    st.shared.v4.f32 [%%r30], {%%f0,%%f1,%%f2,%%f3};\n"
+            "    st.shared.v4.f32 [%%r30+16], {%%f4,%%f5,%%f6,%%f7};\n"
+            "    bra $L_ld_next;\n");
+}
+
+/* One loader item: 8 activation values (half of one token's k-tile),
+   stored transposed so the compute phase reads 4 tokens per v4. Invalid
+   tokens stage zeros. */
+static void gemm_tile_load_b(FILE *out) {
+    fprintf(out,
+            "    sub.u32 %%r24, %%r15, 128;\n"
+            "    shr.u32 %%r25, %%r24, 1;\n"
+            "    and.b32 %%r26, %%r24, 1;\n"
+            "    shl.b32 %%r27, %%r4, 4;\n"
+            "    shl.b32 %%r28, %%r26, 3;\n"
+            "    add.u32 %%r27, %%r27, %%r28;\n"
+            "    setp.lt.s32 %%p5, %%r25, %%r54;\n"
+            "    mul.wide.u32 %%rd9, %%r25, %%r51;\n"
+            "    shl.b64 %%rd9, %%rd9, 2;\n"
+            "    add.s64 %%rd9, %%rd9, %%rd1;\n"
+            "    shl.b32 %%r29, %%r27, 2;\n"
+            "    cvt.u64.u32 %%rd10, %%r29;\n"
+            "    add.s64 %%rd9, %%rd9, %%rd10;\n"
+            "    mov.f32 %%f0, 0f00000000;\n"
+            "    mov.f32 %%f1, 0f00000000;\n"
+            "    mov.f32 %%f2, 0f00000000;\n"
+            "    mov.f32 %%f3, 0f00000000;\n"
+            "    mov.f32 %%f4, 0f00000000;\n"
+            "    mov.f32 %%f5, 0f00000000;\n"
+            "    mov.f32 %%f6, 0f00000000;\n"
+            "    mov.f32 %%f7, 0f00000000;\n"
+            "    @%%p5 ld.global.v4.f32 {%%f0,%%f1,%%f2,%%f3}, [%%rd9];\n"
+            "    @%%p5 ld.global.v4.f32 {%%f4,%%f5,%%f6,%%f7}, [%%rd9+16];\n"
+            "    shl.b32 %%r29, %%r26, 3;\n"
+            "    mul.lo.u32 %%r29, %%r29, %d;\n"
+            "    add.u32 %%r30, %%r29, %%r13;\n"
+            "    shl.b32 %%r29, %%r25, 2;\n"
+            "    add.u32 %%r30, %%r30, %%r29;\n",
+            TILE_BS_STRIDE);
+    for (int e = 0; e < 8; e++)
+        fprintf(out, "    st.shared.f32 [%%r30+%d], %%f%d;\n",
+                e * TILE_BS_STRIDE, e);
+    fprintf(out, "    bra $L_ld_next;\n");
+}
+
+static void gemm_tile_entry(FILE *out, int tt) {
+    int tx_groups = tt / 4;
+    int ty_shift = tx_groups == 4 ? 2 : tx_groups == 8 ? 3 : 4;
+    fprintf(out,
+            ".visible .entry geode_gemm_tile%d(\n"
+            "    .param .u64 p_w, .param .u64 p_x, .param .u64 p_out,\n"
+            "    .param .u32 p_n_in, .param .u32 p_head_out,\n"
+            "    .param .u32 p_n_head, .param .u32 p_x_stride,\n"
+            "    .param .u32 p_x_head_stride, .param .u32 p_out_stride,\n"
+            "    .param .u32 p_n_tokens, .param .u32 p_type)\n"
+            "{\n"
+            "    .reg .pred %%p<16>;\n"
+            "    .reg .f32 %%f<64>;\n"
+            "    .reg .b16 %%rs<8>;\n"
+            "    .reg .u32 %%r<76>;\n"
+            "    .reg .b64 %%rd<24>;\n"
+            "    .shared .align 16 .b8 geode_tshm[%d];\n"
+            "    ld.param.u64 %%rd0, [p_w];\n"
+            "    ld.param.u64 %%rd1, [p_x];\n"
+            "    ld.param.u64 %%rd2, [p_out];\n"
+            "    ld.param.u32 %%r48, [p_n_in];\n"
+            "    ld.param.u32 %%r49, [p_head_out];\n"
+            "    ld.param.u32 %%r50, [p_n_head];\n"
+            "    ld.param.u32 %%r51, [p_x_stride];\n"
+            "    ld.param.u32 %%r52, [p_x_head_stride];\n"
+            "    ld.param.u32 %%r53, [p_out_stride];\n"
+            "    ld.param.u32 %%r54, [p_n_tokens];\n"
+            "    ld.param.u32 %%r55, [p_type];\n"
+            "    mov.u32 %%r0, %%tid.x;\n"
+            "    shr.u32 %%r1, %%r0, %d;\n"
+            "    and.b32 %%r2, %%r0, %d;\n"
+            "    mov.u32 %%r3, %d;\n"
+            "    mov.u32 %%r12, geode_tshm;\n"
+            "    add.u32 %%r13, %%r12, %d;\n"
+            "    mov.u32 %%r14, %d;\n"
+            "    shr.u32 %%r5, %%r48, 4;\n"
+            /* Weight row bytes by encoding, once. */
+            "    setp.eq.s32 %%p8, %%r55, 1;\n"
+            "    @%%p8 bra $L_rb_q4;\n"
+            "    setp.eq.s32 %%p9, %%r55, 2;\n"
+            "    @%%p9 bra $L_rb_f16;\n"
+            "    shl.b32 %%r16, %%r48, 2;\n"
+            "    bra $L_rb_done;\n"
+            "$L_rb_q4:\n"
+            "    shr.u32 %%r29, %%r48, 8;\n"
+            "    mul.lo.u32 %%r16, %%r29, 144;\n"
+            "    bra $L_rb_done;\n"
+            "$L_rb_f16:\n"
+            "    shl.b32 %%r16, %%r48, 1;\n"
+            "$L_rb_done:\n"
+            /* This block's head: weights, activations and out each move by
+               their own stride for it. */
+            "    mov.u32 %%r11, %%ctaid.z;\n"
+            "    mul.lo.u32 %%r29, %%r49, %%r16;\n"
+            "    mul.wide.u32 %%rd3, %%r11, %%r29;\n"
+            "    add.s64 %%rd0, %%rd0, %%rd3;\n"
+            "    mul.wide.u32 %%rd4, %%r11, %%r52;\n"
+            "    shl.b64 %%rd4, %%rd4, 2;\n"
+            "    add.s64 %%rd1, %%rd1, %%rd4;\n"
+            "    mul.wide.u32 %%rd5, %%r11, %%r49;\n"
+            "    shl.b64 %%rd5, %%rd5, 2;\n"
+            "    add.s64 %%rd2, %%rd2, %%rd5;\n"
+            "    mov.u32 %%r18, %%nctaid.x;\n"
+            "    mov.u32 %%r10, %%ctaid.x;\n"
+            "    mul.lo.u32 %%r20, %%r1, 320;\n"
+            "    add.u32 %%r20, %%r20, %%r12;\n"
+            "    shl.b32 %%r21, %%r2, 4;\n"
+            "    add.u32 %%r21, %%r21, %%r13;\n"
+            "$L_tile:\n"
+            "    shl.b32 %%r17, %%r10, 6;\n"
+            "    setp.ge.s32 %%p1, %%r17, %%r49;\n"
+            "    @%%p1 bra $L_ret;\n",
+            tt, TILE_SHM_BYTES, ty_shift, tx_groups - 1, 16 * tx_groups,
+            TILE_AS_BYTES, 128 + 2 * tt);
+    for (int i = 0; i < 16; i++)
+        fprintf(out, "    mov.f32 %%f%d, 0f00000000;\n", 40 + i);
+    fprintf(out,
+            "    mov.u32 %%r4, 0;\n"
+            "$L_kt:\n"
+            "    mov.u32 %%r15, %%r0;\n"
+            "$L_ld:\n"
+            "    setp.ge.s32 %%p2, %%r15, %%r14;\n"
+            "    @%%p2 bra $L_ld_done;\n"
+            "    setp.lt.s32 %%p3, %%r15, 128;\n"
+            "    @%%p3 bra $L_item_a;\n");
+    gemm_tile_load_b(out);
+    fprintf(out, "$L_item_a:\n");
+    gemm_tile_load_a(out);
+    fprintf(out,
+            "$L_ld_next:\n"
+            "    add.u32 %%r15, %%r15, %%r3;\n"
+            "    bra $L_ld;\n"
+            "$L_ld_done:\n"
+            "    bar.sync 0;\n");
+    for (int kk = 0; kk < TILE_K; kk++) gemm_tile_step(out, kk);
+    fprintf(out,
+            "    bar.sync 0;\n"
+            "    add.u32 %%r4, %%r4, 1;\n"
+            "    setp.lt.s32 %%p4, %%r4, %%r5;\n"
+            "    @%%p4 bra $L_kt;\n");
+    /* Store the tile: rows [base, base+64) of this head, tokens
+       [tx*4, tx*4+4); both ends masked. */
+    fprintf(out,
+            "    shl.b32 %%r22, %%r2, 2;\n"
+            "    shl.b32 %%r23, %%r1, 2;\n"
+            "    add.u32 %%r23, %%r23, %%r17;\n");
+    for (int j = 0; j < 4; j++) {
+        fprintf(out,
+                "    add.u32 %%r24, %%r22, %d;\n"
+                "    setp.lt.s32 %%p5, %%r24, %%r54;\n",
+                j);
+        for (int i = 0; i < 4; i++) {
+            fprintf(out,
+                    "    add.u32 %%r25, %%r23, %d;\n"
+                    "    setp.lt.s32 %%p6, %%r25, %%r49;\n"
+                    "    and.pred %%p7, %%p5, %%p6;\n"
+                    "    mul.wide.u32 %%rd5, %%r24, %%r53;\n"
+                    "    cvt.u64.u32 %%rd6, %%r25;\n"
+                    "    add.s64 %%rd5, %%rd5, %%rd6;\n"
+                    "    shl.b64 %%rd5, %%rd5, 2;\n"
+                    "    add.s64 %%rd5, %%rd5, %%rd2;\n"
+                    "    @%%p7 st.global.f32 [%%rd5], %%f%d;\n",
+                    i, 40 + i * 4 + j);
+        }
+    }
+    fprintf(out,
+            "    add.u32 %%r10, %%r10, %%r18;\n"
+            "    bra $L_tile;\n"
+            "$L_ret:\n"
+            "    ret;\n"
+            "}\n");
 }
 
 /* =============================================================== */
@@ -1709,6 +2083,46 @@ static const char kv_prep_ptx[] =
     "    ret;\n"
     "}\n";
 
+/* geode_ffn_silu: activated[i] = silu(gate[i]) * up[i], one element per
+   thread. Same arithmetic as the cpu's swiglu() over the same f32 values:
+   the ex2.approx here and the expf there differ by ~2^-21 relative, which
+   the logits never notice. */
+static const char ffn_silu_ptx[] =
+    ".visible .entry geode_ffn_silu(\n"
+    "    .param .u64 p_gate, .param .u64 p_up, .param .u64 p_out,\n"
+    "    .param .u32 p_total)\n"
+    "{\n"
+    "    .reg .pred %p1;\n"
+    "    .reg .f32 %f<6>;\n"
+    "    .reg .u32 %r<8>;\n"
+    "    .reg .b64 %rd<8>;\n"
+    "    ld.param.u64 %rd1, [p_gate];\n"
+    "    ld.param.u64 %rd2, [p_up];\n"
+    "    ld.param.u64 %rd3, [p_out];\n"
+    "    ld.param.u32 %r1, [p_total];\n"
+    "    mov.u32 %r2, %ctaid.x;\n"
+    "    mov.u32 %r3, %ntid.x;\n"
+    "    mov.u32 %r4, %tid.x;\n"
+    "    mad.lo.u32 %r5, %r2, %r3, %r4;\n"
+    "    setp.ge.u32 %p1, %r5, %r1;\n"
+    "    @%p1 bra $L_ret;\n"
+    "    mul.wide.u32 %rd4, %r5, 4;\n"
+    "    add.s64 %rd5, %rd1, %rd4;\n"
+    "    add.s64 %rd6, %rd2, %rd4;\n"
+    "    add.s64 %rd7, %rd3, %rd4;\n"
+    "    ld.global.f32 %f1, [%rd5];\n"
+    "    ld.global.f32 %f2, [%rd6];\n"
+    "    mul.f32 %f3, %f1, 0f3FB8AA3B;\n"
+    "    neg.f32 %f3, %f3;\n"
+    "    ex2.approx.f32 %f3, %f3;\n"
+    "    add.f32 %f3, %f3, 0f3F800000;\n"
+    "    div.rn.f32 %f4, %f1, %f3;\n"
+    "    mul.f32 %f5, %f4, %f2;\n"
+    "    st.global.f32 [%rd7], %f5;\n"
+    "$L_ret:\n"
+    "    ret;\n"
+    "}\n";
+
 static char *build_module(void) {
     char *text = NULL;
     size_t size = 0;
@@ -1719,11 +2133,13 @@ static char *build_module(void) {
         gemm_entry(out, tile, 1);
         gemm_entry(out, tile, 2);
     }
+    for (int i = 0; i < GEMM_TT_COUNT; i++) gemm_tile_entry(out, gemm_tt[i]);
     fputs(attn_score_ptx, out);
     fputs(attn_softmax_ptx, out);
     fputs(attn_fold_ptx, out);
     fputs(q_prep_ptx, out);
     fputs(kv_prep_ptx, out);
+    fputs(ffn_silu_ptx, out);
     fclose(out);
     return text;
 }
@@ -1792,12 +2208,13 @@ int cuda_sync(CudaDevice *dev) {
    Launches are asynchronous; the queue is drained by the copy that ends each
    attention call, which is where a deferred fault surfaces. */
 static void launch(CudaDevice *dev, void *fn, unsigned grid_x, unsigned grid_y,
-                   unsigned block, unsigned shared, void **params) {
+                   unsigned grid_z, unsigned block, unsigned shared,
+                   void **params) {
     if (!dev->launch_kernel) {
         FAULT(dev, "CUDA driver API incomplete");
         return;
     }
-    int rc = dev->launch_kernel(fn, grid_x, grid_y, 1, block, 1, 1, shared,
+    int rc = dev->launch_kernel(fn, grid_x, grid_y, grid_z, block, 1, 1, shared,
                                 NULL, params, NULL);
     if (rc) {
         const char *why = NULL;
@@ -1813,6 +2230,34 @@ void cuda_gemm(CudaDevice *dev, unsigned long long w, unsigned long long x,
                int x_row_stride, int x_head_stride, int out_row_stride,
                int n_tokens, int type) {
     if (dev->fault[0]) return;
+
+    /* Prefill's shapes: whole chunk in one token tile, weights dequantized
+       once per k-tile instead of once per token. Below GEMM_TILED_MIN the
+       token tile would sit mostly empty and the latency-shaped kernels
+       win, which is every decode call. */
+    if (n_tokens >= GEMM_TILED_MIN &&
+        n_tokens <= gemm_tt[GEMM_TT_COUNT - 1] && n_in % TILE_K == 0 &&
+        (type != CUDA_W_Q4K || n_in % QK_K == 0)) {
+        int v = n_tokens <= gemm_tt[0] ? 0
+                : n_tokens <= gemm_tt[1] ? 1
+                                         : 2;
+        int tiles = (head_out + TILE_ROWS - 1) / TILE_ROWS;
+        unsigned resident = (unsigned)dev->gemm_tile_max[v];
+        unsigned grid_x =
+            (unsigned)tiles < resident ? (unsigned)tiles : resident;
+
+        unsigned long long w64 = w, x64 = x, out64 = out;
+        unsigned n_in32 = n_in, head_out32 = head_out, n_head32 = n_head;
+        unsigned x_str = x_row_stride, x_hstr = x_head_stride;
+        unsigned out_str = out_row_stride;
+        unsigned ntok = n_tokens, type32 = type;
+        void *params[] = {&w64,      &x64,     &out64,    &n_in32,
+                          &head_out32, &n_head32, &x_str,   &x_hstr,
+                          &out_str,  &ntok,    &type32};
+        launch(dev, dev->gemm_tile_fn[v], grid_x, 1, (unsigned)n_head,
+               (unsigned)(16 * gemm_tt[v] / 4), TILE_SHM_BYTES, params);
+        return;
+    }
 
     int tile = 1;
     for (int t = 2; t <= GEMM_TILE_MAX; t *= 2)
@@ -1839,7 +2284,7 @@ void cuda_gemm(CudaDevice *dev, unsigned long long w, unsigned long long x,
                       &head_out32, &n_head32, &x_str,   &x_hstr,
                       &out_str,  &ntok,    &type32};
     launch(dev, dev->gemm_fn[__builtin_ctz(tile)][r - 1], grid_x, grid_y,
-           GEMM_BLOCK, 0, params);
+           1, GEMM_BLOCK, 0, params);
 }
 
 void cuda_attention(CudaDevice *dev, unsigned long long cache,
@@ -1856,18 +2301,18 @@ void cuda_attention(CudaDevice *dev, unsigned long long cache,
     void *score_params[] = {&cache64, &query64, &qlat64,  &scores64,
                             &pos32,   &ntok32,  &geom64};
     launch(dev, dev->score_fn, (attended + SCORE_TILE - 1) / SCORE_TILE,
-           n_tokens, SCORE_BLOCK, 0, score_params);
+           n_tokens, 1, SCORE_BLOCK, 0, score_params);
 
     unsigned long long scores_in = scores;
     void *softmax_params[] = {&scores_in, &pos32, &ntok32, &geom64};
-    launch(dev, dev->softmax_fn, geom->n_head, n_tokens, SOFTMAX_BLOCK, 0,
+    launch(dev, dev->softmax_fn, geom->n_head, n_tokens, 1, SOFTMAX_BLOCK, 0,
            softmax_params);
 
     unsigned long long out64 = out, cache_in = cache, scores_f = scores;
     void *fold_params[] = {&cache_in, &scores_f, &out64, &pos32, &ntok32,
                            &geom64};
     launch(dev, dev->fold_fn,
-           (geom->fold_width + FOLD_R_TILE - 1) / FOLD_R_TILE, n_tokens,
+           (geom->fold_width + FOLD_R_TILE - 1) / FOLD_R_TILE, n_tokens, 1,
            FOLD_BLOCK, 0, fold_params);
 
 }
@@ -1880,7 +2325,7 @@ void cuda_q_prep(CudaDevice *dev, unsigned long long query,
     unsigned long long g64 = geometry_on_device;
     unsigned ntok = n_tokens;
     void *params[] = {&q64, &cos64, &w64, &ntok, &g64};
-    launch(dev, dev->q_prep_fn, n_tokens, 1, 32, 0, params);
+    launch(dev, dev->q_prep_fn, n_tokens, 1, 1, 32, 0, params);
 }
 
 void cuda_kv_prep(CudaDevice *dev, unsigned long long kv_projected,
@@ -1892,7 +2337,18 @@ void cuda_kv_prep(CudaDevice *dev, unsigned long long kv_projected,
     unsigned long long slot64 = slot_base, g64 = geometry_on_device;
     unsigned ntok = n_tokens;
     void *params[] = {&kv64, &cos64, &n64, &slot64, &ntok, &g64};
-    launch(dev, dev->kv_prep_fn, n_tokens, 1, 32, 0, params);
+    launch(dev, dev->kv_prep_fn, n_tokens, 1, 1, 32, 0, params);
+}
+
+void cuda_swiglu(CudaDevice *dev, unsigned long long gate,
+                 unsigned long long up, unsigned long long out, size_t total) {
+    if (dev->fault[0] || total == 0) return;
+    unsigned long long gate64 = gate, up64 = up, out64 = out;
+    unsigned total32 = (unsigned)total;
+    void *params[] = {&gate64, &up64, &out64, &total32};
+    launch(dev, dev->swiglu_fn,
+           (unsigned)((total + SILU_BLOCK - 1) / SILU_BLOCK), 1, 1,
+           SILU_BLOCK, 0, params);
 }
 
 /* =============================================================== */
@@ -1908,10 +2364,10 @@ void cuda_kv_prep(CudaDevice *dev, unsigned long long kv_projected,
 #define SELF_TEST_TOKENS 11
 #define SELF_TEST_TOLERANCE 1e-3
 
-static int check_gemm(CudaDevice *dev, int type, char *err, size_t errsz) {
+static int check_gemm(CudaDevice *dev, int type, int n_tokens, char *err,
+                       size_t errsz) {
     int n = SELF_TEST_N_IN;
     int rows = SELF_TEST_ROWS;
-    int n_tokens = SELF_TEST_TOKENS;
     /* The Q4_K and F16 encodings each carry their own row size. */
     size_t dev_row_bytes = type == CUDA_W_Q4K ? (size_t)n / 256 * 144
                            : type == CUDA_W_F16 ? (size_t)n * 2
@@ -2283,15 +2739,16 @@ static int check_attention(CudaDevice *dev, int kind, char *err,
    reach: n_head matrices share one weight row array, and each head reads its
    own x segment -- the strides must not be confused with n_in. */
 static int check_gemm_heads(CudaDevice *dev, int type, int head_out,
-                           char *err, size_t errsz) {
+                           int n_tokens, char *err, size_t errsz) {
     /* Q4_K rows must be whole 256-wide blocks, so the two encodings get
        different widths; x segments deliberately overlap (x_head_stride <
        n_in) to catch the strides being confused with n_in. head_out 16
-       takes the row-paired kernels, 24 the single-row fallback. */
+       takes the row-paired kernels, 24 the single-row fallback; n_tokens
+       above GEMM_TILED_MIN takes the token-tiled kernels, with grid.z
+       stacking the heads. */
     const int n_head = 4;
     const int n_in = type == CUDA_W_Q4K ? 512 : 48;
     const int x_head_stride = type == CUDA_W_Q4K ? 128 : 24;
-    const int n_tokens = 2;
     int rows = n_head * head_out;
     int x_row = (n_head - 1) * x_head_stride + n_in;
 
@@ -2580,6 +3037,62 @@ static int check_prep(CudaDevice *dev, int kind, char *err, size_t errsz) {
     return ok;
 }
 
+/* The silu kernel against the cpu's swiglu() over the same values. */
+static int check_swiglu(CudaDevice *dev, char *err, size_t errsz) {
+    enum { N = 1000 };
+    float *gate = malloc(N * sizeof *gate);
+    float *up = malloc(N * sizeof *up);
+    float *got = malloc(N * sizeof *got);
+    float *want = malloc(N * sizeof *want);
+    if (!gate || !up || !got || !want) {
+        snprintf(err, errsz, "out of memory for gpu self-test");
+        free(gate); free(up); free(got); free(want);
+        return 0;
+    }
+    for (int i = 0; i < N; i++) {
+        gate[i] = (float)(i % 19) - 9.5f;
+        up[i] = (float)((i * 7) % 13) - 6.0f;
+    }
+    swiglu(want, gate, up, N);
+
+    unsigned long long dgate = cuda_alloc(dev, N * sizeof *gate, err, errsz);
+    unsigned long long dup = cuda_alloc(dev, N * sizeof *up, err, errsz);
+    unsigned long long dout = cuda_alloc(dev, N * sizeof *got, err, errsz);
+    int ok = dgate && dup && dout;
+    if (ok)
+        ok = cuda_copy_to(dev, dgate, gate, N * sizeof *gate) &&
+             cuda_copy_to(dev, dup, up, N * sizeof *up);
+    if (ok) {
+        cuda_swiglu(dev, dgate, dup, dout, N);
+        ok = !cuda_fault(dev) &&
+             cuda_copy_from(dev, got, dout, N * sizeof *got);
+    }
+    if (ok) {
+        for (int i = 0; i < N; i++) {
+            float tolerance = 1e-4f * (1.0f + fabsf(want[i]));
+            if (fabsf(got[i] - want[i]) > tolerance) {
+                snprintf(err, errsz,
+                         "gpu swiglu self-test mismatch: element %d got %.6f "
+                         "want %.6f",
+                         i, got[i], want[i]);
+                ok = 0;
+                break;
+            }
+        }
+    } else if (!err[0]) {
+        snprintf(err, errsz, "%s", dev->fault);
+    }
+
+    cu_mem_free_t mem_free = sym(dev->cuda, "cuMemFree");
+    if (mem_free) {
+        mem_free(dgate);
+        mem_free(dup);
+        mem_free(dout);
+    }
+    free(gate); free(up); free(got); free(want);
+    return ok;
+}
+
 int cuda_start(CudaDevice **out, char *err, size_t errsz) {
     CudaDevice *dev = calloc(1, sizeof *dev);
     if (!dev) {
@@ -2614,6 +3127,7 @@ int cuda_start(CudaDevice **out, char *err, size_t errsz) {
        row tile -- the shape that cannot pipeline. */
     for (int i = 0; i < GEMM_TILE_COUNT; i++)
         for (int j = 0; j < 2; j++) dev->gemm_max_blocks[i][j] = -1;
+    for (int i = 0; i < GEMM_TT_COUNT; i++) dev->gemm_tile_max[i] = -1;
     if (!init || !device_get || !ctx_create || !module_load || !func_get ||
         !dev->mem_alloc || !dev->mem_free || !dev->mem_info ||
         !dev->memcpy_htd || !dev->memcpy_dth || !dev->host_register ||
@@ -2684,6 +3198,12 @@ char jit_log[2048] = "";
     ok &= func_get(&dev->fold_fn, dev->module, "geode_attn_fold") == 0;
     ok &= func_get(&dev->q_prep_fn, dev->module, "geode_q_prep") == 0;
     ok &= func_get(&dev->kv_prep_fn, dev->module, "geode_kv_prep") == 0;
+    ok &= func_get(&dev->swiglu_fn, dev->module, "geode_ffn_silu") == 0;
+    for (int i = 0; i < GEMM_TT_COUNT; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "geode_gemm_tile%d", gemm_tt[i]);
+        ok &= func_get(&dev->gemm_tile_fn[i], dev->module, name) == 0;
+    }
     if (!ok) {
         snprintf(err, errsz, "kernel module is missing an entry point");
         cuda_stop(dev);
@@ -2707,14 +3227,37 @@ char jit_log[2048] = "";
                 dev->gemm_max_blocks[i][j] = per_sm * dev->n_sm;
             }
 
+    /* The tiled gemms carry their shared staging, so the occupancy call
+       has to know about it. */
+    if (dev->n_sm > 0 && dev->occupancy)
+        for (int i = 0; i < GEMM_TT_COUNT; i++) {
+            int per_sm = 0;
+            if (dev->occupancy(&per_sm, dev->gemm_tile_fn[i],
+                               16 * gemm_tt[i] / 4, TILE_SHM_BYTES) ||
+                per_sm < 1)
+                continue;
+            dev->gemm_tile_max[i] = per_sm * dev->n_sm;
+        }
 
-    if (!check_gemm(dev, CUDA_W_F32, err, errsz) ||
-        !check_gemm(dev, CUDA_W_Q4K, err, errsz) ||
-        !check_gemm(dev, CUDA_W_F16, err, errsz) ||
-        !check_gemm_heads(dev, CUDA_W_F32, 16, err, errsz) ||
-        !check_gemm_heads(dev, CUDA_W_Q4K, 16, err, errsz) ||
-        !check_gemm_heads(dev, CUDA_W_F32, 24, err, errsz) ||
-        !check_gemm_heads(dev, CUDA_W_Q4K, 24, err, errsz) ||
+
+    if (!check_gemm(dev, CUDA_W_F32, SELF_TEST_TOKENS, err, errsz) ||
+        !check_gemm(dev, CUDA_W_Q4K, SELF_TEST_TOKENS, err, errsz) ||
+        !check_gemm(dev, CUDA_W_F16, SELF_TEST_TOKENS, err, errsz) ||
+        !check_gemm_heads(dev, CUDA_W_F32, 16, 2, err, errsz) ||
+        !check_gemm_heads(dev, CUDA_W_Q4K, 16, 2, err, errsz) ||
+        !check_gemm_heads(dev, CUDA_W_F32, 24, 2, err, errsz) ||
+        !check_gemm_heads(dev, CUDA_W_Q4K, 24, 2, err, errsz) ||
+        /* The token-tiled gemms: one width per tile entry, tails on the
+           token and row axes, and stacked heads through grid.z. */
+        !check_gemm(dev, CUDA_W_Q4K, 16, err, errsz) ||
+        !check_gemm(dev, CUDA_W_F32, 17, err, errsz) ||
+        !check_gemm(dev, CUDA_W_Q4K, 17, err, errsz) ||
+        !check_gemm(dev, CUDA_W_F16, 17, err, errsz) ||
+        !check_gemm(dev, CUDA_W_F32, 37, err, errsz) ||
+        !check_gemm(dev, CUDA_W_Q4K, 37, err, errsz) ||
+        !check_gemm_heads(dev, CUDA_W_Q4K, 16, 33, err, errsz) ||
+        !check_gemm_heads(dev, CUDA_W_F32, 24, 33, err, errsz) ||
+        !check_swiglu(dev, err, errsz) ||
         !check_attention(dev, ATTN_MLA, err, errsz) ||
         !check_attention(dev, ATTN_GQA, err, errsz) ||
         !check_prep(dev, ATTN_MLA, err, errsz) ||

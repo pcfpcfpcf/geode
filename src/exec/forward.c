@@ -605,7 +605,8 @@ static void add_branch_token(Runtime *runtime, int flat, int token,
     runtime->branch_weights[flat] = weight;
 }
 
-static int select_branches(Runtime *runtime, const Layer *layer, int n_tokens) {
+static int select_branches(Runtime *runtime, const Layer *layer, int n_tokens,
+                           int skip_base) {
     const Model *model = runtime->model;
     int used = model->n_expert_used;
     int n_branches = 0;
@@ -630,7 +631,7 @@ static int select_branches(Runtime *runtime, const Layer *layer, int n_tokens) {
         branch->n_tokens = flat - begin;
     }
 
-    if (model->n_expert_shared > 0) {
+    if (model->n_expert_shared > 0 && !skip_base) {
         Branch *shared = &runtime->branches[n_branches++];
         shared->ffn = &layer->shared_expert;
         shared->matrix_index = 0;
@@ -642,10 +643,12 @@ static int select_branches(Runtime *runtime, const Layer *layer, int n_tokens) {
     return n_branches;
 }
 
-static void feed_forward(Runtime *runtime, const Layer *layer, int n_tokens) {
+void forward_feed_forward_cpu(Runtime *runtime, const Layer *layer,
+                               int n_tokens, int skip_base) {
     const Model *model = runtime->model;
 
     if (!layer->has_experts) {
+        if (skip_base) return;
         Branch *branch = &runtime->branches[0];
         branch->ffn = &layer->dense;
         branch->matrix_index = 0;
@@ -658,11 +661,11 @@ static void feed_forward(Runtime *runtime, const Layer *layer, int n_tokens) {
     }
     run_matmul(runtime, runtime->router_probs, (size_t)model->n_expert,
                layer->router, 0, &runtime->normed_batch);
-    run_branches(runtime, select_branches(runtime, layer, n_tokens), n_tokens,
-                 &runtime->normed_batch);
+    run_branches(runtime, select_branches(runtime, layer, n_tokens, skip_base),
+                 n_tokens, &runtime->normed_batch);
 }
 const float *forward_with(Runtime *runtime, const int *tokens, int position,
-                          int n_tokens, AttentionFn attention) {
+                          int n_tokens, AttentionFn attention, FfnFn ffn) {
     const Model *model = runtime->model;
     int n_embd = model->n_embd;
 
@@ -686,7 +689,10 @@ const float *forward_with(Runtime *runtime, const int *tokens, int position,
                        runtime->projected + (size_t)t * n_embd, 1.0f, n_embd);
 
         normalize(runtime, layer->ffn_norm, n_tokens);
-        feed_forward(runtime, layer, n_tokens);
+        if (ffn)
+            ffn(runtime, layer, index, n_tokens);
+        else
+            forward_feed_forward_cpu(runtime, layer, n_tokens, 0);
         for (int t = 0; t < n_tokens; t++)
             add_scaled(runtime->residual + (size_t)t * n_embd,
                        runtime->projected + (size_t)t * n_embd, 1.0f, n_embd);
@@ -706,9 +712,9 @@ const float *forward_with(Runtime *runtime, const int *tokens, int position,
 }
 
 const float *forward(Runtime *runtime, const int *tokens, int position,
-                      int n_tokens) {
+                     int n_tokens) {
     return forward_with(runtime, tokens, position, n_tokens,
-                      forward_attention_cpu);
+                        forward_attention_cpu, NULL);
 }
 
 static float *alloc_floats(size_t n, int *ok) {

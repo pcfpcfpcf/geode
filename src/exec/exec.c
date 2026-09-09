@@ -144,7 +144,7 @@ static int stream_tokens(Session *session, Runtime *runtime, const int *ids,
 static int generate(const GgufFile *g, const RunArgs *args) {
     char err[256];
     Session session;
-    if (!session_open(&session, g, args->model, err, sizeof err)) {
+    if (!session_open(&session, g, args->model, NULL, err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         return 1;
     }
@@ -285,7 +285,7 @@ static const char *read_turn(char *line, int max) {
     return line;
 }
 
-int exec_cli(const char *path) {
+int exec_cli(const char *path, const char *strategy) {
     char err[256];
     GgufFile g;
     if (!gguf_open(&g, path, err, sizeof err)) {
@@ -294,7 +294,7 @@ int exec_cli(const char *path) {
     }
 
     Session session;
-    if (!session_open(&session, &g, path, err, sizeof err)) {
+    if (!session_open(&session, &g, path, strategy, err, sizeof err)) {
         fprintf(stderr, "%s\n", err);
         gguf_close(&g);
         return 1;

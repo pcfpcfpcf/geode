@@ -31,9 +31,14 @@ typedef struct {
     DeviceTensor k_b;       /* MLA */
     DeviceTensor v_b;       /* MLA */
     DeviceTensor attn_output;
+    DeviceTensor ffn_gate;  /* the layer's base ffn: dense block or shared
+                               expert, resident with attention */
+    DeviceTensor ffn_up;
+    DeviceTensor ffn_down;
     unsigned long long q_norm;  /* GQA: per-layer, f32 */
     unsigned long long kv_norm; /* f32: MLA kv_a_norm, GQA attn_k_norm */
     int kv_merged;              /* GQA: attn_k/attn_v share one allocation */
+    int ffn_width;              /* 0: this layer has no base ffn on the gpu */
 } HybridLayer;
 
 typedef struct {
@@ -43,6 +48,8 @@ typedef struct {
     unsigned long long geom_on_device;
     unsigned long long normed, query, kv_projected, query_latent, attn_latent,
         attn_out, projected, scores, cache, cos_sin;
+    unsigned long long ffn_gate, ffn_up, ffn_activated, ffn_out;
+    float *ffn_result; /* pinned host landing for the per-layer copy down */
     /* The rope table is per-forward, not per-layer: it rides up once and
        the other 47 layers of the same chunk skip their copy. */
     int cos_sin_position, cos_sin_tokens;
@@ -119,14 +126,23 @@ static int upload_tensor(CudaDevice *dev, const GgufTensor *t, DeviceTensor *out
     return 1;
 }
 
+/* The layer's deterministic feed-forward: the dense block's own ffn, or the
+   MoE layer's shared expert. Every token reads it, so it rides along with
+   attention -- placement, not caching: nothing about it is predicted. */
+static const FeedForward *layer_base_ffn(const Model *model,
+                                         const Layer *layer) {
+    if (!layer->has_experts) return &layer->dense;
+    return model->n_expert_shared > 0 ? &layer->shared_expert : NULL;
+}
+
 /* Every weight byte the strategy uploads, for the vram budget check.
    Q4_K tensors stream at quant size; everything else grows to f16 on the
    way up. */
-static size_t attention_upload_bytes(const Model *model) {
+static size_t weights_upload_bytes(const Model *model) {
     size_t total = 0;
     for (int i = 0; i < model->n_layer; i++) {
         const Layer *layer = &model->layers[i];
-        const GgufTensor *tensors[6];
+        const GgufTensor *tensors[9];
         int n = 0;
         tensors[n++] = layer->attn_q;
         tensors[n++] = layer->attn_output;
@@ -138,6 +154,12 @@ static size_t attention_upload_bytes(const Model *model) {
             tensors[n++] = layer->attn_k;
             tensors[n++] = layer->attn_v;
             tensors[n++] = layer->attn_q_norm;
+        }
+        const FeedForward *base = layer_base_ffn(model, layer);
+        if (base) {
+            tensors[n++] = base->gate;
+            tensors[n++] = base->up;
+            tensors[n++] = base->down;
         }
         for (int k = 0; k < n; k++) {
             const GgufTensor *t = tensors[k];
@@ -243,9 +265,61 @@ void gpu_attention(Runtime *runtime, const Layer *layer,
     }
 }
 
+/* The ffn hook: the layer's base ffn on the gpu, the routed experts on the
+   cpu. The gpu launches go out before the cpu's matmuls run, so the two
+   tiers read in parallel and the copy-from at the end lands whichever side
+   finished last. Its queue-drain contract is attention's: the copy is also
+   where a deferred fault surfaces. */
+static void gpu_feed_forward(Runtime *runtime, const Layer *layer,
+                             int layer_index, int n_tokens) {
+    Hybrid *hy = runtime->device;
+    HybridLayer *hl = &hy->layers[layer_index];
+    const Model *model = runtime->model;
+    int n_embd = model->n_embd;
+    int width = hl->ffn_width;
+
+    if (width) {
+        CudaDevice *dev = hy->dev;
+        cuda_copy_to(dev, hy->normed, runtime->normed,
+                     (size_t)n_tokens * n_embd * 4);
+        cuda_gemm(dev, hl->ffn_gate.ptr, hy->normed, hy->ffn_gate, n_embd,
+                  width, 1, n_embd, 0, width, n_tokens, hl->ffn_gate.type);
+        cuda_gemm(dev, hl->ffn_up.ptr, hy->normed, hy->ffn_up, n_embd, width,
+                  1, n_embd, 0, width, n_tokens, hl->ffn_up.type);
+        cuda_swiglu(dev, hy->ffn_gate, hy->ffn_up, hy->ffn_activated,
+                    (size_t)n_tokens * width);
+        cuda_gemm(dev, hl->ffn_down.ptr, hy->ffn_activated, hy->ffn_out, width,
+                  n_embd, 1, width, 0, n_embd, n_tokens, hl->ffn_down.type);
+    }
+
+    forward_feed_forward_cpu(runtime, layer, n_tokens, width > 0);
+
+    if (width) {
+        CudaDevice *dev = hy->dev;
+        cuda_copy_from(dev, hy->ffn_result, hy->ffn_out,
+                       (size_t)n_tokens * n_embd * 4);
+        if (cuda_fault(dev)) {
+            fprintf(stderr, "gpu fault, cannot continue: %s\n",
+                    cuda_fault(dev));
+            exit(1);
+        }
+        /* The cpu side already accumulated the routed experts into
+           `projected` (or nothing, on a dense layer this hook owns whole) --
+           the base ffn's contribution lands on top. */
+        if (layer->has_experts)
+            for (int t = 0; t < n_tokens; t++)
+                add_scaled(runtime->projected + (size_t)t * n_embd,
+                           hy->ffn_result + (size_t)t * n_embd, 1.0f, n_embd);
+        else
+            memcpy(runtime->projected, hy->ffn_result,
+                   (size_t)n_tokens * n_embd * 4);
+    }
+}
+
 static const float *hybrid_forward(Runtime *runtime, const int *tokens,
                                    int position, int n_tokens) {
-    return forward_with(runtime, tokens, position, n_tokens, gpu_attention);
+    return forward_with(runtime, tokens, position, n_tokens, gpu_attention,
+                        gpu_feed_forward);
 }
 
 /* -------------------------------------------------------------- */
@@ -264,6 +338,7 @@ static void hybrid_teardown(Runtime *runtime) {
         cuda_host_unpin(dev, runtime->normed);
         cuda_host_unpin(dev, runtime->projected);
         cuda_host_unpin(dev, runtime->cos_sin);
+        cuda_host_unpin(dev, hy->ffn_result);
         for (int i = 0; i < runtime->model->n_layer; i++) {
             HybridLayer *hl = &hy->layers ? &hy->layers[i] : NULL;
             if (!hl) break;
@@ -275,6 +350,9 @@ static void hybrid_teardown(Runtime *runtime) {
             if (!hl->kv_merged) cuda_free(dev, hl->attn_v.ptr);
             cuda_free(dev, hl->k_b.ptr);
             cuda_free(dev, hl->v_b.ptr);
+            cuda_free(dev, hl->ffn_gate.ptr);
+            cuda_free(dev, hl->ffn_up.ptr);
+            cuda_free(dev, hl->ffn_down.ptr);
             cuda_free(dev, hl->q_norm);
             cuda_free(dev, hl->kv_norm);
         }
@@ -288,9 +366,14 @@ static void hybrid_teardown(Runtime *runtime) {
         cuda_free(dev, hy->scores);
         cuda_free(dev, hy->cache);
         cuda_free(dev, hy->cos_sin);
+        cuda_free(dev, hy->ffn_gate);
+        cuda_free(dev, hy->ffn_up);
+        cuda_free(dev, hy->ffn_activated);
+        cuda_free(dev, hy->ffn_out);
         cuda_free(dev, hy->geom_on_device);
         cuda_stop(dev);
     }
+    free(hy->ffn_result);
     free(hy->layers);
     free(hy);
     runtime->device = NULL;
@@ -434,15 +517,38 @@ static int upload_layer(CudaDevice *dev, const Model *model, int index,
         }
         hl->kv_norm = upload_f32(dev, layer->kv_a_norm->data,
                                  model->kv_lora_rank, err, errsz);
-        return hl->kv_norm != 0;
+        if (!hl->kv_norm) return 0;
+    } else {
+        if (!upload_gqa_kv(dev, layer, hl, err, errsz)) return 0;
+        hl->q_norm = upload_f32(dev, layer->attn_q_norm->data,
+                                model->head_dim_k, err, errsz);
+        if (!hl->q_norm) return 0;
+        hl->kv_norm = upload_f32(dev, layer->attn_k_norm->data,
+                                 model->head_dim_k, err, errsz);
+        if (!hl->kv_norm) return 0;
     }
-    if (!upload_gqa_kv(dev, layer, hl, err, errsz)) return 0;
-    hl->q_norm = upload_f32(dev, layer->attn_q_norm->data, model->head_dim_k,
-                            err, errsz);
-    if (!hl->q_norm) return 0;
-    hl->kv_norm = upload_f32(dev, layer->attn_k_norm->data, model->head_dim_k,
-                             err, errsz);
-    return hl->kv_norm != 0;
+
+    const FeedForward *base = layer_base_ffn(model, layer);
+    if (!base) return 1;
+    if (!upload_tensor(dev, base->gate, &hl->ffn_gate, err, errsz) ||
+        !upload_tensor(dev, base->up, &hl->ffn_up, err, errsz) ||
+        !upload_tensor(dev, base->down, &hl->ffn_down, err, errsz))
+        return 0;
+    hl->ffn_width = (int)base->gate->dims[1];
+    return 1;
+}
+
+/* The widest base ffn in the model, for the activation buffers. */
+static int base_ffn_width(const Model *model) {
+    int widest = 0;
+    for (int i = 0; i < model->n_layer; i++) {
+        const FeedForward *base = layer_base_ffn(model, &model->layers[i]);
+        if (base) {
+            int width = (int)base->gate->dims[1];
+            if (width > widest) widest = width;
+        }
+    }
+    return widest;
 }
 
 static Runtime *hybrid_start(const Model *model, const Plan *plan, int n_ctx,
@@ -495,15 +601,20 @@ static Runtime *hybrid_start(const Model *model, const Plan *plan, int n_ctx,
     g->rms_eps = m->rms_eps;
 
     int max_tokens = runtime->max_tokens;
+    int ffn_width = base_ffn_width(model);
     size_t activations = (size_t)max_tokens *
                          ((size_t)m->n_embd * 2 + g->q_stride + g->cache_width +
                           g->latent_stride * 2 + g->out_stride + g->rope_dim) *
                          4;
-    size_t weights = attention_upload_bytes(model);
+    size_t weights = weights_upload_bytes(model);
     size_t kv_bytes = (size_t)m->n_layer * g->n_ctx * g->slot_bytes;
     size_t scores_bytes =
         (size_t)m->n_head * max_tokens * g->n_ctx * 4 + sizeof *g;
-    size_t needed = weights + kv_bytes + activations + scores_bytes;
+    size_t ffn_buffers = 0;
+    if (ffn_width)
+        ffn_buffers = (size_t)max_tokens * ((size_t)ffn_width * 3 + m->n_embd) * 4;
+    size_t needed =
+        weights + kv_bytes + activations + scores_bytes + ffn_buffers;
 
     unsigned long long free_bytes = cuda_vram_free(dev);
     if (free_bytes < needed + (64ull << 20)) {
@@ -559,6 +670,18 @@ ok &= (hy->cache = cuda_alloc(dev, (size_t)m->n_layer * g->n_ctx *
                    cuda_alloc(dev, (size_t)max_tokens * g->latent_stride * 4,
                               err, errsz)) != 0;
     }
+    if (ffn_width) {
+        ok &= (hy->ffn_gate = cuda_alloc(
+                   dev, (size_t)max_tokens * ffn_width * 4, err, errsz)) != 0;
+        ok &= (hy->ffn_up = cuda_alloc(dev, (size_t)max_tokens * ffn_width * 4,
+                                       err, errsz)) != 0;
+        ok &= (hy->ffn_activated =
+                   cuda_alloc(dev, (size_t)max_tokens * ffn_width * 4, err,
+                              errsz)) != 0;
+        ok &= (hy->ffn_out =
+                   cuda_alloc(dev, (size_t)max_tokens * m->n_embd * 4, err,
+                              errsz)) != 0;
+    }
     if (ok) ok = cuda_copy_to(dev, hy->geom_on_device, g, sizeof *g);
     if (!ok) {
         if (!err[0]) snprintf(err, errsz, "%s", cuda_fault(dev));
@@ -569,12 +692,19 @@ ok &= (hy->cache = cuda_alloc(dev, (size_t)m->n_layer * g->n_ctx *
     /* The per-layer transfers are small and frequent; a pin that silently
        fell back to pageable staging costs ~1 ms a copy on this driver,
        which is a whole decode rate -- so it is required, not best effort. */
-    if (!cuda_host_pin(dev, runtime->normed,
-                       (size_t)max_tokens * m->n_embd * 4) ||
-        !cuda_host_pin(dev, runtime->projected,
-                       (size_t)max_tokens * m->n_embd * 4) ||
-        !cuda_host_pin(dev, runtime->cos_sin,
-                       (size_t)max_tokens * g->rope_dim * 4)) {
+    int pinned = cuda_host_pin(dev, runtime->normed,
+                               (size_t)max_tokens * m->n_embd * 4) &&
+                 cuda_host_pin(dev, runtime->projected,
+                               (size_t)max_tokens * m->n_embd * 4) &&
+                 cuda_host_pin(dev, runtime->cos_sin,
+                               (size_t)max_tokens * g->rope_dim * 4);
+    if (ffn_width) {
+        hy->ffn_result = malloc((size_t)max_tokens * m->n_embd * 4);
+        pinned &= hy->ffn_result &&
+                  cuda_host_pin(dev, hy->ffn_result,
+                                (size_t)max_tokens * m->n_embd * 4);
+    }
+    if (!pinned) {
         snprintf(err, errsz,
                  "could not pin the per-layer transfer buffers (another "
                  "process may hold the gpu, or the driver refuses to pin "

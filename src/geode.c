@@ -55,7 +55,7 @@ static int run_cached_planner(const char *argv0, int nargs, char **args,
     return planner_main(n, planner_argv);
 }
 
-static int run_end_to_end(const char *model) {
+static int run_end_to_end(const char *model, const char *strategy) {
     int rc;
     if (!have_cached(geode_home("probe.json"))) {
         char *probe_argv[] = {"geode probe"};
@@ -72,13 +72,15 @@ static int run_end_to_end(const char *model) {
         rc = planner_main(2, planner_argv);
         if (rc) return rc;
     }
-    return exec_cli(model);
+    return exec_cli(model, strategy);
 }
 
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage:\n"
-            "  %s MODEL.gguf         probe -> manifest -> planner, then chat\n"
+            "  %s MODEL.gguf [--strategy NAME]\n"
+            "                        probe -> manifest -> planner, then chat;\n"
+            "                        NAME runs that executor instead of the plan's\n"
             "  %s plan MODEL.gguf [opts]   rerun the planner for a model\n"
             "                        (--context N --batch N --out plan.json)\n"
             "  %s probe|manifest|planner [args...]   run one step\n"
@@ -118,9 +120,11 @@ int main(int argc, char **argv) {
         clean_cached();
         return 0;
     }
+    if (argc == 4 && strcmp(argv[2], "--strategy") == 0)
+        return run_end_to_end(argv[1], argv[3]);
     if (argc != 2) {
         usage(argv[0]);
         return 2;
     }
-    return run_end_to_end(argv[1]);
+    return run_end_to_end(argv[1], NULL);
 }

@@ -269,8 +269,8 @@ static void score_cpu_stream(Candidate *c, const Manifest *m,
 
 static void score_hybrid(Candidate *c, const Manifest *m,
                          unsigned long long kv_total,
-                         unsigned long long bytes_per_step,
-                         unsigned long long gpu_bytes_per_step,
+                         unsigned long long gpu_fixed_step,
+                         unsigned long long dram_step,
                          const DramPlan *dram, const GpuTier *gpu,
                          double flops_bound) {
     snprintf(c->strategy, sizeof c->strategy, "HYBRID");
@@ -283,23 +283,26 @@ static void score_hybrid(Candidate *c, const Manifest *m,
         snprintf(c->reason, sizeof c->reason, "gpu bandwidth unmeasured");
         return;
     }
-    unsigned long long on_gpu = m->attention_bytes + kv_total;
+    unsigned long long on_gpu =
+        m->attention_bytes + m->base_bytes + kv_total;
     if (on_gpu > gpu->vram * VRAM_USABLE_FRACTION) {
         snprintf(c->reason, sizeof c->reason,
-                 "attention+kv do not fit in vram");
+                 "attention+base+kv do not fit in vram");
         return;
     }
-    /* Decode is expert-byte-bound on the cpu side: experts stream from DRAM
-   exactly as in CPU-STREAM. The gpu takes attention+kv reads -- but the
-   strategy runs the two sides in lockstep, attention on the gpu then
-   experts on the cpu every layer, so the times add rather than overlap:
-   the binding resource is whichever side is slower per layer, and there
-   is no min(). */
+    /* Decode's gpu side holds the deterministic reads: attention+kv every
+    layer, serially, plus the base ffn (dense block's or shared expert) --
+    whose gemms are launched before the cpu's routed matmuls run, so the
+    two tiers read in parallel and the step pays whichever of the two
+    finishes last. Routed experts stream from DRAM exactly as in
+    CPU-STREAM. */
     c->scorable = 1;
-    double cpu_time = (double)bytes_per_step / dram->eff_bw;
-    double gpu_time = (double)gpu_bytes_per_step /
-                      (gpu->hbm_bw * HYBRID_GEMV_EFFICIENCY);
-    c->decode_tok_s[1] = 1.0 / (cpu_time + gpu_time);
+    double eff_bw = gpu->hbm_bw * HYBRID_GEMV_EFFICIENCY;
+    double step = (double)gpu_fixed_step / eff_bw;
+    double routed_time = (double)dram_step / dram->eff_bw;
+    double shared_time = (double)m->base_bytes / eff_bw;
+    step += routed_time > shared_time ? routed_time : shared_time;
+    c->decode_tok_s[1] = 1.0 / step;
     if (flops_bound < c->decode_tok_s[1]) c->decode_tok_s[1] = flops_bound;
     c->decode_tok_s[1] *= HYBRID_SYNC_FACTOR * mtp_multiplier(m);
 }
@@ -567,7 +570,7 @@ int planner_main(int argc, char **argv) {
         (unsigned long long)(experts_hit * m.expert_bytes);
     wl.bytes_per_step = m.attention_bytes + m.base_bytes + routed_per_step +
                         wl.kv_per_token * (unsigned long long)batch;
-    wl.hybrid_dram_step = m.base_bytes + routed_per_step;
+    wl.hybrid_dram_step = routed_per_step;
     wl.hybrid_gpu_step = m.attention_bytes + wl.kv_per_token * (unsigned long long)batch;
 
     Plan plan = {0};
@@ -579,22 +582,22 @@ int planner_main(int argc, char **argv) {
                    wl.gpu_flops_bound);
     score_cpu_stream(&cands[1], &m, wl.weights_kv, wl.bytes_per_step, &hw.dram,
                      wl.flops_bound);
-    score_hybrid(&cands[2], &m, wl.kv_total, wl.hybrid_dram_step,
-                wl.hybrid_gpu_step, &hw.dram, &hw.gpu, wl.flops_bound);
+score_hybrid(&cands[2], &m, wl.kv_total, wl.hybrid_gpu_step,
+                 wl.hybrid_dram_step, &hw.dram, &hw.gpu, wl.flops_bound);
     score_flash_stream(&cands[3], &m, wl.kv_total, wl.weights_kv,
                        wl.kv_per_token, batch, &hw.dram, &hw.nvme,
                        wl.flops_bound);
 
     /* Params split approximated by byte split; the Q4_K/Q6_K mix varies
-       little across components. HYBRID prefill serializes: attention on the
-       gpu, everything else on the cpu. */
+       little across components. HYBRID prefill serializes: attention+base
+       on the gpu, routed experts on the cpu. */
     double active_bytes = m.attention_bytes + m.base_bytes + m.routed_bytes;
-    double att_frac = m.attention_bytes / active_bytes;
+    double gpu_frac = (m.attention_bytes + m.base_bytes) / active_bytes;
     cands[0].prefill_tok_s = wl.gpu_prefill;
     cands[1].prefill_tok_s = wl.cpu_prefill;
     cands[2].prefill_tok_s =
         (wl.gpu_prefill > 0 && wl.cpu_prefill > 0)
-            ? 1.0 / (att_frac / wl.gpu_prefill + (1.0 - att_frac) / wl.cpu_prefill)
+            ? 1.0 / (gpu_frac / wl.gpu_prefill + (1.0 - gpu_frac) / wl.cpu_prefill)
             : 0;
     cands[3].prefill_tok_s = wl.cpu_prefill;
 
@@ -625,7 +628,7 @@ int planner_main(int argc, char **argv) {
         } else {
             int hybrid = best_idx == 2;
             add_placement(&plan, "attention", hybrid ? "vram" : "dram", "resident");
-            add_placement(&plan, "base", "dram", "resident");
+            add_placement(&plan, "base", hybrid ? "vram" : "dram", "resident");
             add_placement(&plan, "experts", "dram", "resident");
             add_placement(&plan, "kv", hybrid ? "vram" : "dram", "resident");
         }

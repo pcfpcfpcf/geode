@@ -13,6 +13,13 @@ typedef struct Runtime Runtime;
 typedef void (*AttentionFn)(Runtime *runtime, const Layer *layer,
                             int layer_index, int position, int n_tokens);
 
+/* The tier a strategy places the layer's deterministic feed-forward on --
+   the dense block's ffn or the MoE layer's shared expert. Same contract:
+   reads `normed`, and leaves the layer's whole feed-forward result in
+   `projected` for every token, routed experts included. */
+typedef void (*FfnFn)(Runtime *runtime, const Layer *layer, int layer_index,
+                      int n_tokens);
+
 /* Whatever a strategy attached to this runtime beyond the cpu state -- the
    hybrid's device handle. Opaque: forward knows nothing about the layer
    above it. */
@@ -120,10 +127,17 @@ const float *forward(Runtime *runtime, const int *tokens, int position,
 void forward_attention_cpu(Runtime *runtime, const Layer *layer,
                            int layer_index, int position, int n_tokens);
 
-/* The same pass with the attention tier swapped: a strategy splits the layer
-   loop here and nowhere else -- everything around attention (embedding, rope
-   tables, norms, the expert stack, the output projection) is tier-agnostic. */
+/* The cpu's own feed-forward: the shared expert and the dense block's ffn
+   alongside the routed experts. `skip_base` leaves the deterministic half
+   out, for the strategy that placed it on another tier. */
+void forward_feed_forward_cpu(Runtime *runtime, const Layer *layer,
+                              int n_tokens, int skip_base);
+
+/* The same pass with a tier swapped per hook: a strategy splits the layer
+   loop here and nowhere else -- everything around the hooks (embedding,
+   rope tables, norms, the output projection) is tier-agnostic. Either hook
+   may be NULL for the cpu's own. */
 const float *forward_with(Runtime *runtime, const int *tokens, int position,
-                         int n_tokens, AttentionFn attention);
+                          int n_tokens, AttentionFn attention, FfnFn ffn);
 
 #endif

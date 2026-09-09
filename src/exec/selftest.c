@@ -346,13 +346,14 @@ int selftest_hybrid(const GgufFile *g) {
                     trace_projected = cpu_out;
                     trace_saved = 0;
                     forward_with(cpu_runtime, ids, 0, n,
-                                  tracing_attention_cpu);
+                                  tracing_attention_cpu, NULL);
                     runtime_stop(cpu_runtime);
                     if (trace_saved) {
                         trace_normed = gpu_in;
                         trace_projected = gpu_out;
                         trace_saved = 0;
-                        forward_with(runtime, ids, 0, n, tracing_attention);
+                        forward_with(runtime, ids, 0, n, tracing_attention,
+                                     NULL);
                         float worst_in = 0, worst_out = 0;
                         int worst_i = 0, off = 0;
                         for (size_t i = 0; i < (size_t)n * model.n_embd;
